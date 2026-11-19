@@ -425,6 +425,17 @@ class DefaultsTest(unittest.TestCase):
         # The publisher printed plain 300 mm disks, not coded rings.
         self.assertEqual(eo.DEFAULT_TARGET_TYPE, "Circular")
 
+    def test_both_polarities_run_bright_first(self):
+        # The targets are bright disks with a small black centre. The bright
+        # (inverted) pass finds the robust ~10 px disk and must run first so its
+        # better-centred detection wins a camera; the dark pass fills in.
+        self.assertEqual(eo.DEFAULT_INVERTED_PASSES, (True, False))
+
+    def test_the_search_radius_covers_the_rtk_error(self):
+        # The RTK-only georeference is ~16 px off at 1.5 cm GSD; the search
+        # radius must cover several sigma of that, not one target radius.
+        self.assertGreaterEqual(eo.DEFAULT_SEARCH_RADIUS_PX, 40.0)
+
 
 class SelectRefineViewsTest(unittest.TestCase):
     """Each marker is refined against its closest observers, not all of them."""

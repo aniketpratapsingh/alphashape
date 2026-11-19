@@ -84,16 +84,26 @@ MAX_VIEWS_PER_MARKER = 16
 DEFAULT_TARGET_TYPE = "Circular"
 # How far from the projected pixel DetectMarkers may find a target. The
 # RTK-only georeference fits a handful of references at ~0.24 m RMS, which at a
-# 1.5 cm GSD is ~16 px; 40 px covers the worst camera plus a mis-projection,
-# and is still far smaller than the spacing between targets (tens of metres).
-DEFAULT_SEARCH_RADIUS_PX = 40.0
+# 1.5 cm GSD is ~16 px; 60 px covers the worst camera plus a mis-projection
+# (3.75 sigma), and is still far smaller than the spacing between targets (tens
+# of metres, thousands of pixels), so it cannot attach a neighbouring target.
+DEFAULT_SEARCH_RADIUS_PX = 60.0
 # The smallest target radius DetectMarkers accepts, in pixels. The P4 RTK flew
 # at 55 m AGL with an 8.8 mm lens and 2.41 um pixels, so the GSD is ~1.5 cm: the
-# 100 mm black centre is ~3.3 px radius and the 300 mm disk ~10 px. The black
-# centre is the pointing fiducial and the detector's dark-blob floor is 3 px, so
-# 2 px admits it (and the oblique edge of the frame) without admitting ground
-# texture. A larger floor (the first attempt used 4) rejects the centre outright.
+# 100 mm black centre is ~3.3 px radius and the 300 mm disk ~10 px. The detector
+# fits the FIRST edge on each ray from the seed, which for a bright disk with a
+# dark centre is the black-centre boundary (~3.3 px), so the floor must admit
+# that. 2 px admits it without admitting ground texture.
 DEFAULT_MINIMUM_TARGET_PX = 2.0
+# The targets are bright white (check points) or yellow (GCPs) disks with a
+# small black centre (Mills et al. 2023, Fig. 2). The light-on-dark pass finds
+# the bright disk, which at ~10 px radius is a strong, robust feature; the
+# dark-on-light pass finds the black centre, which at ~3.3 px radius sits at the
+# detector's floor and is unreliable. The bright pass runs FIRST so its (larger,
+# better-centred) detection wins a camera; the dark pass then fills in cameras
+# the bright pass missed (a white disk on pale limestone, where the disk does not
+# contrast but the black centre does).
+DEFAULT_INVERTED_PASSES = (True, False)
 # DetectMarkers runs its blob search on a downscaled copy when the image is
 # large: 0 selects the smallest integer d with long_side / d <= 4096, which is
 # 2 for a 5472 px frame. That halves the 3.3 px black centre to 1.65 px, below
@@ -681,14 +691,31 @@ def detect_targets(chunk, stations, projections, per_point, detect_options):
     that matches no marker is dropped (``create_markers=False``), so a stray
     circle in the quarry is never turned into a station.
 
+    The targets are bright disks with a small black centre, so the detector runs
+    BOTH polarities: the dark-on-light pass finds the black centre (small, at
+    the detector's floor) and the light-on-dark pass finds the bright disk
+    (large, robust). A target found by either pass is kept; when both find the
+    same target in one camera, the one nearer the projection wins (the bright
+    disk's centre is the printed centre, so it is preferred on a tie).
+
     Returns ``(detected, per_point)``. ``detected`` maps a station label to a
     list of ``{"camera", "px", "py", "target_radius_px"}`` for the targets that
     were found, with the pixel DetectMarkers measured. ``per_point`` records the
     shift from the hand-computed projection to the detected pixel, so the
     summary shows how far the RTK-only prediction was from the target.
     """
-    chunk.detectMarkers(**detect_options)
     detected = {}
+    # One DetectMarkers run per polarity. Each run attaches its detections to the
+    # markers; a marker already carrying a projection in a camera is skipped by
+    # the task, so the second pass only adds cameras the first did not cover.
+    # The caller's dict is not mutated: `inverted_passes` is popped from a copy.
+    passes = detect_options.get("inverted_passes", (False,))
+    base_options = {key: value for key, value in detect_options.items()
+                    if key != "inverted_passes"}
+    for inverted in passes:
+        options = dict(base_options)
+        options["inverted"] = inverted
+        chunk.detectMarkers(**options)
     for marker in chunk.markers:
         label = marker.label
         for projection in marker.projections:
@@ -917,10 +944,12 @@ def run(args):
         "create_markers": False,
         "minimum_size": args.minimum_target_px,
         "marker_downscale": args.marker_downscale,
+        "inverted_passes": DEFAULT_INVERTED_PASSES,
     }
     log(f"[eurosdr] detecting {args.target_type} targets within "
         f"{args.search_radius_px} px of each projection "
-        f"(downscale {args.marker_downscale or 'auto'})")
+        f"(downscale {args.marker_downscale or 'auto'}, "
+        f"polarities {DEFAULT_INVERTED_PASSES})")
     detected, per_point = detect_targets(
         chunk, stations, projections, per_point, detect_options)
     log(f"[eurosdr] detected {sum(len(v) for v in detected.values())} targets "
