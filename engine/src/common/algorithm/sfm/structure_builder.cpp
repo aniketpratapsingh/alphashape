@@ -54,6 +54,7 @@
 #include "base/utils/error.hpp"
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
 #include "common/algorithm/sfm/essential.hpp"
+#include "common/algorithm/sfm/similarity.hpp"
 #include "common/algorithm/sfm/triangulation.hpp"
 
 namespace alphashape::sfm {
@@ -85,6 +86,12 @@ struct Scene {
     std::vector<std::optional<Eigen::Vector3d>> point;
 
     std::size_t index_a = kNoIndex, index_b = kNoIndex;  ///< gauge cameras
+
+    /// SfM -> ENU similarity, re-estimated after each global BA when
+    /// reference_priors is on. `have_similarity` is false until at least three
+    /// non-collinear referenced cameras are registered.
+    bool have_similarity = false;
+    Similarity sfm_to_enu;
 };
 
 // --- helpers (definitions below) ---
@@ -111,6 +118,12 @@ void run_global_ba(Scene& s);
 bool choose_initial_pair(Scene& s);
 std::size_t resection_point_count(const Scene& s, std::size_t cam);
 bool resect_camera(Scene& s, std::size_t cam);
+
+// --- reference priors (GNSS-aided BA) ---
+Eigen::Vector3d camera_centre_of(const AbsolutePose& pose);
+bool update_reference_similarity(Scene& s);
+void add_reference_priors(Scene& s, BAProblem& problem, const BAIndex& idx);
+void release_gauge_if_priors_suffice(BAProblem& problem);
 
 // --- input validation and indexing ---
 
@@ -398,6 +411,134 @@ BAIndex build_ba(Scene& s) {
     return idx;
 }
 
+// --- reference priors (GNSS-aided BA) ---
+
+/// Camera centre C = -R^T t of a world->camera pose.
+Eigen::Vector3d camera_centre_of(const AbsolutePose& pose) {
+    return -pose.R.transpose() * pose.t;
+}
+
+/// True when the points are not collinear: the farthest pair defines a line and
+/// at least one other point deviates from it by more than a relative tolerance.
+/// Mirrors the gauge test OptimizeCameras and georeference use.
+bool centres_not_collinear(const std::vector<Eigen::Vector3d>& points) {
+    if (points.size() < 3) {
+        return false;
+    }
+    std::size_t a = 0, b = 1;
+    double best = -1.0;
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        for (std::size_t j = i + 1; j < points.size(); ++j) {
+            const double d = (points[i] - points[j]).squaredNorm();
+            if (d > best) {
+                best = d;
+                a = i;
+                b = j;
+            }
+        }
+    }
+    const Eigen::Vector3d dir = points[a] - points[b];
+    const double len = dir.norm();
+    if (!(len > 0.0)) {
+        return false;
+    }
+    const Eigen::Vector3d u = dir / len;
+    double max_perp = 0.0;
+    for (const Eigen::Vector3d& p : points) {
+        const Eigen::Vector3d v = p - points[a];
+        max_perp = std::max(max_perp, (v - v.dot(u) * u).norm());
+    }
+    return max_perp > 1e-3 * len;
+}
+
+/// Re-estimate the SfM -> ENU similarity from the registered cameras that carry
+/// a reference. Returns false (and leaves the previous similarity in place) when
+/// fewer than three non-collinear referenced cameras are registered or the
+/// robust fit fails. The gate is max(reference_prior_gate_m, 5 x median
+/// horizontal accuracy), the same rule georeference_chunk uses.
+bool update_reference_similarity(Scene& s) {
+    std::vector<Eigen::Vector3d> source, target;
+    std::vector<double> horizontal;
+    for (std::size_t c = 0; c < s.ncams; ++c) {
+        if (s.registered[c] == 0) {
+            continue;
+        }
+        const BuilderCamera& cam = s.in->cameras[c];
+        if (!cam.reference_enu.has_value()) {
+            continue;
+        }
+        source.push_back(camera_centre_of(s.pose[c]));
+        target.push_back(*cam.reference_enu);
+        const double h = std::hypot(cam.reference_sigma.x(), cam.reference_sigma.y());
+        horizontal.push_back(std::isfinite(h) && h > 0.0 ? h : 10.0);
+    }
+    if (source.size() < 3 || !centres_not_collinear(source)) {
+        return false;
+    }
+    std::sort(horizontal.begin(), horizontal.end());
+    const std::size_t n = horizontal.size();
+    const double median = (n % 2 == 1) ? horizontal[n / 2]
+                                       : 0.5 * (horizontal[n / 2 - 1] + horizontal[n / 2]);
+    const double threshold = std::max(s.opt->reference_prior_gate_m, 5.0 * median);
+    const SimilarityRansacResult ransac =
+        estimate_similarity_ransac(source, target, threshold, s.opt->seed);
+    if (!ransac.similarity.has_value()) {
+        return false;
+    }
+    s.sfm_to_enu = *ransac.similarity;
+    s.have_similarity = true;
+    return true;
+}
+
+/// Add one centre prior per registered camera that carries a reference, in the
+/// SfM frame the BA problem uses. The reference ENU position is mapped back
+/// through the inverse similarity, and the per-axis sigma and the antenna lever
+/// arm are scaled by 1/s so they are expressed in SfM units. Cameras without a
+/// reference, or with the reference disabled, get no prior.
+void add_reference_priors(Scene& s, BAProblem& problem, const BAIndex& idx) {
+    if (!s.have_similarity) {
+        return;
+    }
+    const Similarity inverse = s.sfm_to_enu.inverse();
+    const double inv_scale = 1.0 / s.sfm_to_enu.scale;
+    for (std::size_t c = 0; c < s.ncams; ++c) {
+        if (s.registered[c] == 0 || idx.cam_ba[c] == kNoIndex) {
+            continue;
+        }
+        const BuilderCamera& cam = s.in->cameras[c];
+        if (!cam.reference_enu.has_value()) {
+            continue;
+        }
+        BACentrePrior prior;
+        prior.camera = idx.cam_ba[c];
+        prior.centre = inverse.apply(*cam.reference_enu);
+        prior.sigma = cam.reference_sigma * inv_scale;
+        prior.lever_arm = cam.reference_lever_arm * inv_scale;
+        problem.centre_priors.push_back(prior);
+    }
+}
+
+/// When the priors pin all 7 similarity degrees of freedom (three or more
+/// non-collinear fully-constrained centre priors), release the fixed-camera
+/// gauge and the scale anchor so the priors define the datum themselves. This
+/// matches OptimizeCameras and stops a fixed gauge camera from biasing the
+/// block's shape. Otherwise the existing gauge is left in place.
+void release_gauge_if_priors_suffice(BAProblem& problem) {
+    std::vector<Eigen::Vector3d> centres;
+    for (const BACentrePrior& prior : problem.centre_priors) {
+        const bool east = std::isfinite(prior.sigma.x()) && prior.sigma.x() > 0.0;
+        const bool north = std::isfinite(prior.sigma.y()) && prior.sigma.y() > 0.0;
+        const bool up = std::isfinite(prior.sigma.z()) && prior.sigma.z() > 0.0;
+        if (east && north && up) {
+            centres.push_back(prior.centre);
+        }
+    }
+    if (centres.size() >= 3 && centres_not_collinear(centres)) {
+        std::fill(problem.fixed_pose.begin(), problem.fixed_pose.end(), 0);
+        problem.scale_anchor_camera = -1;
+    }
+}
+
 /// Run a global bundle adjustment over all registered cameras and points, then
 /// write the refined poses / points back into the Scene.
 void run_global_ba(Scene& s) {
@@ -407,6 +548,16 @@ void run_global_ba(Scene& s) {
     BAIndex idx = build_ba(s);
     if (idx.problem.poses.empty() || idx.problem.points.empty()) {
         return;
+    }
+    // GNSS-aided BA: refresh the SfM -> ENU similarity from the cameras
+    // registered so far, then add their centre priors in the SfM frame. Once
+    // three non-collinear referenced cameras are registered the priors pin the
+    // whole similarity, so the fixed-camera gauge is released and the priors
+    // define the datum; before that the existing gauge holds the block.
+    if (s.opt->reference_priors) {
+        update_reference_similarity(s);
+        add_reference_priors(s, idx.problem, idx);
+        release_gauge_if_priors_suffice(idx.problem);
     }
     BAOptions options;
     options.loss_scale_px = s.opt->ba_loss_scale_px;
@@ -418,6 +569,11 @@ void run_global_ba(Scene& s) {
     }
     for (std::size_t i = 0; i < idx.ba_to_track.size(); ++i) {
         s.point[idx.ba_to_track[i]] = idx.problem.points[i];
+    }
+    // Re-estimate the similarity after the solve so the next round's priors
+    // start from the refined block.
+    if (s.opt->reference_priors) {
+        update_reference_similarity(s);
     }
 }
 
