@@ -14,3 +14,5 @@ docs/**/*.md text
 design/system/tokens.json text eol=lf
 *.py text eol=lf
 *.ttf binary
+# vcpkg overlay ports: patches must keep LF so git apply works on Windows.
+.github/vcpkg-overlays/** text eol=lf
