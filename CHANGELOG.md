@@ -20,20 +20,28 @@ All notable changes to alphashape are recorded here. The format follows
   every cause investigated (lens model, pixel convention, antenna mount, timing,
   fix status, per-photo weighting, block doming, reference frame, marker
   refinement).
+- **Independent reference on the same block.** `engine/docs/m13-validation.md`
+  records the same five leave-one-out folds run through OpenDroneMap 3.6.2
+  (OpenSfM) by `.github/workflows/odm-reference.yml` and
+  `tools/bench/odm_reference.py`: 9.3-9.9 cm horizontal and 46-50 cm vertical
+  check RMS, with the triangulation validated against ODM's own control points
+  to 0.14 cm horizontal. Only numbers are published; the GPL-3.0 dataset is
+  downloaded and measured, never redistributed.
 - **Second ground-control block: the EuroSDR RPAS benchmark.** `tools/bench/DATASETS.md`
   now records the EuroSDR RPAS benchmark (Zenodo 10059050, Wards Hill quarry) as a
   second ground-control block rather than a rejected candidate. The publisher ships
   the surveyed coordinates of 8 GCPs and 51 check points but not the pixel
   observations of their targets, so a CI-only workflow
   (`.github/workflows/eurosdr-observations.yml`, driving
-  `tools/bench/eurosdr_observations.py`) measures them: it aligns the P4 RTK flight
-  with no ground control, projects each surveyed station into every camera that sees
-  it, and snaps the projection onto the circular target with the engine's multi-view
-  marker refinement. The point coordinates come from the xlsx in ETRS89 ellipsoidal
-  terms, so the orthometric-height obstacle the earlier entry recorded does not
-  apply. The accepted observations are committed as our own derived data (CC BY 4.0,
-  Mills et al. 2023, Newcastle University / EuroSDR) and read by the `gcp-eurosdr`
-  bench dataset.
+  `tools/bench/eurosdr_observations.py`) measures them: it places every camera from
+  its own RTK position and gimbal attitude, projects each surveyed station into every
+  camera that sees it, and snaps the projection onto the circular target with the
+  engine's multi-view marker refinement. The point coordinates come from the xlsx in
+  ETRS89 ellipsoidal terms, so the orthometric-height obstacle the earlier entry
+  recorded does not apply. The accepted observations are committed as our own derived
+  data (CC BY 4.0, Mills et al. 2023, Newcastle University / EuroSDR) and read by the
+  `gcp-eurosdr` bench dataset. The first measured result is 5.76 cm horizontal
+  check-point RMS over the eight folds, a miss against the 5 cm target.
 
 ### Changed
 

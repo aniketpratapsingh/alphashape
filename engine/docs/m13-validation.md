@@ -1162,3 +1162,89 @@ setting remains per-image camera RTK with adaptive fitting at **5.31 cm**
 horizontal (12.22 vertical, 13.32 3D); GCP-only adaptive is 6.54 / 6.46 /
 9.19 cm. No frame correction beats the uncorrected variant, and the target is
 not loosened.
+
+#### Independent reference: OpenDroneMap on the same block (2026-11-18, PR #126)
+
+The engine's numbers say what this pipeline achieves; they do not say whether
+the block allows 5 cm with any tool. `.github/workflows/odm-reference.yml` runs
+the same five leave-one-out folds through OpenDroneMap 3.6.2 (OpenSfM) on the
+same photographs and the same survey, and `tools/bench/odm_reference.py`
+triangulates the held-out point through ODM's own camera model and poses. ODM
+is an independent reference, not ground truth; the survey is. Only numbers are
+uploaded — the GPL-3.0 dataset is downloaded and measured, never redistributed.
+
+**Protocol.** Each fold writes a `gcp_list.txt` with the four control points and
+runs ODM to the end of OpenSfM (`--end-with opensfm`). The held-out point's
+image observations are triangulated from the reconstruction's shots and cameras
+(OpenSfM normalised pixels, the Brown distortion model, Gauss–Newton on the
+reprojection error), converted to ODM's topocentric frame through
+`reference_lla.json`, and compared with the survey. The control points are
+measured the same way. Three modes: `gcp_only` (ODM's default with a GCP file),
+`gcp_gps` (`--force-gps`, the camera RTK positions adjusted with the GCPs), and
+`gcp_strong` (the reconstruction re-run with the GCPs weighted as a survey:
+`gcp_global_weight 1.0`, 2 cm horizontal and vertical sd, against ODM's default
+1% weight and 10 cm vertical sd).
+
+**The triangulation is correct.** It was checked against ODM's own
+`stats/ground_control_points.json`, which `compute_statistics` writes from the
+topocentric reconstruction. Our control points agree with ODM's own to
+**0.14 cm horizontal and 1.9 cm vertical RMS** on every fold (max 0.20 / 2.8
+cm). The four conventions that could have been wrong were each checked against
+OpenSfM's source and are right: the pixel normalisation
+`(px + 0.5 - w/2) / max(w, h)` (`opensfm/features.py`), the Brown distortion
+(`DistoBrown`, `opensfm/src/geometry/camera_distortions_functions.h`), the
+topocentric transform (`ecef_from_topocentric_transform`, `opensfm/geo.py`),
+and the `gcp_list` pixel convention (0-based corner origin,
+`_read_gcp_list_lines`, `opensfm/io.py`). ODM's `reference_lla.json` altitude is
+hard-coded 0.0 and the script uses it, so both sides share the frame. The
+survey heights are ellipsoidal on both sides (the dataset's `gcp_height` is
+`ellipsoidal` and the `gcp_list` z matches the CSV exactly), so a geoid swap —
+which would be about 46 m at this site, not 0.5 m — is not in play.
+
+**Results** (CI run `44355652940`, ODM 3.6.2, 176/176 shots reconstructed in
+every fold). Check-point error against the survey, cm:
+
+| mode | fold 1 | fold 2 | fold 3 | fold 4 | fold 5 | h RMS | v RMS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `gcp_only` h | 13.04 | 6.25 | 8.77 | 11.76 | 4.23 | **9.40** | |
+| `gcp_only` v | +73.67 | -2.67 | -24.82 | +65.11 | +24.13 | | **46.63** |
+| `gcp_gps` h | 12.66 | 6.23 | 8.88 | 11.76 | 3.97 | **9.30** | |
+| `gcp_gps` v | +72.21 | -3.22 | -25.44 | +66.24 | +24.85 | | **46.64** |
+| `gcp_strong` h | 13.15 | 8.33 | 7.85 | 13.22 | 2.88 | **9.87** | |
+| `gcp_strong` v | +81.98 | -1.57 | -19.39 | +70.01 | +26.23 | | **50.37** |
+
+Control points, measured the same way: **3.06 cm horizontal, 11.41 cm vertical
+RMS** in `gcp_gps` and 3.06 / 11.48 cm in `gcp_only`. In `gcp_strong` the
+control points are pinned by the weights, so their residual is 0.00 cm by
+construction and says nothing about the triangulation; the held-out point is
+the only measurement there.
+
+**The 3–4 px reprojection is ODM's real residual, not a projection mismatch.**
+ODM's own statistics report the same residual on the same observations: a mean
+of about (-2.2, -3.6) px with a scatter of about 2 px, i.e. a systematic shift
+that dominates the noise, present identically in `gcp_only` and in `gcp_strong`
+where the control points are pinned. Our own triangulation's control residual
+is 3.20 px RMS with mean (-1.66, -3.45) px and scatter (1.87, 1.50) px — the
+same shift, measured through our projection. It is not a pixel-origin or
+normalisation error, because our projection reproduces ODM's own reprojected
+pixels to the same statistics and our triangulated points match ODM's to
+0.14 cm horizontal. It is the block's lens model and geometry not fitting the
+GCP observations better than a few pixels; the same residual appears in the
+engine's own diagnostics on this block (the default lens model is too thin for
+this camera, and the adaptive model reduces it).
+
+**Reading it against the engine.** ODM's 9.3–9.9 cm horizontal and 46–50 cm
+vertical are worse than the engine on the same folds. With per-image camera RTK
+and adaptive fitting the engine gives 4.36 cm horizontal and 10.98 cm vertical at
+500 keypoints per megapixel (the manifest's setting since PR #131; 169/176
+cameras aligned) and 5.31 / 12.22 cm at 250. The vertical gap is the largest:
+ODM's control points already sit 11 cm off vertically in its own adjustment, and
+its held-out points 46 cm. ODM's lens model fits the GCP observations no better
+than the 3–4 px shift above, which is consistent with the engine's finding that
+the default lens model is too thin for this camera and the adaptive model is
+what closes the gap. Both tools put fold 3 (GCP 3, the one interior point) off in
+the same direction: about 9 cm towards the north-west (azimuth 298° in the engine, 306° in ODM). That points to the
+block or its survey rather than to either pipeline. Caveats: ODM ran at
+`--feature-quality high` with its own defaults otherwise, the engine's numbers
+are from a different run and a different alignment, and neither tool is ground
+truth — the survey is.
