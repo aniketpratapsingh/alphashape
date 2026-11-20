@@ -447,13 +447,18 @@ class DefaultsTest(unittest.TestCase):
 
 
 class AlignBlockTest(unittest.TestCase):
-    """The alignment runs the bundle adjustment before any station exists."""
+    """The alignment places the cameras from RTK before any station exists."""
 
-    def _fake_alphashape(self, calls):
+    def _fake_alphashape(self, calls, cameras=()):
+        class FakeCamera:
+            def __init__(self, enabled):
+                self.enabled = enabled
+
         class FakeChunk:
             def __init__(self):
                 self.crs_epsg = None
-                self.cameras = []
+                self.cameras = [FakeCamera(enabled) for enabled in cameras]
+                self.meta = {}
 
             def optimizeCameras(self, **kwargs):
                 calls.append(("optimizeCameras", kwargs))
@@ -475,28 +480,68 @@ class AlignBlockTest(unittest.TestCase):
 
         return FakeModule()
 
-    def test_the_bundle_adjustment_runs_after_alignment(self):
+    def test_the_cameras_are_placed_from_their_reference(self):
+        # AlignCameras georeferences with ONE global similarity, and on this
+        # flight that fit keeps only 6 of 430 cameras inside its inlier
+        # threshold: the similarity is extrapolated from a small cluster and is
+        # metres off across the block. AlignFromReference places every camera
+        # from its own RTK position and attitude instead, so the global fit is
+        # not used at all.
         calls = []
         eo.align_block(self._fake_alphashape(calls), ["a.jpg", "b.jpg", "c.jpg"], 250)
         names = [name for name, _ in calls]
-        self.assertIn("AlignCameras", names)
+        self.assertIn("AlignFromReference", names)
+        self.assertNotIn("AlignCameras", names)
+
+    def test_the_tie_points_are_rebuilt_before_the_bundle_adjustment(self):
+        # AlignFromReference clears the tie points (they belonged to the old
+        # frame), so they must be triangulated from the placed poses before the
+        # bundle adjustment can use them.
+        calls = []
+        eo.align_block(self._fake_alphashape(calls), ["a.jpg", "b.jpg", "c.jpg"], 250)
+        names = [name for name, _ in calls]
+        self.assertIn("TriangulateTiePoints", names)
         self.assertIn("optimizeCameras", names)
+        self.assertGreater(names.index("TriangulateTiePoints"),
+                           names.index("AlignFromReference"))
         self.assertGreater(names.index("optimizeCameras"),
-                           names.index("AlignCameras"))
+                           names.index("TriangulateTiePoints"))
+
+    def test_the_gimbal_attitude_is_imported(self):
+        # AlignFromReference cannot place a camera without an attitude, so the
+        # import must read the XMP gimbal angles.
+        calls = []
+        eo.align_block(self._fake_alphashape(calls), ["a.jpg", "b.jpg", "c.jpg"], 250)
+        add_photos = [kwargs for name, kwargs in calls if name == "AddPhotos"]
+        self.assertTrue(add_photos)
+        self.assertTrue(add_photos[0].get("load_xmp_orientation"))
+
+    def test_every_camera_is_enabled_before_it_is_placed(self):
+        # AddPhotos leaves every camera disabled, and AlignFromReference only
+        # places ENABLED cameras: without enabling them first the task would
+        # place none and the block would stay unaligned.
+        calls = []
+        module = self._fake_alphashape(calls, cameras=(False, False, False))
+        document, chunk = eo.align_block(module, ["a.jpg", "b.jpg", "c.jpg"], 250)
+        self.assertTrue(all(camera.enabled for camera in chunk.cameras))
 
     def test_no_station_is_added_before_the_bundle_adjustment(self):
         # The measurement must not let the surveyed control influence the
-        # alignment that is used to project it: the bundle adjustment runs on a
-        # chunk with no markers at all.
+        # alignment that is used to project it: the alignment runs on a chunk
+        # with no markers at all.
         calls = []
         eo.align_block(self._fake_alphashape(calls), ["a.jpg", "b.jpg", "c.jpg"], 250)
         self.assertNotIn("addMarker", [name for name, _ in calls])
 
     def test_optimize_can_be_switched_off(self):
+        # The comparison path is the plain incremental alignment.
         calls = []
         eo.align_block(self._fake_alphashape(calls), ["a.jpg", "b.jpg", "c.jpg"], 250,
                        optimize=False)
-        self.assertNotIn("optimizeCameras", [name for name, _ in calls])
+        names = [name for name, _ in calls]
+        self.assertIn("AlignCameras", names)
+        self.assertNotIn("AlignFromReference", names)
+        self.assertNotIn("optimizeCameras", names)
 
 
 class CameraReferenceStatsTest(unittest.TestCase):

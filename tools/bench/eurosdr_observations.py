@@ -586,30 +586,54 @@ def align_block(alphashape, images, keypoint_limit_per_mpx, optimize=True):
     positions alone, which is the point: the GCPs must not influence the
     alignment that is used to project them.
 
-    ``optimize`` runs a bundle adjustment with the camera GNSS priors after
-    ``AlignCameras``. The similarity fit that georeferences the block keeps only
-    a handful of cameras inside its inlier threshold on this flight (the block
-    drifts over 430 frames), so the projections land tens of pixels off the
-    targets. The bundle adjustment re-solves every pose against the tie points
-    with each camera's own RTK position as a prior, which removes the drift
-    camera by camera. It runs BEFORE any station is added, so the surveyed
-    control cannot influence the alignment that is used to project it.
+    ``optimize`` replaces the incremental alignment with the RTK-first path.
+    ``AlignCameras`` georeferences the block with ONE global similarity fitted
+    to the camera centres, and on this flight that fit keeps only 6 of 430
+    cameras inside its 0.5 m inlier threshold: the similarity is extrapolated
+    from a small cluster and is metres off across the rest of the block, so the
+    projections land tens of pixels off the targets and the multi-view consensus
+    fails. A bundle adjustment started from that georeference diverges (the
+    priors are ~19 m from the poses it is linearising around). The RTK-first
+    path avoids the global fit entirely: ``AlignFromReference`` places every
+    camera from its OWN RTK position and gimbal attitude in a fresh unit-scale
+    ENU frame, ``TriangulateTiePoints`` rebuilds the tie points from those poses,
+    and ``OptimizeCameras`` then refines the poses against the tie points with
+    each camera's RTK position as a prior. It runs BEFORE any station is added,
+    so the surveyed control cannot influence the alignment used to project it.
     """
     document = alphashape.Document()
     chunk = document.add_chunk("EuroSDR P4 RTK block")
     document.active_chunk = chunk
     # Per-image mode reads each photo's XMP RTK deviations and fix status at
-    # import, so the alignment is weighted by each camera's own solution.
-    document.run_task("AddPhotos", filenames=images, load_xmp_accuracy=True)
+    # import, so the alignment is weighted by each camera's own solution. The
+    # gimbal attitude is what AlignFromReference places the cameras by, so it is
+    # imported too.
+    document.run_task("AddPhotos", filenames=images, load_xmp_accuracy=True,
+                      load_xmp_orientation=True)
     chunk.crs_epsg = 4326
     document.run_task("MatchPhotos",
                       keypoint_limit_per_mpx=keypoint_limit_per_mpx,
                       reference_preselection=True)
-    document.run_task("AlignCameras")
-    if optimize:
-        # No markers exist yet, so `use_gcps` is moot; the camera references are
-        # the only priors and they are what the block is georeferenced by.
-        chunk.optimizeCameras()
+    if not optimize:
+        document.run_task("AlignCameras")
+        return document, chunk
+    # AlignFromReference only places cameras that are ENABLED, and AddPhotos
+    # leaves every camera disabled (it has not been aligned yet). Enable them
+    # all first: the task places each from its own RTK position and attitude.
+    for camera in chunk.cameras:
+        if not camera.enabled:
+            camera.enabled = True
+    # Place every camera from its own RTK position and attitude. This builds the
+    # local ENU frame and clears the tie points, which belonged to the old
+    # (arbitrary) frame.
+    document.run_task("AlignFromReference")
+    placed = chunk.meta.get("align_from_reference.placed", "0")
+    log(f"[eurosdr] placed {placed} cameras from their RTK position and attitude")
+    # Rebuild the tie points from the placed poses, then refine the poses
+    # against them with the RTK positions as priors. No markers exist yet, so
+    # `use_gcps` is moot: the camera references are the only priors.
+    document.run_task("TriangulateTiePoints")
+    chunk.optimizeCameras()
     return document, chunk
 
 

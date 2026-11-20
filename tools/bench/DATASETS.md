@@ -298,20 +298,31 @@ data (see below), so the ordinary `gcp-eurosdr` run needs no measurement step.
   pixels, so the GSD is ~1.5 cm: the black centre is only ~3.3 px radius and the disk
   ~10 px. The measurement workflow (`.github/workflows/eurosdr-observations.yml`,
   driving `tools/bench/eurosdr_observations.py`) does exactly that:
-  1. import the 430 P4 RTK images with their DJI RTK XMP positions and accuracies, then
-     `MatchPhotos` (`keypoint_limit_per_mpx=250`, reference preselection) and
-     `AlignCameras` with **no** GCPs;
-  2. read the xlsx with openpyxl and add all 59 stations as markers in EPSG:4979
+  1. import the 430 P4 RTK images with their DJI RTK XMP positions, accuracies and
+     gimbal attitudes, then `MatchPhotos` (`keypoint_limit_per_mpx=250`, reference
+     preselection);
+  2. place every camera from its **own** RTK position and gimbal attitude with
+     `AlignFromReference`, which builds a unit-scale local ENU frame. The incremental
+     `AlignCameras` is deliberately not used: it georeferences the block with one global
+     similarity fitted to the camera centres, and on this 430-frame flight that fit keeps
+     only 6 cameras inside its 0.5 m inlier threshold, so the similarity is extrapolated
+     from a small cluster and is metres off across the rest of the block. A bundle
+     adjustment started from that georeference diverges (its priors are ~19 m from the
+     poses it linearises around). Placing each camera from its own RTK solution avoids
+     the global fit entirely;
+  3. rebuild the tie points from the stored matches with `TriangulateTiePoints` (the
+     placement cleared them, as they belonged to the old frame), then refine the poses
+     with `OptimizeCameras`, which uses each camera's RTK position as a prior. No
+     station exists yet, so the surveyed control cannot influence the alignment;
+  4. read the xlsx with openpyxl and add all 59 stations as markers in EPSG:4979
      (ETRS89 geodetic, ellipsoidal height);
-  3. project each point into every aligned camera that sees it, then run `DetectMarkers`
-     (non-coded `Circular`, full resolution, 2 px floor) to FIND the printed target near
-     each projection, and `RefineMarkers` to snap the detected centre onto the printed
-     centre with multi-view consensus;
-  4. keep only detections within the search radius of the projection (the RTK-only
-     georeference is ~16 px off, so the search radius, not one target radius, is the
-     "right target" gate) and, where the refinement triangulated the marker, a small
-     reprojection residual; write the accepted observations as an ODM `gcp_list.txt`
-     plus a JSON summary.
+  5. project each point into every aligned camera that sees it, then run `DetectMarkers`
+     (non-coded `Circular`, full resolution, 2 px floor, both polarities) to FIND the
+     printed target near each projection, and `RefineMarkers` to snap the detected centre
+     onto the printed centre with multi-view consensus;
+  6. keep only detections within the search radius of the projection and, where the
+     refinement triangulated the marker, a small reprojection residual; write the
+     accepted observations as an ODM `gcp_list.txt` plus a JSON summary.
   The accepted `gcp_list` is committed under `tools/bench/data/eurosdr/` as our own
   derived data (CC BY 4.0, Mills et al. 2023, Newcastle University / EuroSDR), so the
   weekly `gcp-eurosdr` run reads it from the repository and never re-measures. The
