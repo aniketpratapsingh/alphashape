@@ -336,13 +336,34 @@ data (see below), so the ordinary `gcp-eurosdr` run needs no measurement step.
   would silently pair every point with the wrong name. The xlsx is the authoritative
   file (it is the one the paper describes), and the measurement script reads labels
   from the xlsx only.
-- The smallest usable photogrammetric flight (P4 RTK `100_0004`, 430 images) is larger
-  than the current ground-control block (176 images). The `gcp-rtk` block (176 images,
-  5 folds) takes ~3 h of protocol time on a shared runner, so 430 images with 8 folds
-  would run past the 330-minute job ceiling. The manifest therefore caps the weekly
-  `gcp-eurosdr` run with `max_images`, selecting the nearest-to-centroid cluster the
-  pipeline datasets use (a contiguous block with the overlap the alignment needs) and
-  recording the choice and the selected file names in the report.
+- The whole 430-image flight is used, and the block is aligned RTK-first. Two
+  attempts to shrink the block failed and are worth recording:
+  - A stride of 4 (108 images) halves the flight's forward overlap, so only 23 of
+    108 cameras registered, and the 23 that did formed a collinear strip, so
+    `UpdateTransform` refused the fit ("need 3 non-collinear reference points").
+    Every fold then reported "missing or unpositioned check point(s)".
+  - The incremental `AlignCameras` on the full flight registers all 430 cameras at
+    0.84 px, but its single global similarity fit keeps only 6 of 430 cameras
+    inside the 0.5 m inlier threshold: the similarity is extrapolated from a small
+    cluster and is metres off across the rest of the block. A bundle adjustment
+    started from that georeference diverges (RMS 0.84 -> 2.8e8 px, prior RMS 1082
+    sigma, because the priors are ~19 m from the poses it linearises around).
+  The protocol's `--align-from-reference` (the manifest's
+  `gcp.align_from_reference`) avoids the global fit: `AlignFromReference` places
+  every camera from its own RTK position and gimbal attitude in a fresh unit-scale
+  ENU frame, `TriangulateTiePoints` rebuilds the tie points, and `OptimizeCameras`
+  refines the poses with the RTK positions as priors. It registers 430/430 and
+  bundle-adjusts to 0.62 px with a prior RMS of 0.14 sigma (2.5 mm at the 1.8 cm
+  reported accuracy), which is the evidence that the RTK positions are good and
+  the global fit was the problem.
+- **First measured result (2026-11-20, run 44673527305): 5.76 cm horizontal
+  check-point RMS over the 8 folds, a MISS against the 5 cm target.** The
+  `camera_rtk_gcps` variant is the best of the four (uniform 5.71 cm, engine
+  defaults 8.40 cm, GCPs only 8.32 cm). The vertical RMS is 7.11 cm and the 3D
+  total 9.15 cm. The per-fold horizontal errors run 1.1 cm (GA1) to 10.5 cm (GF8),
+  so the miss is not one bad point: it is a block-wide residual of a few
+  centimetres. The protocol time is 98 min for the full flight and 8 folds, well
+  inside the 330-minute job ceiling, so the whole flight is affordable.
 
 ## Adding a dataset
 
