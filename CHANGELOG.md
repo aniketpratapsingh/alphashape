@@ -193,6 +193,17 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **GNSS-aided alignment (`AlignCameras/reference_priors`).** An opt-in
+  parameter (default off) that adds each camera's GNSS reference as a weighted
+  centre prior inside the bundle adjustments run during incremental alignment,
+  so the references hold the block's shape as it grows instead of only fitting
+  a similarity afterwards. The SfM -> ENU similarity is re-estimated after each
+  global BA (Umeyama 1991 inside the existing RANSAC), the priors are whitened
+  by each camera's own reference accuracy and robustified with the same Huber
+  loss `OptimizeCameras` uses, and cameras without an enabled reference get no
+  prior. With the parameter off the build is bit-identical to before. See
+  Triggs et al. 2000, "Bundle Adjustment -- A Modern Synthesis", and Cucci,
+  Rehak & Skaloud 2017, INS/GNSS-aided BA.
 - **Marker placement in the GUI.** The central area gains a Photo tab beside the
   3-D Model view: double-click a photo in the Photos dock (or use Reference >
   Place on photo) to open it, then right-click to add a marker at the cursor,
