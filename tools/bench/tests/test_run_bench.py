@@ -118,7 +118,13 @@ class GcpManifestTest(unittest.TestCase):
         # cameras inside its inlier threshold on this flight, so the block
         # registers a small fraction of its images. The RTK-first path places
         # every camera from its own position and attitude instead.
-        self.assertTrue(self.dataset["gcp"].get("align_from_reference"))
+        #
+        # EXPERIMENT (exp-alignpriors-eurosdr): the RTK-first path is turned
+        # off and AlignCameras runs with reference_priors=True instead, to
+        # measure whether GNSS-aided incremental alignment holds the block's
+        # shape. The manifest must say so.
+        self.assertFalse(self.dataset["gcp"].get("align_from_reference"))
+        self.assertTrue(self.dataset["gcp"].get("alignment_reference_priors"))
 
     def test_the_horizontal_target_is_the_five_centimetre_gate(self):
         # The second ground-control block exists to test the same 5 cm target
