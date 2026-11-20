@@ -262,6 +262,170 @@ AlignmentReport evaluate(const GtScene& scene, const BuilderResult& result) {
     return report;
 }
 
+// ---------------------------------------------------------------------------
+// Reference priors: a long strip with injected drift
+// ---------------------------------------------------------------------------
+
+/// A long straight strip of `n_cameras` nadir cameras flying along +X over a
+/// ground plane, with `n_points` points spread over the strip. The scene is
+/// built in a metric frame, so `true_centres` are the GNSS truth. The
+/// references stay on the truth.
+///
+/// The flight line carries a small lateral wobble (real drones do not fly a
+/// perfectly straight line), so the camera centres are NOT collinear and the
+/// reference similarity fit is well posed.
+///
+/// `drift_m` injects a systematic shape error: the OBSERVATIONS are generated
+/// from a trajectory offset laterally from the truth by a quadratic ramp that
+/// reaches `drift_m` at the far end, while the references stay on the truth.
+/// The plain build recovers the offset trajectory (it fits the observations),
+/// so its centres drift off the truth; the priors pull them back. This is the
+/// incremental-drift scenario the priors exist for.
+GtScene make_strip_scene(std::uint32_t seed, double sigma_px, int n_cameras = 24,
+                         int n_points = 900, double strip_len = 120.0,
+                         double drift_m = 0.0) {
+    GtScene scene;
+    scene.cal = frame_calibration();
+    std::mt19937 rng(seed);
+
+    const double half = 0.5 * strip_len;
+    const auto dx = [half](std::mt19937& g) { return rng::uniform_real(g, -half, half); };
+    const auto dy = [](std::mt19937& g) { return rng::uniform_real(g, -12.0, 12.0); };
+    const auto dz = [](std::mt19937& g) { return rng::uniform_real(g, -0.5, 0.5); };
+    for (int i = 0; i < n_points; ++i) {
+        scene.true_points.push_back(draw3(rng, dx, dy, dz));
+    }
+
+    const double altitude = 30.0;
+    const double pi = 3.14159265358979323846;
+    std::vector<AbsolutePose> obs_poses;  // the trajectory the pixels come from
+    for (int c = 0; c < n_cameras; ++c) {
+        const double f = static_cast<double>(c) / static_cast<double>(n_cameras - 1);
+        const double x = -half + strip_len * f;
+        // Lateral wobble of +/-1 m keeps the centres non-collinear without
+        // leaving the strip.
+        const double y = std::sin(f * 2.0 * pi) * 1.0;
+        const Eigen::Vector3d centre(x, y, altitude);
+        scene.true_centres.push_back(centre);
+        // Nadir: camera looks down -Z, +X right, +Y down (world +Y).
+        Eigen::Matrix3d R_wc;
+        R_wc.col(0) = Eigen::Vector3d::UnitX();
+        R_wc.col(1) = Eigen::Vector3d::UnitY();
+        R_wc.col(2) = -Eigen::Vector3d::UnitZ();
+        AbsolutePose pose;
+        pose.R = R_wc.transpose();
+        pose.t = -pose.R * centre;
+        scene.true_poses.push_back(pose);
+
+        // The observation trajectory drifts laterally by a quadratic ramp.
+        const Eigen::Vector3d obs_centre = centre + Eigen::Vector3d(0.0, drift_m * f * f, 0.0);
+        AbsolutePose obs_pose;
+        obs_pose.R = pose.R;
+        obs_pose.t = -pose.R * obs_centre;
+        obs_poses.push_back(obs_pose);
+    }
+
+    const auto noise = [sigma_px](std::mt19937& g) { return rng::normal(g, 0.0, sigma_px); };
+    std::vector<std::vector<std::uint8_t>> visible(static_cast<std::size_t>(n_cameras));
+    for (int c = 0; c < n_cameras; ++c) {
+        BuilderCamera bc;
+        bc.id = c;
+        bc.calibration = scene.cal;
+        bc.pixels.assign(scene.true_points.size(), Eigen::Vector2d(0.0, 0.0));
+        visible[static_cast<std::size_t>(c)].assign(scene.true_points.size(), 0);
+        for (std::size_t p = 0; p < scene.true_points.size(); ++p) {
+            const Eigen::Vector3d p_cam =
+                obs_poses[static_cast<std::size_t>(c)].R * scene.true_points[p] +
+                obs_poses[static_cast<std::size_t>(c)].t;
+            if (!(p_cam.z() > 0.0)) {
+                continue;
+            }
+            const Eigen::Vector2d px = scene.cal.project(p_cam);
+            if (px.x() < 0.0 || px.x() > kWidth || px.y() < 0.0 || px.y() > kHeight) {
+                continue;
+            }
+            visible[static_cast<std::size_t>(c)][p] = 1;
+            bc.pixels[p] = px + draw2(rng, noise, noise);
+        }
+        scene.input.cameras.push_back(bc);
+    }
+
+    for (std::size_t p = 0; p < scene.true_points.size(); ++p) {
+        Track track;
+        for (int c = 0; c < n_cameras; ++c) {
+            if (visible[static_cast<std::size_t>(c)][p] != 0) {
+                track.observations.push_back(Observation{c, static_cast<std::uint32_t>(p)});
+            }
+        }
+        if (track.observations.size() < 2) {
+            continue;
+        }
+        scene.track_to_point.push_back(p);
+        scene.input.tracks.push_back(track);
+    }
+    for (int i = 0; i < n_cameras; ++i) {
+        for (int j = i + 1; j < n_cameras; ++j) {
+            PairMatches pair;
+            pair.camera_a = i;
+            pair.camera_b = j;
+            for (std::size_t t = 0; t < scene.input.tracks.size(); ++t) {
+                bool in_i = false, in_j = false;
+                for (const Observation& o : scene.input.tracks[t].observations) {
+                    in_i = in_i || o.camera_id == i;
+                    in_j = in_j || o.camera_id == j;
+                }
+                if (in_i && in_j) {
+                    const std::uint32_t p = static_cast<std::uint32_t>(scene.track_to_point[t]);
+                    pair.matches.push_back(KeypointMatch{p, p});
+                }
+            }
+            if (!pair.matches.empty()) {
+                scene.input.matches.push_back(pair);
+            }
+        }
+    }
+    return scene;
+}
+
+/// Attach a GNSS reference to every camera of `scene` (the true centre, in the
+/// scene's own metric frame) with a per-axis sigma. Cameras listed in
+/// `without_reference` get none.
+void attach_references(GtScene& scene, double sigma_m,
+                       const std::vector<int>& without_reference = {}) {
+    for (std::size_t c = 0; c < scene.input.cameras.size(); ++c) {
+        const bool skip = std::find(without_reference.begin(), without_reference.end(),
+                                    static_cast<int>(c)) != without_reference.end();
+        if (skip) {
+            continue;
+        }
+        scene.input.cameras[c].reference_enu = scene.true_centres[c];
+        scene.input.cameras[c].reference_sigma = Eigen::Vector3d::Constant(sigma_m);
+    }
+}
+
+/// Worst camera-centre error of `result` against the truth, after the best
+/// similarity fit from the reconstructed centres to the truth centres. This is
+/// the shape error the references are meant to hold down.
+double worst_centre_error(const GtScene& scene, const BuilderResult& result) {
+    std::vector<Eigen::Vector3d> recon, truth;
+    for (std::size_t c = 0; c < result.poses.size(); ++c) {
+        if (result.poses[c].has_value()) {
+            recon.push_back(camera_centre(*result.poses[c]));
+            truth.push_back(scene.true_centres[c]);
+        }
+    }
+    if (recon.size() < 3) {
+        return 1e9;
+    }
+    const Similarity sim = umeyama(recon, truth);
+    double worst = 0.0;
+    for (std::size_t k = 0; k < recon.size(); ++k) {
+        const Eigen::Vector3d mapped = sim.scale * sim.R * recon[k] + sim.t;
+        worst = std::max(worst, (mapped - truth[k]).norm());
+    }
+    return worst;
+}
+
 // TESTS
 
 TEST(StructureBuilder, RecoversArcScene) {
@@ -494,6 +658,93 @@ TEST(StructureBuilder, MalformedInputThrows) {
         bad.tracks.front().observations.front().keypoint_index = 100000;
         EXPECT_THROW(build_incremental(bad, BuilderOptions{}), ValueError);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reference priors (GNSS-aided BA)
+// ---------------------------------------------------------------------------
+
+/// (a) On a long strip the references hold the block's shape: with the priors
+/// on, the camera centres stay within the reference accuracy where the default
+/// build bends by more.
+TEST(StructureBuilder, ReferencePriorsHoldStripShape) {
+    GtScene scene = make_strip_scene(11, 0.5, 24, 900, 120.0, /*drift_m=*/3.0);
+    attach_references(scene, 0.05);  // 5 cm per axis, a typical RTK fix
+
+    BuilderOptions plain;
+    const BuilderResult without = build_incremental(scene.input, plain);
+
+    BuilderOptions priors;
+    priors.reference_priors = true;
+    const BuilderResult with = build_incremental(scene.input, priors);
+
+    ASSERT_EQ(without.registered, scene.input.cameras.size());
+    ASSERT_EQ(with.registered, scene.input.cameras.size());
+
+    const double worst_plain = worst_centre_error(scene, without);
+    const double worst_priors = worst_centre_error(scene, with);
+    std::printf("[structure_builder] strip: worst centre plain = %.4f m, priors = %.4f m\n",
+                worst_plain, worst_priors);
+
+    // The drift bends the plain build well past the reference accuracy; the
+    // priors hold the block's shape to it.
+    EXPECT_GT(worst_plain, 0.15) << "the drift did not bend the plain build";
+    EXPECT_LT(worst_priors, worst_plain) << "priors did not improve the shape";
+    EXPECT_LT(worst_priors, 0.05 * 3.0) << "priors left " << worst_priors << " m of shape error";
+}
+
+/// (b) With the option off the build is bit-identical to the pre-existing
+/// behaviour: same poses and same points.
+TEST(StructureBuilder, ReferencePriorsOffIsBitIdentical) {
+    GtScene scene = make_strip_scene(12, 0.5);
+    attach_references(scene, 0.05);
+
+    const BuilderResult baseline = build_incremental(scene.input, BuilderOptions{});
+    BuilderOptions off;
+    off.reference_priors = false;
+    const BuilderResult explicit_off = build_incremental(scene.input, off);
+
+    ASSERT_EQ(baseline.poses.size(), explicit_off.poses.size());
+    ASSERT_EQ(baseline.points.size(), explicit_off.points.size());
+    EXPECT_EQ(baseline.registered, explicit_off.registered);
+    for (std::size_t c = 0; c < baseline.poses.size(); ++c) {
+        ASSERT_EQ(baseline.poses[c].has_value(), explicit_off.poses[c].has_value());
+        if (baseline.poses[c].has_value()) {
+            EXPECT_TRUE(baseline.poses[c]->R == explicit_off.poses[c]->R) << "camera " << c;
+            EXPECT_TRUE(baseline.poses[c]->t == explicit_off.poses[c]->t) << "camera " << c;
+        }
+    }
+    for (std::size_t t = 0; t < baseline.points.size(); ++t) {
+        ASSERT_EQ(baseline.points[t].has_value(), explicit_off.points[t].has_value());
+        if (baseline.points[t].has_value()) {
+            EXPECT_TRUE(*baseline.points[t] == *explicit_off.points[t]) << "track " << t;
+        }
+    }
+}
+
+/// (c) Cameras without a reference are unaffected by the priors: they still
+/// register, and the priors on the referenced cameras hold the block's shape
+/// so the unreferenced tail lands in the right place too. No drift here, so
+/// the only thing under test is that a missing reference is not an error and
+/// does not distort the block.
+TEST(StructureBuilder, ReferencePriorsLeaveUnreferencedCamerasAlone) {
+    GtScene scene = make_strip_scene(13, 0.5);
+    const int n = static_cast<int>(scene.input.cameras.size());
+    attach_references(scene, 0.05, {n - 2, n - 1});
+
+    BuilderOptions priors;
+    priors.reference_priors = true;
+    const BuilderResult with = build_incremental(scene.input, priors);
+
+    ASSERT_EQ(with.registered, scene.input.cameras.size());
+    // The unreferenced cameras still have a pose.
+    EXPECT_TRUE(with.poses[static_cast<std::size_t>(n - 1)].has_value());
+    EXPECT_TRUE(with.poses[static_cast<std::size_t>(n - 2)].has_value());
+
+    // The whole block, referenced and not, stays on the truth.
+    const double worst = worst_centre_error(scene, with);
+    std::printf("[structure_builder] strip, 2 unreferenced: worst centre = %.4f m\n", worst);
+    EXPECT_LT(worst, 0.05 * 3.0);
 }
 
 // TESTS

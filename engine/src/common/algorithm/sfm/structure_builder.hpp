@@ -38,6 +38,18 @@ struct BuilderCamera {
     std::vector<Eigen::Vector2d> pixels;
     /// Already-aligned camera to keep when continuing an alignment.
     std::optional<AbsolutePose> initial_pose;
+    /// GNSS reference position in a metric ENU frame (metres), when the camera
+    /// carries an enabled reference. Used only when
+    /// BuilderOptions::reference_priors is on; the builder fits the SfM -> ENU
+    /// similarity itself, so the caller does not need to know the SfM frame.
+    std::optional<Eigen::Vector3d> reference_enu;
+    /// Per-axis 1-sigma accuracy of `reference_enu`, metres. A non-positive or
+    /// non-finite axis is unconstrained, matching BACentrePrior.
+    Eigen::Vector3d reference_sigma = Eigen::Vector3d::Zero();
+    /// GNSS antenna lever arm in the CAMERA frame, metres. Zero means the
+    /// reference measures the projection centre. Scaled into the SfM frame by
+    /// the fitted similarity before it reaches BACentrePrior.
+    Eigen::Vector3d reference_lever_arm = Eigen::Vector3d::Zero();
 };
 
 struct BuilderInput {
@@ -61,6 +73,21 @@ struct BuilderOptions {
     /// then every max(1, registered/10).
     std::size_t global_ba_every = 1;
     std::uint64_t seed = 0x5eed;
+
+    /// GNSS-aided bundle adjustment (Triggs et al. 2000, "Bundle Adjustment --
+    /// A Modern Synthesis", sec. on priors; Cucci, Rehak & Skaloud 2017,
+    /// INS/GNSS-aided BA). When true, every global BA after the first three
+    /// non-collinear referenced cameras are registered adds a per-camera centre
+    /// prior in the metric ENU frame, whitened by that camera's own reference
+    /// accuracy and robustified with the same Huber loss OptimizeCameras uses.
+    /// The SfM -> ENU similarity is re-estimated after each global BA, so the
+    /// SfM frame itself never changes mid-build. Off by default: a build with
+    /// this false is bit-identical to the pre-existing behaviour.
+    bool reference_priors = false;
+    /// Ours: the RANSAC threshold of the SfM -> ENU similarity fit, in metres.
+    /// The georeference stage uses max(0.5 m, 5 x median horizontal accuracy);
+    /// the builder uses the same rule so the two agree on what an inlier is.
+    double reference_prior_gate_m = 0.5;
 };
 
 struct BuilderResult {

@@ -40,13 +40,18 @@
 #include "base/utils/error.hpp"
 #include "base/utils/log.hpp"
 #include "common/algorithm/feature/detect_features_task.hpp"  // keypoint_to_pixel
+#include "common/algorithm/reference/convert_reference.hpp"
+#include "common/algorithm/reference/reference_orientation.hpp"
 #include "common/algorithm/sfm/absolute_pose.hpp"
 #include "common/algorithm/sfm/georeference.hpp"
 #include "common/algorithm/sfm/structure_builder.hpp"
 #include "common/io/camera_image.hpp"
+#include "model/geo/geodesy.hpp"
 
 namespace alphashape {
 namespace {
+
+namespace geo = alphashape::geo;
 
 /// The 4x4 [R t; 0 1] form of an absolute pose (X_cam = R X_world + t).
 Transform pose_to_transform(const sfm::AbsolutePose& pose) {
@@ -69,6 +74,10 @@ sfm::AbsolutePose transform_to_pose(const Transform& transform) {
 void AlignCamerasTask::declare_params(Params& params) const {
     params.declare({"reset_alignment", ParamType::Bool, false,
                     "Discard the existing alignment and realign every camera from scratch."});
+    params.declare({"reference_priors", ParamType::Bool, false,
+                    "Use camera GNSS references as weighted priors inside the bundle "
+                    "adjustments run during alignment, so the block's shape is held by "
+                    "the references as it grows (GNSS-aided BA). Off by default."});
 }
 
 std::vector<Stage> AlignCamerasTask::stages() const {
@@ -77,6 +86,7 @@ std::vector<Stage> AlignCamerasTask::stages() const {
 
 void AlignCamerasTask::apply(Document& document, Params& params, const Progress& progress) {
     const bool reset_alignment = params.get_bool("reset_alignment");
+    const bool reference_priors = params.get_bool("reference_priors");
 
     // -- validate everything before touching the chunk -----------------------
     progress.update("prepare", 0.0);
@@ -90,8 +100,10 @@ void AlignCamerasTask::apply(Document& document, Params& params, const Progress&
     }
 
     std::unordered_map<std::int32_t, const Camera*> camera_by_id;
-    for (const Camera& camera : chunk->cameras()) {
-        camera_by_id[camera.id] = &camera;
+    std::unordered_map<std::int32_t, std::size_t> camera_slot;
+    for (std::size_t i = 0; i < chunk->cameras().size(); ++i) {
+        camera_by_id[chunk->cameras()[i].id] = &chunk->cameras()[i];
+        camera_slot[chunk->cameras()[i].id] = i;
     }
     std::unordered_map<std::int32_t, const KeypointSet*> set_by_id;
     for (const KeypointSet& set : tie_points.keypoint_sets) {
@@ -136,6 +148,47 @@ void AlignCamerasTask::apply(Document& document, Params& params, const Progress&
 
     sfm::BuilderInput input;
     input.cameras.reserve(input_ids.size());
+
+    // GNSS references, read once in a metric ENU frame when the priors are on.
+    // The origin is the geodetic of the mean ECEF of the referenced cameras, so
+    // the ENU linearisation is exact over the block's extent. A conversion that
+    // cannot run leaves the priors off rather than failing the alignment.
+    std::vector<std::optional<Eigen::Vector3d>> camera_geodetic;
+    std::optional<geo::Geodetic> enu_origin;
+    if (reference_priors) {
+        try {
+            camera_geodetic = reference::geodetic_camera_locations(*chunk);
+        } catch (const Error&) {
+            camera_geodetic.clear();
+        }
+        Eigen::Vector3d mean_ecef = Eigen::Vector3d::Zero();
+        std::size_t referenced = 0;
+        for (const Camera& camera : chunk->cameras()) {
+            if (!camera.reference.enabled) {
+                continue;
+            }
+            if (std::find(input_ids.begin(), input_ids.end(), camera.id) == input_ids.end()) {
+                continue;
+            }
+            const std::size_t slot = camera_slot.at(camera.id);
+            if (slot >= camera_geodetic.size() || !camera_geodetic[slot].has_value()) {
+                continue;
+            }
+            const Eigen::Vector3d& loc = *camera_geodetic[slot];
+            if (!std::isfinite(loc.x()) || !std::isfinite(loc.y()) || !std::isfinite(loc.z())) {
+                continue;
+            }
+            mean_ecef += geo::geodetic_to_ecef(geo::Geodetic{loc.x(), loc.y(), loc.z()});
+            ++referenced;
+        }
+        if (referenced >= 3) {
+            mean_ecef /= static_cast<double>(referenced);
+            enu_origin = geo::ecef_to_geodetic(mean_ecef);
+        }
+    }
+    const Transform ecef_to_enu =
+        enu_origin.has_value() ? geo::ecef_to_enu(*enu_origin) : Transform::Identity();
+
     for (const std::int32_t id : input_ids) {
         const Camera& camera = *camera_by_id.at(id);
         const KeypointSet& set = *set_by_id.at(id);
@@ -153,6 +206,25 @@ void AlignCamerasTask::apply(Document& document, Params& params, const Progress&
         if (!reset_alignment && camera.enabled) {
             builder_camera.initial_pose = transform_to_pose(camera.pose);
         }
+        // GNSS reference in the ENU frame, when the priors are on and the
+        // camera carries an enabled, finite reference.
+        if (enu_origin.has_value() && camera.reference.enabled) {
+            const std::size_t slot = camera_slot.at(camera.id);
+            if (slot < camera_geodetic.size() && camera_geodetic[slot].has_value()) {
+                const Eigen::Vector3d& loc = *camera_geodetic[slot];
+                if (std::isfinite(loc.x()) && std::isfinite(loc.y()) && std::isfinite(loc.z())) {
+                    const Eigen::Vector3d ecef =
+                        geo::geodetic_to_ecef(geo::Geodetic{loc.x(), loc.y(), loc.z()});
+                    builder_camera.reference_enu =
+                        (ecef_to_enu * ecef.homogeneous()).head<3>();
+                    builder_camera.reference_sigma = camera.reference.accuracy;
+                    const Antenna& antenna = reference::effective_antenna(*chunk, camera);
+                    if (antenna.is_set() || antenna.boresight_deg.has_value()) {
+                        builder_camera.reference_lever_arm = antenna.camera_offset();
+                    }
+                }
+            }
+        }
         input.cameras.push_back(std::move(builder_camera));
     }
     input.matches = tie_points.matches;
@@ -168,8 +240,10 @@ void AlignCamerasTask::apply(Document& document, Params& params, const Progress&
     // The cancelled callback is polled between registrations, outside any
     // OpenMP region, so it may safely call back into the host.
     progress.update("align", 0.0);
+    sfm::BuilderOptions builder_options;
+    builder_options.reference_priors = reference_priors;
     const sfm::BuilderResult result =
-        sfm::build_incremental(input, sfm::BuilderOptions{},
+        sfm::build_incremental(input, builder_options,
                                [&progress]() { return progress.is_cancelled(); });
     progress.update("align", 1.0);
 
