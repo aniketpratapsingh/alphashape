@@ -229,7 +229,8 @@
         "marker_location_accuracy_m": 0.015,
         "gcp_height": "ellipsoidal",
         "diagnostics": false,
-        "align_from_reference": true
+        "align_from_reference": false,
+        "alignment_reference_priors": true
       },
       "param_overrides": {
         "MatchPhotos": {

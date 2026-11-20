@@ -1719,7 +1719,11 @@ def align_block(args, images, gcps):
         doc.run_task("TriangulateTiePoints")
         chunk.optimizeCameras()
     else:
-        doc.run_task("AlignCameras")
+        # GNSS-aided alignment: reference_priors feeds the camera references
+        # into the bundle adjustments run during incremental alignment, so the
+        # references hold the block's shape as it grows.
+        reference_priors = bool(getattr(args, "alignment_reference_priors", False))
+        doc.run_task("AlignCameras", reference_priors=reference_priors)
     project = project_path_for(args)
     doc.save(project)
     total = len(chunk.cameras)
@@ -4266,6 +4270,11 @@ def parse_args(argv):
                              "flight whose single global similarity fit keeps only "
                              "a small fraction of the cameras, which leaves the "
                              "block registering few images")
+    parser.add_argument("--alignment-reference-priors", action="store_true",
+                        help="pass reference_priors=True to AlignCameras so the "
+                             "camera GNSS references are weighted priors inside "
+                             "the bundle adjustments run during incremental "
+                             "alignment (GNSS-aided BA)")
     parser.add_argument("--match-param", action="append", default=[],
                         metavar="KEY=VALUE",
                         help="extra MatchPhotos argument for the block's "

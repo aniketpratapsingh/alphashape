@@ -1790,6 +1790,10 @@ def run_gcp_validation(
     # manifest opts a dataset in.
     if gcp.get("align_from_reference"):
         command.append("--align-from-reference")
+    # GNSS-aided alignment: pass reference_priors=True to AlignCameras so the
+    # camera references hold the block's shape during incremental alignment.
+    if gcp.get("alignment_reference_priors"):
+        command.append("--alignment-reference-priors")
     # The timing diagnostics need the RTK module's per-exposure event marks.
     mrk = references.get("mrk")
     if mrk:
