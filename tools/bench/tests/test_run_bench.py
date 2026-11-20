@@ -99,6 +99,47 @@ class ManifestTest(unittest.TestCase):
         reordered["datasets"] = dict(reversed(list(reordered["datasets"].items())))
         self.assertEqual(run_bench.manifest_hash(reordered), baseline)
 
+
+class GcpManifestTest(unittest.TestCase):
+    """The EuroSDR block's manifest choices, which a silent edit would undo."""
+
+    def setUp(self):
+        self.dataset = run_bench.load_manifest()["datasets"]["gcp-eurosdr"]
+
+    def test_the_whole_flight_is_used(self):
+        # A strided subset was tried and rejected: taking every fourth frame
+        # halves the forward overlap and only 23 of 108 cameras registered, so
+        # the block could not be georeferenced. The full 430-image flight is
+        # what aligns.
+        self.assertIsNone(self.dataset.get("max_images"))
+
+    def test_the_block_is_aligned_from_its_rtk_solution(self):
+        # AlignCameras' single global similarity fit keeps only 6 of 430
+        # cameras inside its inlier threshold on this flight, so the block
+        # registers a small fraction of its images. The RTK-first path places
+        # every camera from its own position and attitude instead.
+        self.assertTrue(self.dataset["gcp"].get("align_from_reference"))
+
+    def test_the_horizontal_target_is_the_five_centimetre_gate(self):
+        # The second ground-control block exists to test the same 5 cm target
+        # as gcp-rtk; loosening it here would defeat the point.
+        self.assertEqual(self.dataset["gcp"]["target_horizontal_m"], 0.05)
+
+    def test_the_height_is_ellipsoidal(self):
+        # The xlsx carries ETRS89 ellipsoidal heights, so no geoid model is
+        # needed and the protocol must not be told otherwise.
+        self.assertEqual(self.dataset["gcp"]["gcp_height"], "ellipsoidal")
+
+    def test_the_observations_are_committed_derived_data(self):
+        # The publisher ships no observations, so the manifest must read ours
+        # from the repository rather than download them.
+        kinds = {reference["kind"]: reference
+                 for reference in self.dataset["reference_files"]}
+        self.assertIn("gcp_list", kinds)
+        self.assertIn("gcp_names", kinds)
+        for kind in ("gcp_list", "gcp_names"):
+            self.assertTrue(kinds[kind].get("repo_path"), kind)
+
     def test_an_unknown_version_is_rejected(self):
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as handle:
             json.dump({"version": 99, "datasets": {}}, handle)

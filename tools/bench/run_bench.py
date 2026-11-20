@@ -1785,6 +1785,11 @@ def run_gcp_validation(
     if gcp.get("camera_accuracy_uniform_m") is not None:
         command.extend(["--camera-accuracy-uniform",
                         str(gcp["camera_accuracy_uniform_m"])])
+    # A long flight whose single global similarity fit keeps only a small
+    # fraction of the cameras needs the RTK-first alignment instead; the
+    # manifest opts a dataset in.
+    if gcp.get("align_from_reference"):
+        command.append("--align-from-reference")
     # The timing diagnostics need the RTK module's per-exposure event marks.
     mrk = references.get("mrk")
     if mrk:

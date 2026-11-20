@@ -1679,6 +1679,19 @@ def align_block(args, images, gcps):
     The same block is reloaded for every fold, so the expensive matching and
     alignment happen exactly once. keypoint_limit_per_mpx is the 16 GB-runner
     budget recorded in the manifest; the dense stage never runs.
+
+    ``--align-from-reference`` replaces the incremental alignment with the
+    RTK-first path: place every camera from its own RTK position and gimbal
+    attitude (``AlignFromReference``), rebuild the tie points from the stored
+    matches (``TriangulateTiePoints``), then refine the poses with the RTK
+    positions as priors (``OptimizeCameras``). It exists because
+    ``AlignCameras`` georeferences the block with ONE global similarity fitted
+    to the camera centres, and on a long flight that fit can keep only a small
+    fraction of the cameras inside its inlier threshold: the similarity is then
+    extrapolated from a cluster and is metres off across the rest of the block,
+    so the block registers a small fraction of its images. The RTK-first path
+    avoids the global fit entirely. It needs the XMP gimbal attitude, so the
+    import reads it.
     """
     doc = alphashape.Document()
     chunk = doc.add_chunk("Helenenschacht RTK block")
@@ -1688,13 +1701,25 @@ def align_block(args, images, gcps):
     # keep the historic behaviour (no XMP accuracy) so the comparison against
     # earlier runs is like for like.
     per_image = args.camera_accuracy == CAMERA_ACCURACY_PER_IMAGE
+    align_from_reference = bool(getattr(args, "align_from_reference", False))
     doc.run_task("AddPhotos", filenames=images,
-                 load_xmp_accuracy=per_image)
+                 load_xmp_accuracy=per_image,
+                 load_xmp_orientation=align_from_reference)
     chunk.crs_epsg = 4326
     match_params = getattr(args, "match_params", {}) or {}
     doc.run_task("MatchPhotos", keypoint_limit_per_mpx=args.keypoint_limit,
                  **match_params)
-    doc.run_task("AlignCameras")
+    if align_from_reference:
+        # AlignFromReference only places ENABLED cameras, and AddPhotos leaves
+        # every camera disabled (it has not been aligned yet).
+        for camera in chunk.cameras:
+            if not camera.enabled:
+                camera.enabled = True
+        doc.run_task("AlignFromReference")
+        doc.run_task("TriangulateTiePoints")
+        chunk.optimizeCameras()
+    else:
+        doc.run_task("AlignCameras")
     project = project_path_for(args)
     doc.save(project)
     total = len(chunk.cameras)
@@ -1709,6 +1734,7 @@ def align_block(args, images, gcps):
             "cameras_aligned": aligned,
             "keypoint_limit_per_mpx": args.keypoint_limit,
             "match_params": dict(match_params),
+            "align_from_reference": align_from_reference,
             "camera_accuracy": args.camera_accuracy,
             "xmp_accuracy_imported":
                 args.camera_accuracy == CAMERA_ACCURACY_PER_IMAGE,
@@ -4232,6 +4258,14 @@ def parse_args(argv):
                              "the camera_rtk_gcps variant and the fit's datum")
     parser.add_argument("--keypoint-limit", type=int, default=250,
                         help="MatchPhotos keypoint_limit_per_mpx for the block")
+    parser.add_argument("--align-from-reference", action="store_true",
+                        help="place the cameras from their own RTK position and "
+                             "gimbal attitude (AlignFromReference + "
+                             "TriangulateTiePoints + OptimizeCameras) instead of "
+                             "the incremental AlignCameras. Use it on a long "
+                             "flight whose single global similarity fit keeps only "
+                             "a small fraction of the cameras, which leaves the "
+                             "block registering few images")
     parser.add_argument("--match-param", action="append", default=[],
                         metavar="KEY=VALUE",
                         help="extra MatchPhotos argument for the block's "
