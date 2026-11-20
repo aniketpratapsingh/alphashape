@@ -1,0 +1,22 @@
+From 7ea0fd3ba479845464b34ccf5265b8e6d055cde5 Mon Sep 17 00:00:00 2001
+From: Mike Taves <mwtoews@gmail.com>
+Date: Mon, 21 Sep 2026 22:05:20 +1200
+Subject: [PATCH] CMake: fix issue with target_compile_features
+
+---
+ src/lib_proj.cmake | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/lib_proj.cmake b/src/lib_proj.cmake
+index 24de00b47f..f2b30425b7 100644
+--- a/src/lib_proj.cmake
++++ b/src/lib_proj.cmake
+@@ -393,7 +393,7 @@ add_library(proj
+ add_library(PROJ::proj ALIAS proj)
+ 
+ target_compile_features(proj
+-  PUBLIC
++  PRIVATE
+     c_std_${CMAKE_C_STANDARD}
+     cxx_std_${CMAKE_CXX_STANDARD}
+ )

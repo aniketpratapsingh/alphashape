@@ -452,6 +452,11 @@ jobs:
     continue-on-error: ${{ !inputs.windows-required }}
     env:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-bincache
+      # The proj overlay is the baseline port with its backport patch committed
+      # as a local file instead of fetched from a github.com /commit/<sha>.patch
+      # URL, which GitHub rate-limits for Actions runners (503). Without it a
+      # binary-cache miss forces a source rebuild that dies on that download.
+      VCPKG_OVERLAY_PORTS: ${{ github.workspace }}\.github\vcpkg-overlays
       # pybind11 and its python3 port are absent on purpose: that port ships a
       # vcpkg-cmake-wrapper which forces its own Python headers and libraries
       # into find_package(Python3) whenever Development.Module is requested, so
@@ -1079,6 +1084,10 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.windows) }}
     env:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-bincache
+      # Same proj overlay as the build job: the backport patch is a local file,
+      # so a shard that misses the binary cache can still build proj instead of
+      # dying on a rate-limited github.com /commit/<sha>.patch download.
+      VCPKG_OVERLAY_PORTS: ${{ github.workspace }}\.github\vcpkg-overlays
       # pybind11 and its python3 port are absent on purpose: that port ships a
       # vcpkg-cmake-wrapper which forces its own Python headers and libraries
       # into find_package(Python3) whenever Development.Module is requested, so
