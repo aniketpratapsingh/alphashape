@@ -1314,8 +1314,17 @@ def run(args):
     summary["min_intersection_images"] = MIN_INTERSECTION_IMAGES
     summary["min_baseline_height_ratio"] = MIN_BASELINE_HEIGHT_RATIO
 
-    rows = write_gcp_list(args.gcp_list, stations, observations)
-    log(f"[eurosdr] wrote {rows} observations to {args.gcp_list}")
+    # The full list is what the control/check measure scores, so a check point
+    # the intersection rule excludes is left out of it here, where the rule is
+    # applied; its observations stay in the summary JSON. GCPs are always
+    # written: they are control, never scored.
+    excluded_labels = {record["label"] for record in summary["excluded_stations"]
+                       if record["role"] != "gcp"}
+    scored_stations = [station for station in stations
+                       if station["label"] not in excluded_labels]
+    rows = write_gcp_list(args.gcp_list, scored_stations, observations)
+    log(f"[eurosdr] wrote {rows} observations to {args.gcp_list} "
+        f"({len(excluded_labels)} excluded check point(s) left out)")
     # The ground-control protocol does leave-one-out over EVERY point in the
     # gcp_list, so a 59-station list would be 59 folds. The bench block is the
     # eight GCPs (8 folds, the same shape as gcp-rtk's 5), so a GCP-only list is
