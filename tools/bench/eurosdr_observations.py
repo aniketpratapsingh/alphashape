@@ -171,14 +171,74 @@ XLSX_HEIGHT_COLUMN = 6
 # the authoritative label source; the Phase3 text file's labels are shifted by
 # one and are never read here.
 GCP_LABELS = ("GA1", "GA5", "GA8", "GC6", "GD4", "GF1", "GF4", "GF8")
-# The unnamed row in the xlsx (a station with no label) is given this label so
-# it can be a marker. It is a check point, never a GCP.
+# The station grid is 6 rows (A-F) x 8 columns (1-8); the paper describes the CP
+# test field as exactly that array (Mills et al. 2023, §2.1.2). One xlsx row has
+# no station label in column A. It is not an extra "unnamed" station: the xlsx's
+# shared-strings table still lists `A1` (no data row uses it), and the unlabelled
+# row sits at the A1 lattice cell (row 0, column 0), so the missing grid label is
+# recovered from the labels the sheet does carry rather than guessed. See
+# :func:`infer_unnamed_label`.
+GRID_ROWS = "ABCDEF"
+GRID_COLUMNS = 8
+# Fallback only: used when the missing grid label cannot be identified uniquely
+# (a sheet with more than one grid cell absent, i.e. a data error). A fallback
+# station is never dropped, it is just labelled so it can still be a marker.
 UNNAMED_STATION_LABEL = "UNNAMED"
+# A station is scored only when its accepted observations give a well-conditioned
+# intersection. Decided BEFORE looking at results, from photogrammetric first
+# principles:
+#  * three images are the minimum that yields a triangulation with any redundancy
+#    (two views have zero redundancy and no way to detect a blunder), so fewer
+#    than three accepted images cannot be scored independently;
+#  * the baseline/height ratio is the largest camera-pair baseline over the mean
+#    range to the target. A ratio r corresponds to a parallax of atan(r); the
+#    vertical precision scales as sigma_xy / r relative to the horizontal, so at
+#    r = 0.1 (parallax ~5.7 deg) the height is already ~10x worse than the
+#    horizontal, and a check point below that is limited by its intersection
+#    geometry rather than by the block. This is the standard nadir-block rule of
+#    thumb, and it is exactly the failure of the two consecutive D3 frames (a few
+#    metres of baseline at ~55 m range, r ~ 0.05).
+# A station that fails either test is excluded from scoring, listed with its
+# reason in the summary and the run output, and never silently kept.
+MIN_INTERSECTION_IMAGES = 3
+MIN_BASELINE_HEIGHT_RATIO = 0.1
 
 
 # ---------------------------------------------------------------------------
 # xlsx reader (openpyxl, imported lazily so the helpers below stay importable)
 # ---------------------------------------------------------------------------
+
+
+def grid_labels():
+    """Every label of the 6x8 CP test field, in row-major order (A1..F8)."""
+    return [f"{row}{column}"
+            for row in GRID_ROWS
+            for column in range(1, GRID_COLUMNS + 1)]
+
+
+def infer_unnamed_label(labels):
+    """The single grid label the sheet is missing, or ``None``.
+
+    The CP test field is a 6x8 array (``A1``..``F8``). The xlsx carries every
+    cell but one, and the one unlabelled row is that cell: the sheet's
+    shared-strings table still lists the label (``A1``) even though no data row
+    uses it, and the unlabelled row's coordinates sit at that lattice cell. So
+    the missing label is recovered from the labels the sheet DOES carry rather
+    than guessed.
+
+    Returns the missing label only when exactly one grid cell is absent. A sheet
+    with zero or several grid cells missing is not a single unnamed station (it
+    is a data error or a different layout), so ``None`` is returned and the
+    caller falls back to :data:`UNNAMED_STATION_LABEL` rather than inventing a
+    label. ``labels`` is the set of station labels already read; GCP labels
+    (``GA1`` etc.) and the supplementary ``S1``-``S3`` are not grid cells and are
+    ignored.
+    """
+    present = {str(label).strip() for label in labels if label is not None}
+    missing = [label for label in grid_labels() if label not in present]
+    if len(missing) == 1:
+        return missing[0]
+    return None
 
 
 def read_stations(path):
@@ -192,10 +252,13 @@ def read_stations(path):
     block. The OSGB36/ODN block in the same sheet is orthometric and is not
     read: the protocol needs ellipsoidal heights, and the xlsx supplies them.
 
-    A row with no station label is the one unnamed check point the paper
-    mentions; it is labelled ``UNNAMED`` so it can still be a marker. A row
-    whose coordinates are not finite is a data error and raises, rather than
-    silently dropping a station.
+    A row with no station label is the one grid cell the sheet omits (``A1`` on
+    the published sheet). Its label is recovered from the labels the sheet does
+    carry by :func:`infer_unnamed_label`, so the station is named correctly at
+    the source rather than written as ``UNNAMED``. When the missing cell cannot
+    be identified uniquely the row falls back to :data:`UNNAMED_STATION_LABEL`
+    so it is still a marker. A row whose coordinates are not finite is a data
+    error and raises, rather than silently dropping a station.
     """
     import openpyxl  # noqa: PLC0415 - benchmark-only dependency
 
@@ -205,7 +268,7 @@ def read_stations(path):
             raise ValueError(
                 f"{path}: no sheet named {XLSX_SHEET!r}; found {workbook.sheetnames!r}")
         sheet = workbook[XLSX_SHEET]
-        stations = []
+        rows = []
         for row_index, row in enumerate(
                 sheet.iter_rows(min_row=XLSX_FIRST_DATA_ROW, values_only=True),
                 start=XLSX_FIRST_DATA_ROW):
@@ -232,17 +295,29 @@ def read_stations(path):
             if not (math.isfinite(lat) and math.isfinite(lon) and math.isfinite(height)):
                 raise ValueError(f"{path}: row {row_index} has a non-finite coordinate")
             name = str(label).strip() if label is not None else ""
+            rows.append({"label": name, "lat": lat, "lon": lon, "height": height})
+        if not rows:
+            raise ValueError(f"{path}: no station rows found")
+        # Recover the one grid label the sheet omits (A1 on the published sheet)
+        # from the labels it does carry, so the unlabelled row is named at the
+        # source. Only a single unlabelled row can be that cell; a sheet with
+        # several unlabelled rows is a data error and each falls back.
+        unnamed = [row for row in rows if not row["label"]]
+        inferred = None
+        if len(unnamed) == 1:
+            inferred = infer_unnamed_label(row["label"] for row in rows)
+        stations = []
+        for row in rows:
+            name = row["label"]
             if not name:
-                name = UNNAMED_STATION_LABEL
+                name = inferred or UNNAMED_STATION_LABEL
             stations.append({
                 "label": name,
-                "lat": lat,
-                "lon": lon,
-                "height": height,
+                "lat": row["lat"],
+                "lon": row["lon"],
+                "height": row["height"],
                 "role": "gcp" if name in GCP_LABELS else "check_point",
             })
-        if not stations:
-            raise ValueError(f"{path}: no station rows found")
         return stations
     finally:
         workbook.close()
@@ -424,6 +499,64 @@ def accept_observation(detect_shift_px, target_radius_px, residual_px=None,
     return True
 
 
+def baseline_height_ratio(centres, point):
+    """Largest camera-pair baseline over the mean range to ``point``.
+
+    ``centres`` is a list of camera centres (chunk-local 3-tuples) and ``point``
+    the station's chunk-local position. The ratio is the geometric measure of
+    how well the accepted views condition the intersection: a large baseline at
+    a short range gives a strong parallax and a well-determined height, while a
+    cluster of near-coincident cameras at a long range gives almost none. It is
+    the ratio the exclusion rule (:data:`MIN_BASELINE_HEIGHT_RATIO`) tests.
+
+    Returns ``None`` when there are fewer than two centres or the mean range is
+    not positive (no geometry to measure). Pure: no engine, no numpy.
+    """
+    centres = [tuple(float(value) for value in centre) for centre in centres]
+    if len(centres) < 2:
+        return None
+    ranges = [math.dist(centre, point) for centre in centres]
+    mean_range = sum(ranges) / len(ranges)
+    if not (mean_range > 0.0):
+        return None
+    largest = 0.0
+    for i in range(len(centres)):
+        for j in range(i + 1, len(centres)):
+            largest = max(largest, math.dist(centres[i], centres[j]))
+    return largest / mean_range
+
+
+def intersection_exclusion(accepted_images, centres, point):
+    """Why a station's accepted observations cannot be scored, or ``None``.
+
+    The rule is fixed before any result is seen (see
+    :data:`MIN_INTERSECTION_IMAGES` and :data:`MIN_BASELINE_HEIGHT_RATIO`):
+
+    * fewer than :data:`MIN_INTERSECTION_IMAGES` accepted images — two views
+      have no redundancy, so a blunder cannot be detected and the point is not
+      an independent check;
+    * a baseline/height ratio below :data:`MIN_BASELINE_HEIGHT_RATIO` — the
+      parallax is too small for the height to be determined, so the point's
+      error is set by its own geometry rather than by the block.
+
+    ``accepted_images`` is the list of accepted image labels, ``centres`` the
+    matching camera centres and ``point`` the station's chunk-local position.
+    Returns a short human-readable reason string, or ``None`` when the station
+    is well conditioned. Pure: no engine, no numpy.
+    """
+    if len(accepted_images) < MIN_INTERSECTION_IMAGES:
+        return (f"only {len(accepted_images)} accepted image(s); "
+                f"need >= {MIN_INTERSECTION_IMAGES} for a redundant intersection")
+    ratio = baseline_height_ratio(centres, point)
+    if ratio is None:
+        return "no camera geometry to measure the baseline"
+    if ratio < MIN_BASELINE_HEIGHT_RATIO:
+        return (f"baseline/height ratio {ratio:.3f} < "
+                f"{MIN_BASELINE_HEIGHT_RATIO:.2f}; parallax too small to "
+                f"determine the height")
+    return None
+
+
 def write_gcp_names(path, stations):
     """Write the survey CSV the ground-control protocol matches labels against.
 
@@ -472,7 +605,7 @@ def write_gcp_list(path, stations, observations):
     return len(lines) - 1
 
 
-def summarise(stations, observations, per_point):
+def summarise(stations, observations, per_point, centres=None, local=None):
     """Build the JSON summary: per point, views, detection shift and residual.
 
     ``per_point`` maps a station label to a list of per-view records, each with
@@ -483,6 +616,16 @@ def summarise(stations, observations, per_point):
     accepted, the mean and maximum detection shift and residual, and the role. A
     station with no views is listed with zero counts so a point that was never
     seen is visible rather than absent.
+
+    ``centres`` maps an image label to its camera centre and ``local`` maps a
+    station label to its chunk-local position. When both are supplied, each
+    station is tested against the intersection-conditioning rule
+    (:func:`intersection_exclusion`): a station whose accepted observations
+    cannot give a well-conditioned intersection is marked ``scored: false`` with
+    its ``exclusion_reason``, so the downstream protocol can drop it from
+    scoring and the run output can list it. Without the geometry every station
+    is reported as scored (the rule needs the camera centres to measure the
+    baseline).
     """
     points = []
     for station in stations:
@@ -494,6 +637,12 @@ def summarise(stations, observations, per_point):
         residuals = [view["residual_px"] for view in accepted
                      if view.get("residual_px") is not None
                      and math.isfinite(view["residual_px"])]
+        images = sorted(view["image"] for view in accepted)
+        reason = None
+        if centres is not None and local is not None and label in local:
+            reason = intersection_exclusion(
+                images, [centres[image] for image in images if image in centres],
+                local[label])
         points.append({
             "label": label,
             "role": station["role"],
@@ -503,12 +652,15 @@ def summarise(stations, observations, per_point):
             "max_shift_px": max(shifts) if shifts else None,
             "mean_residual_px": (sum(residuals) / len(residuals)) if residuals else None,
             "max_residual_px": max(residuals) if residuals else None,
-            "images": sorted(view["image"] for view in accepted),
+            "images": images,
+            "scored": reason is None,
+            "exclusion_reason": reason,
         })
     total_views = sum(point["views_projected"] for point in points)
     total_accepted = sum(point["views_accepted"] for point in points)
     gcps = [point for point in points if point["role"] == "gcp"]
     checks = [point for point in points if point["role"] == "check_point"]
+    excluded = [point for point in points if not point["scored"]]
     return {
         "stations": len(points),
         "gcps": len(gcps),
@@ -518,6 +670,12 @@ def summarise(stations, observations, per_point):
         "acceptance_rate": (total_accepted / total_views) if total_views else None,
         "gcps_with_min_views": sum(
             1 for point in gcps if point["views_accepted"] >= MIN_VIEWS_PER_POINT),
+        "scored_stations": len(points) - len(excluded),
+        "excluded_stations": [
+            {"label": point["label"], "role": point["role"],
+             "views_accepted": point["views_accepted"],
+             "reason": point["exclusion_reason"]}
+            for point in excluded],
         "points": points,
     }
 
@@ -666,13 +824,17 @@ def add_stations(chunk, stations):
 def project_stations(chunk, stations):
     """Project every station into every aligned camera that sees it.
 
-    Returns ``(projections, per_point, calibrations, poses)``. ``projections``
-    maps a station label to a list of ``{"camera", "px", "py",
+    Returns ``(projections, per_point, calibrations, poses, centres, local)``.
+    ``projections`` maps a station label to a list of ``{"camera", "px", "py",
     "target_radius_px"}`` dicts, one per camera the point projects into.
     ``per_point`` is the same data keyed for the summary, with the shift and
     residual filled in after refinement. ``calibrations`` and ``poses`` map a
     camera label to its calibration dict and 4x4 pose, so the residual gate can
-    reproject the triangulated marker without another engine call.
+    reproject the triangulated marker without another engine call. ``centres``
+    maps a camera label to its chunk-local centre and ``local`` maps a station
+    label to its chunk-local position, so the summary can measure each station's
+    intersection geometry (the baseline/height ratio) without another engine
+    call.
     """
     transform = chunk.transform
     # A camera names its sensor by id, which indexes Chunk.sensors. The P4 RTK
@@ -688,6 +850,7 @@ def project_stations(chunk, stations):
     per_point = {}
     calibrations = {}
     poses = {}
+    centres = {}
     for camera in chunk.cameras:
         if not camera.enabled:
             continue
@@ -699,6 +862,7 @@ def project_stations(chunk, stations):
         centre = camera.center
         calibrations[camera.label] = calibration
         poses[camera.label] = pose
+        centres[camera.label] = centre
         for station in stations:
             point = local[station["label"]]
             pixel = project_point(point, pose, calibration)
@@ -719,7 +883,7 @@ def project_stations(chunk, stations):
                 "target_radius_px": radius,
                 "accepted": False,
             })
-    return projections, per_point, calibrations, poses
+    return projections, per_point, calibrations, poses, centres, local
 
 
 def detect_targets(chunk, stations, projections, per_point, detect_options):
@@ -797,26 +961,72 @@ def detect_targets(chunk, stations, projections, per_point, detect_options):
     return detected, per_point
 
 
-def select_refine_views(projections, limit):
-    """The ``limit`` observers of each station with the largest apparent target.
+def select_refine_views(projections, limit, centres=None):
+    """The ``limit`` observers of each station that best condition the intersection.
 
     RefineMarkers holds every view of a marker in memory at once, so a marker
     seen by ~95 full-resolution 20 MP cameras is ~15 GB and cannot be evicted
-    under the 1.5 GB view cache. The multi-view consensus needs only a handful
-    of corroborating views, so each marker is refined against its ``limit``
-    closest observers (largest apparent target radius, which is the most pixels
-    on the target and the least foreshortening). Returns a dict of the same
-    shape as ``projections`` with at most ``limit`` entries per station.
+    under the 1.5 GB view cache. The refinement therefore runs on at most
+    ``limit`` views per station. WHICH views matters: the engine triangulates
+    the marker from the refined views, and a cluster of near-coincident cameras
+    (the closest observers, which the previous selection kept) gives a
+    poorly-conditioned height, so the triangulated position then fails the
+    residual gate for every other view. The selection here maximises the
+    baseline spread instead: it seeds with the closest observer (the most pixels
+    on the target) and then adds, one at a time, the observer farthest from the
+    already-selected set (farthest-point sampling on the camera centres). That is
+    the same number of views (the same memory) spread across the station's
+    observers, so the triangulation is well conditioned.
+
+    ``centres`` maps a camera label to its chunk-local centre. When it is not
+    supplied (a caller with no geometry) the selection falls back to the
+    ``limit`` largest apparent targets, which is the previous behaviour.
     """
     selected = {}
     for label, views in projections.items():
-        ordered = sorted(views, key=lambda view: -view["target_radius_px"])
-        selected[label] = ordered[:limit]
+        if centres is None:
+            ordered = sorted(views, key=lambda view: -view["target_radius_px"])
+            selected[label] = ordered[:limit]
+        else:
+            selected[label] = spread_views(views, limit, centres)
     return selected
 
 
+def spread_views(views, limit, centres):
+    """Farthest-point sampling of ``views`` by camera centre, seeded closest.
+
+    The seed is the observer with the largest apparent target (the most pixels
+    on the target, so the most accurate centre). Each further pick is the
+    observer whose camera centre is farthest from the nearest already-selected
+    centre, which maximises the baseline of the refined set. Deterministic: ties
+    keep the earlier view in ``views`` order. A view whose centre is unknown is
+    never preferred (its distance is treated as negative) but is still returned
+    when fewer than ``limit`` views have a known centre. Pure: no engine.
+    """
+    if len(views) <= limit:
+        return list(views)
+    seed = max(views, key=lambda view: view["target_radius_px"])
+    chosen = [seed]
+    remaining = [view for view in views if view is not seed]
+
+    def nearest_distance(view):
+        centre = centres.get(view["camera"])
+        if centre is None:
+            return -1.0
+        distances = [math.dist(centre, centres[other["camera"]])
+                     for other in chosen if other["camera"] in centres]
+        return min(distances) if distances else -1.0
+
+    while len(chosen) < limit and remaining:
+        farthest = max(remaining, key=nearest_distance)
+        chosen.append(farthest)
+        remaining.remove(farthest)
+    return chosen
+
+
 def refine_and_collect(chunk, stations, detected, per_point, refine_options,
-                       calibrations, poses, max_views, search_radius_px):
+                       calibrations, poses, max_views, search_radius_px,
+                       centres=None):
     """Refine the DETECTED projections and record the accepted observations.
 
     The detected projections are already on the targets (DetectMarkers found
@@ -824,29 +1034,37 @@ def refine_and_collect(chunk, stations, detected, per_point, refine_options,
     valid measurement on its own. The refinement here adds the multi-view
     consensus: it snaps each projection onto the printed centre and, when it
     succeeds, triangulates the marker and writes that position back. Only the
-    ``max_views`` closest observers of each station are refined (see
+    ``max_views`` best-spread observers of each station are refined (see
     :func:`select_refine_views`); the rest are reported as detected but not
     refined.
 
-    A detection is accepted when it is within the search radius of the
-    projection (the "right target" gate: the neighbouring target is thousands of
-    pixels away). When the refinement TRIANGULATED the marker, the residual of
-    the triangulated position against the detected pixel is also required to be
-    small — a detection that is a different target is an outlier of the
-    triangulation. A marker the refinement could not triangulate (no consensus,
-    or too few views) keeps its surveyed reference as ``position``; the residual
-    against that reference is the block's own georeference error (~16 px), which
-    is NOT a wrong-target signal, so the residual gate is skipped for it and the
+    EVERY detected view is a candidate observation, not only the refined ones.
+    The previous version accepted only the refined views, so a station whose
+    target was detected in 50 cameras but refined in 16 could never exceed 16
+    observations, and the 16 closest observers formed a tight cluster whose
+    triangulation was ill-conditioned, so the residual gate then rejected most
+    of even those. Here the triangulated position (from the well-spread refined
+    set) is the reference for ALL detected views: each detected pixel is
+    accepted when it is within the search radius of the projection (the "right
+    target" gate: the neighbouring target is thousands of pixels away) and,
+    when the marker was triangulated, its residual against that position is
+    small. A detection that is a different target is an outlier of the
+    triangulation and its residual is large.
+
+    A marker the refinement could not triangulate (no consensus, or too few
+    views) keeps its surveyed reference as ``position``; the residual against
+    that reference is the block's own georeference error (~16 px), which is NOT
+    a wrong-target signal, so the residual gate is skipped for it and the
     detected pixel is written as measured.
 
     ``calibrations`` and ``poses`` map a camera label to its calibration dict
-    and 4x4 pose, so the residual of each refined projection against the
+    and 4x4 pose, so the residual of each detected projection against the
     triangulated marker position is computed here without another engine call.
     Returns ``(observations, per_point, refine_meta)`` where ``observations``
     maps a station label to the accepted ``{"image", "px", "py"}`` rows and
     ``refine_meta`` is the engine's own ``refine_markers.*`` diagnostics.
     """
-    refine_views = select_refine_views(detected, max_views)
+    refine_views = select_refine_views(detected, max_views, centres)
     before = {}
     positions_before = {}
     for marker in chunk.markers:
@@ -903,18 +1121,22 @@ def refine_and_collect(chunk, stations, detected, per_point, refine_options,
         position = positions.get(label)
         was_triangulated = triangulated.get(label, False)
         for record in per_point.get(label, []):
+            # Only a view DetectMarkers actually found is a candidate. A view
+            # that was projected but never detected has no measured pixel.
+            detected_pixel = record.get("detected_px")
+            if detected_pixel is None:
+                continue
             key = (label, record["image"])
             refined = after.get(key)
-            if refined is None:
-                # Not one of the refined observers: detected but not refined,
-                # so it is not an observation.
-                continue
-            original = before.get(key)
-            if original is None:
-                continue
-            refine_shift = math.hypot(refined[0] - original[0],
-                                      refined[1] - original[1])
-            record["refine_shift_px"] = refine_shift
+            # A refined view uses the refinement's snapped pixel; a detected but
+            # unrefined view uses the DetectMarkers measurement, which is already
+            # on the target. Both are valid observations.
+            pixel = refined if refined is not None else detected_pixel
+            if refined is not None:
+                original = before.get(key)
+                if original is not None:
+                    record["refine_shift_px"] = math.hypot(
+                        refined[0] - original[0], refined[1] - original[1])
             residual = None
             if was_triangulated and position is not None:
                 calibration = calibrations.get(record["image"])
@@ -922,8 +1144,8 @@ def refine_and_collect(chunk, stations, detected, per_point, refine_options,
                 if calibration is not None and pose is not None:
                     reprojected = project_point(position, pose, calibration)
                     if reprojected is not None:
-                        residual = math.hypot(reprojected[0] - refined[0],
-                                              reprojected[1] - refined[1])
+                        residual = math.hypot(reprojected[0] - pixel[0],
+                                              reprojected[1] - pixel[1])
             record["residual_px"] = residual
             # The gate is on the DETECTION distance (how far the found target is
             # from the projection), not the refinement move: a detected target
@@ -935,8 +1157,8 @@ def refine_and_collect(chunk, stations, detected, per_point, refine_options,
             if record["accepted"]:
                 observations.setdefault(label, []).append({
                     "image": record["image"],
-                    "px": refined[0],
-                    "py": refined[1],
+                    "px": pixel[0],
+                    "py": pixel[1],
                 })
     # `chunk.meta` is already a dict (the binding materialises it), so iterate
     # its items directly; `.items` on the dict would be the method object.
@@ -1026,7 +1248,8 @@ def run(args):
         f"median horizontal accuracy {reference_stats['median_horizontal_m']} m")
 
     add_stations(chunk, stations)
-    projections, per_point, calibrations, poses = project_stations(chunk, stations)
+    (projections, per_point, calibrations, poses,
+     centres, local) = project_stations(chunk, stations)
     log(f"[eurosdr] projected {sum(len(v) for v in projections.values())} "
         f"observations over {len(projections)} stations")
 
@@ -1063,8 +1286,10 @@ def run(args):
         f"(up to {args.max_views} views per marker)")
     observations, per_point, refine_meta = refine_and_collect(
         chunk, stations, detected, per_point, refine_options,
-        calibrations, poses, args.max_views, args.search_radius_px)
-    summary = summarise(stations, observations, per_point)
+        calibrations, poses, args.max_views, args.search_radius_px,
+        centres=centres)
+    summary = summarise(stations, observations, per_point,
+                        centres=centres, local=local)
     summary["images"] = len(images)
     summary["images_available"] = len(available)
     summary["image_stride"] = stride
@@ -1086,6 +1311,8 @@ def run(args):
     summary["chunk_meta"] = dict(chunk.meta)
     summary["target_diameter_m"] = TARGET_DIAMETER_M
     summary["max_shift_target_radii"] = MAX_SHIFT_TARGET_RADII
+    summary["min_intersection_images"] = MIN_INTERSECTION_IMAGES
+    summary["min_baseline_height_ratio"] = MIN_BASELINE_HEIGHT_RATIO
 
     rows = write_gcp_list(args.gcp_list, stations, observations)
     log(f"[eurosdr] wrote {rows} observations to {args.gcp_list}")
@@ -1107,6 +1334,16 @@ def run(args):
         f"({(summary['acceptance_rate'] or 0.0) * 100:.1f}%), "
         f"{summary['gcps_with_min_views']}/{summary['gcps']} GCPs with "
         f">= {MIN_VIEWS_PER_POINT} views")
+    # The intersection-conditioning rule is fixed before any result is seen (see
+    # MIN_INTERSECTION_IMAGES / MIN_BASELINE_HEIGHT_RATIO). A station that fails
+    # it is excluded from scoring and listed here with its reason, so the run
+    # output says which points the downstream protocol must drop and why.
+    excluded = summary["excluded_stations"]
+    log(f"[eurosdr] {summary['scored_stations']}/{summary['stations']} stations "
+        f"well conditioned; {len(excluded)} excluded from scoring")
+    for record in excluded:
+        log(f"[eurosdr]   excluded {record['label']} ({record['role']}, "
+            f"{record['views_accepted']} accepted): {record['reason']}")
     return 0
 
 

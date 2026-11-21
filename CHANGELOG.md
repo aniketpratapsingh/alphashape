@@ -46,7 +46,26 @@ All notable changes to alphashape are recorded here. The format follows
   gains an optional `--check-list`: the eight GCPs are control and the remaining
   stations are scored as independent check points in one adjustment per variant,
   reported beside the leave-one-out result. It never changes `passed` or any
-  variant result; the leave-one-out over the eight GCPs remains the gate.
+  variant result; the leave-one-out over the eight GCPs remains the gate. Each
+  per-point record now also carries the number of projections actually set on
+  cameras present in the chunk and the post-adjustment marker reprojection RMS in
+  pixels, and each variant reports the horizontal RMS split by observation count
+  (>= 6 vs < 6), so a point limited by its own intersection geometry can be told
+  from a block-wide residual.
+- **EuroSDR observations: every detected view is kept, and the unnamed station is
+  `A1`.** The measurement script accepted only the `max_views` refined views of
+  each station, so a target detected in 50 cameras but refined in 16 could never
+  exceed 16 observations, and the 16 closest observers formed a tight cluster
+  whose triangulation was ill-conditioned. The refinement now runs on the
+  observers that best span the station (farthest-point sampling on the camera
+  centres), and every detected view is a candidate observation, gated by the same
+  search radius and reprojection residual as before. The one xlsx row with no
+  station label is the missing `A1` grid cell (the sheet carries every cell of the
+  6x8 `A1`..`F8` array but `A1`), so the label is recovered from the labels the
+  sheet does carry rather than written as `UNNAMED`. A station whose accepted
+  observations cannot give a well-conditioned intersection (fewer than 3 images,
+  or a baseline/height ratio below 0.1) is excluded from scoring and listed with
+  its reason in the run output and the JSON summary.
 
 ### Changed
 

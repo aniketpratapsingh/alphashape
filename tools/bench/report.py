@@ -584,17 +584,21 @@ def gcp_markdown(current: dict) -> str:
         lines.append(f"## Control {control_n} / check {check_n} (report-only)")
         lines.append("")
         lines.append("| Variant | Checks | Horizontal RMS (m) | Vertical RMS (m) | "
-                     "Max horizontal (m) |")
-        lines.append("|---|---:|---:|---:|---:|")
+                     "Max horizontal (m) | H RMS, >= 6 obs (m) | H RMS, < 6 obs (m) | "
+                     "Marker reprojection RMS (px) |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
         for variant, record in control_variants.items():
             if "error" in record:
-                lines.append(f"| {variant} | _error: {record.get('error')}_ | | | |")
+                lines.append(f"| {variant} | _error: {record.get('error')}_ | | | | | | |")
                 continue
             lines.append(
                 f"| {variant} | {record.get('checks')} | "
                 f"{_fmt(record.get('rms_horizontal_m'))} | "
                 f"{_fmt(record.get('rms_vertical_m'))} | "
-                f"{_fmt(record.get('max_horizontal_m'))} |")
+                f"{_fmt(record.get('max_horizontal_m'))} | "
+                f"{_fmt(record.get('rms_horizontal_many_observations_m'))} | "
+                f"{_fmt(record.get('rms_horizontal_few_observations_m'))} | "
+                f"{_fmt(record.get('reprojection_rms_px'))} |")
         lines.append("")
     for variant, data in (current.get("variants") or {}).items():
         options = data.get("options") or {}

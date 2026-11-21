@@ -369,6 +369,16 @@ jobs:
           print(f"- views accepted: {data.get('views_accepted')} "
                 f"({(data.get('acceptance_rate') or 0.0) * 100:.1f}%)")
           print(f"- GCPs with >= 2 views: {data.get('gcps_with_min_views')} / {data.get('gcps')}")
+          print(f"- stations well conditioned: {data.get('scored_stations')} / "
+                f"{data.get('stations')}")
+          excluded = data.get("excluded_stations") or []
+          if excluded:
+              print("\n### Excluded from scoring (intersection not well conditioned)\n")
+              print("| station | role | accepted | reason |")
+              print("|---|---|---:|---|")
+              for record in excluded:
+                  print(f"| {record['label']} | {record['role']} | "
+                        f"{record['views_accepted']} | {record['reason']} |")
           print("\n| station | role | projected | accepted | mean detect shift px |")
           print("|---|---|---:|---:|---:|")
           for point in data.get("points", []):

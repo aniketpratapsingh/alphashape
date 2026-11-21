@@ -369,6 +369,51 @@ class SummaryTest(unittest.TestCase):
         self.assertAlmostEqual(point["mean_shift_px"], 2.0, places=9)
         self.assertAlmostEqual(point["max_shift_px"], 3.0, places=9)
 
+    def test_without_geometry_every_station_is_scored(self):
+        # The exclusion rule needs the camera centres; without them every
+        # station is reported as scored rather than silently dropped.
+        summary = eo.summarise(self.stations(), {}, {})
+        self.assertTrue(all(point["scored"] for point in summary["points"]))
+        self.assertEqual(summary["excluded_stations"], [])
+        self.assertEqual(summary["scored_stations"], 2)
+
+    def test_a_station_with_too_few_images_is_excluded_with_a_reason(self):
+        per_point = {
+            "GA1": [
+                {"image": "a", "shift_px": 1.0, "residual_px": 0.5, "accepted": True},
+                {"image": "b", "shift_px": 1.0, "residual_px": 0.5, "accepted": True},
+            ],
+        }
+        centres = {"a": (0.0, 0.0, 0.0), "b": (10.0, 0.0, 0.0)}
+        local = {"GA1": (5.0, 0.0, 50.0), "A2": (0.0, 0.0, 50.0)}
+        summary = eo.summarise(self.stations(), {}, per_point,
+                               centres=centres, local=local)
+        ga1 = next(point for point in summary["points"] if point["label"] == "GA1")
+        self.assertFalse(ga1["scored"])
+        self.assertIn("accepted image", ga1["exclusion_reason"])
+        excluded = {record["label"]: record for record in summary["excluded_stations"]}
+        self.assertIn("GA1", excluded)
+        self.assertIn("reason", excluded["GA1"])
+        # A2 has no accepted images at all, so it is excluded too.
+        self.assertIn("A2", excluded)
+        self.assertEqual(summary["scored_stations"], 0)
+
+    def test_a_well_conditioned_station_is_scored(self):
+        per_point = {
+            "GA1": [
+                {"image": "a", "shift_px": 1.0, "residual_px": 0.5, "accepted": True},
+                {"image": "b", "shift_px": 1.0, "residual_px": 0.5, "accepted": True},
+                {"image": "c", "shift_px": 1.0, "residual_px": 0.5, "accepted": True},
+            ],
+        }
+        centres = {"a": (0.0, 0.0, 0.0), "b": (10.0, 0.0, 0.0), "c": (5.0, 10.0, 0.0)}
+        local = {"GA1": (5.0, 5.0, 50.0), "A2": (0.0, 0.0, 50.0)}
+        summary = eo.summarise(self.stations(), {}, per_point,
+                               centres=centres, local=local)
+        ga1 = next(point for point in summary["points"] if point["label"] == "GA1")
+        self.assertTrue(ga1["scored"])
+        self.assertIsNone(ga1["exclusion_reason"])
+
 
 class SelectImagesTest(unittest.TestCase):
     """The strided subset must keep the whole site covered, not just the middle."""
@@ -627,6 +672,264 @@ class SelectRefineViewsTest(unittest.TestCase):
         self.assertEqual(set(selected), {"GA1", "A2"})
 
 
+class SpreadViewsTest(unittest.TestCase):
+    """The refined set must span the station's observers, not cluster on one."""
+
+    def views(self, cameras):
+        return [{"camera": camera, "px": 0.0, "py": 0.0, "target_radius_px": 10.0}
+                for camera in cameras]
+
+    def test_the_seed_is_the_largest_apparent_target(self):
+        # The seed is the most pixels on the target, so the most accurate centre.
+        views = [
+            {"camera": "a", "px": 0.0, "py": 0.0, "target_radius_px": 5.0},
+            {"camera": "b", "px": 0.0, "py": 0.0, "target_radius_px": 20.0},
+            {"camera": "c", "px": 0.0, "py": 0.0, "target_radius_px": 12.0},
+        ]
+        centres = {"a": (0.0, 0.0, 0.0), "b": (1.0, 0.0, 0.0), "c": (2.0, 0.0, 0.0)}
+        chosen = eo.spread_views(views, 1, centres)
+        self.assertEqual([view["camera"] for view in chosen], ["b"])
+
+    def test_the_next_pick_is_the_farthest_observer(self):
+        # Seed b at x=1; the farthest remaining centre is c at x=100, not a at 0.
+        views = self.views(["a", "b", "c"])
+        centres = {"a": (0.0, 0.0, 0.0), "b": (1.0, 0.0, 0.0), "c": (100.0, 0.0, 0.0)}
+        chosen = eo.spread_views(views, 2, centres)
+        self.assertEqual([view["camera"] for view in chosen], ["a", "c"])
+
+    def test_a_cluster_is_broken_up(self):
+        # Three near-coincident cameras and one far away: the far one must be
+        # picked, which is what gives the triangulation a baseline.
+        views = self.views(["a", "b", "c", "far"])
+        centres = {"a": (0.0, 0.0, 0.0), "b": (0.1, 0.0, 0.0),
+                   "c": (0.2, 0.0, 0.0), "far": (50.0, 0.0, 0.0)}
+        chosen = eo.spread_views(views, 2, centres)
+        self.assertIn("far", [view["camera"] for view in chosen])
+
+    def test_fewer_views_than_the_limit_keeps_them_all(self):
+        views = self.views(["a", "b"])
+        centres = {"a": (0.0, 0.0, 0.0), "b": (1.0, 0.0, 0.0)}
+        self.assertEqual(len(eo.spread_views(views, 16, centres)), 2)
+
+    def test_a_view_with_no_centre_is_never_preferred(self):
+        # A view whose centre is unknown cannot contribute a baseline, so it is
+        # only returned when there are not enough known-centre views.
+        views = self.views(["a", "b", "unknown"])
+        centres = {"a": (0.0, 0.0, 0.0), "b": (10.0, 0.0, 0.0)}
+        chosen = eo.spread_views(views, 2, centres)
+        self.assertNotIn("unknown", [view["camera"] for view in chosen])
+
+    def test_select_refine_views_uses_the_centres_when_given(self):
+        projections = {
+            "GA1": self.views(["a", "b", "c"]),
+        }
+        centres = {"a": (0.0, 0.0, 0.0), "b": (0.1, 0.0, 0.0), "c": (40.0, 0.0, 0.0)}
+        selected = eo.select_refine_views(projections, 2, centres)
+        self.assertIn("c", [view["camera"] for view in selected["GA1"]])
+
+
+class BaselineHeightRatioTest(unittest.TestCase):
+    """The intersection-conditioning measure the exclusion rule tests."""
+
+    def test_a_wide_baseline_at_short_range_is_well_conditioned(self):
+        # Two cameras 10 m apart looking at a point 50 m above their midpoint.
+        # The mean range is the 3-D distance, so the ratio is 10 / mean_range.
+        centres = [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0)]
+        point = (5.0, 0.0, 50.0)
+        ratio = eo.baseline_height_ratio(centres, point)
+        mean_range = math.dist((0.0, 0.0, 0.0), point)
+        self.assertAlmostEqual(ratio, 10.0 / mean_range, places=9)
+        self.assertGreater(ratio, eo.MIN_BASELINE_HEIGHT_RATIO)
+
+    def test_a_tight_cluster_at_long_range_is_poorly_conditioned(self):
+        # Two consecutive frames 2 m apart at 55 m range: ratio ~0.036.
+        centres = [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0)]
+        ratio = eo.baseline_height_ratio(centres, (1.0, 0.0, 55.0))
+        self.assertLess(ratio, eo.MIN_BASELINE_HEIGHT_RATIO)
+
+    def test_the_largest_pair_sets_the_baseline(self):
+        # Three cameras; the widest pair (a-c, 20 m) sets the baseline, not a-b.
+        centres = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (20.0, 0.0, 0.0)]
+        point = (10.0, 0.0, 100.0)
+        ratio = eo.baseline_height_ratio(centres, point)
+        mean_range = sum(math.dist(centre, point) for centre in centres) / 3.0
+        self.assertAlmostEqual(ratio, 20.0 / mean_range, places=9)
+
+    def test_fewer_than_two_centres_has_no_ratio(self):
+        self.assertIsNone(eo.baseline_height_ratio([(0.0, 0.0, 0.0)], (0.0, 0.0, 1.0)))
+        self.assertIsNone(eo.baseline_height_ratio([], (0.0, 0.0, 1.0)))
+
+
+class IntersectionExclusionTest(unittest.TestCase):
+    """The exclusion rule is fixed before results and reported with a reason."""
+
+    def test_two_images_are_excluded(self):
+        reason = eo.intersection_exclusion(
+            ["a", "b"], [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0)], (5.0, 0.0, 50.0))
+        self.assertIsNotNone(reason)
+        self.assertIn("accepted image", reason)
+
+    def test_three_well_spread_images_are_scored(self):
+        reason = eo.intersection_exclusion(
+            ["a", "b", "c"],
+            [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (5.0, 10.0, 0.0)],
+            (5.0, 5.0, 50.0))
+        self.assertIsNone(reason)
+
+    def test_a_low_baseline_ratio_is_excluded(self):
+        # Three images but all within 2 m at 55 m range: ratio ~0.036.
+        reason = eo.intersection_exclusion(
+            ["a", "b", "c"],
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 0.0, 0.0)],
+            (1.0, 0.0, 55.0))
+        self.assertIsNotNone(reason)
+        self.assertIn("baseline/height", reason)
+
+    def test_the_thresholds_are_the_documented_values(self):
+        self.assertEqual(eo.MIN_INTERSECTION_IMAGES, 3)
+        self.assertAlmostEqual(eo.MIN_BASELINE_HEIGHT_RATIO, 0.1, places=9)
+
+
+class RefineAndCollectTest(unittest.TestCase):
+    """Every detected view is a candidate observation, not only the refined ones.
+
+    The previous version accepted only the ``max_views`` refined views, so a
+    station detected in 20 cameras but refined in 16 could never exceed 16
+    observations. These fakes pin the corrected behaviour: a detected view that
+    was not refined is still accepted, and a wrong-target detection is still
+    rejected by the residual gate.
+    """
+
+    class _Projection:
+        def __init__(self, camera, px, py):
+            self.camera = type("Camera", (), {"label": camera})()
+            self.pixel = (px, py)
+
+    class _Marker:
+        def __init__(self, label, position):
+            self.label = label
+            self.position = position
+            self.projections = []
+
+    class _Chunk:
+        def __init__(self, triangulated):
+            self.markers = []
+            self.meta = {}
+            self._triangulated = triangulated
+
+        def removeMarkerProjection(self, label, camera):
+            for marker in self.markers:
+                if marker.label == label:
+                    marker.projections = [projection for projection
+                                          in marker.projections
+                                          if projection.camera.label != camera]
+
+        def setMarkerProjection(self, label, camera, px, py):
+            for marker in self.markers:
+                if marker.label == label:
+                    for projection in marker.projections:
+                        if projection.camera.label == camera:
+                            projection.pixel = (px, py)
+                            return
+                    marker.projections.append(
+                        RefineAndCollectTest._Projection(camera, px, py))
+
+        def refineMarkers(self, markers, **_kwargs):
+            # A moved position is what marks the marker as triangulated.
+            for marker in self.markers:
+                if marker.label in markers:
+                    marker.position = self._triangulated
+
+    def calibration(self):
+        # A 200 px frame with f = 1: the point (0, 0, 10) projects to the image
+        # centre (100, 100), so a detection there has a zero residual.
+        return {"type": "frame", "width": 200, "height": 200, "f": 1.0,
+                "cx": 0.0, "cy": 0.0, "b1": 0.0, "b2": 0.0,
+                "k1": 0.0, "k2": 0.0, "k3": 0.0, "k4": 0.0,
+                "p1": 0.0, "p2": 0.0, "p3": 0.0, "p4": 0.0}
+
+    def run_collect(self, detections, triangulated=(0.0, 0.0, 10.0)):
+        chunk = self._Chunk(triangulated)
+        marker = self._Marker("A1", (0.0, 0.0, 0.0))
+        for camera, _px, _py in detections:
+            marker.projections.append(self._Projection(camera, 100.0, 100.0))
+        chunk.markers = [marker]
+        stations = [{"label": "A1", "lat": 0.0, "lon": 0.0, "height": 0.0,
+                     "role": "check_point"}]
+        detected = {"A1": [{"camera": camera, "px": px, "py": py,
+                            "target_radius_px": 10.0}
+                           for camera, px, py in detections]}
+        per_point = {"A1": [{"image": camera, "shift_px": 1.0,
+                             "residual_px": None, "target_radius_px": 10.0,
+                             "accepted": False, "detected_px": (px, py)}
+                            for camera, px, py in detections]}
+        calibration = self.calibration()
+        calibrations = {camera: calibration for camera, _px, _py in detections}
+        poses = {camera: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0],
+                          [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+                 for camera, _px, _py in detections}
+        centres = {camera: (float(index), 0.0, 0.0)
+                   for index, (camera, _px, _py) in enumerate(detections)}
+        return eo.refine_and_collect(
+            chunk, stations, detected, per_point, {}, calibrations, poses,
+            16, 60.0, centres=centres)
+
+    def test_a_detected_view_beyond_the_refined_limit_is_still_accepted(self):
+        # 20 detections, only 16 refined: all 20 are valid observations.
+        detections = [(f"cam{index}", 100.0, 100.0) for index in range(20)]
+        observations, _per_point, _meta = self.run_collect(detections)
+        self.assertEqual(len(observations["A1"]), 20)
+
+    def test_a_wrong_target_detection_is_rejected_by_the_residual(self):
+        # cam19 detected a different target at (500, 500); the triangulated
+        # position reprojects to (100, 100), so its residual is large.
+        detections = [(f"cam{index}", 100.0, 100.0) for index in range(19)]
+        detections.append(("cam19", 500.0, 500.0))
+        observations, per_point, _meta = self.run_collect(detections)
+        accepted = [row["image"] for row in observations["A1"]]
+        self.assertNotIn("cam19", accepted)
+        self.assertEqual(len(accepted), 19)
+        cam19 = next(record for record in per_point["A1"]
+                     if record["image"] == "cam19")
+        self.assertGreater(cam19["residual_px"], eo.MIN_RESIDUAL_PX)
+
+    def test_an_undetected_view_is_not_an_observation(self):
+        # A projected view that DetectMarkers never found has no detected_px and
+        # must not be written as an observation.
+        detections = [(f"cam{index}", 100.0, 100.0) for index in range(3)]
+        chunk = self._Chunk((0.0, 0.0, 10.0))
+        marker = self._Marker("A1", (0.0, 0.0, 0.0))
+        for camera, _px, _py in detections:
+            marker.projections.append(self._Projection(camera, 100.0, 100.0))
+        chunk.markers = [marker]
+        stations = [{"label": "A1", "lat": 0.0, "lon": 0.0, "height": 0.0,
+                     "role": "check_point"}]
+        detected = {"A1": [{"camera": camera, "px": px, "py": py,
+                            "target_radius_px": 10.0}
+                           for camera, px, py in detections]}
+        # One projected-but-undetected view: no detected_px.
+        per_point = {"A1": [{"image": camera, "shift_px": 1.0,
+                             "residual_px": None, "target_radius_px": 10.0,
+                             "accepted": False, "detected_px": (px, py)}
+                            for camera, px, py in detections]}
+        per_point["A1"].append({"image": "cam_undetected", "shift_px": 0.0,
+                                "residual_px": None, "target_radius_px": 10.0,
+                                "accepted": False})
+        calibration = self.calibration()
+        calibrations = {camera: calibration for camera, _px, _py in detections}
+        poses = {camera: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0],
+                          [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+                 for camera, _px, _py in detections}
+        centres = {camera: (float(index), 0.0, 0.0)
+                   for index, (camera, _px, _py) in enumerate(detections)}
+        observations, _per_point, _meta = eo.refine_and_collect(
+            chunk, stations, detected, per_point, {}, calibrations, poses,
+            16, 60.0, centres=centres)
+        accepted = [row["image"] for row in observations["A1"]]
+        self.assertNotIn("cam_undetected", accepted)
+        self.assertEqual(len(accepted), 3)
+
+
 class XlsxReaderTest(unittest.TestCase):
     """The xlsx reader must take the ETRS89 ellipsoidal block, not OSGB36/ODN."""
 
@@ -685,6 +988,8 @@ class XlsxReaderTest(unittest.TestCase):
         self.assertEqual(stations[0]["role"], "check_point")
 
     def test_an_unnamed_station_gets_the_unnamed_label(self):
+        # A sheet with only one row has 47 grid cells missing, so the missing
+        # cell cannot be identified uniquely and the row falls back to UNNAMED.
         with tempfile.TemporaryDirectory() as directory:
             path = self.write_workbook(directory, [
                 [None, 0.0, 0.0, 0.0, 55.262911463, -1.876660186, 222.2881,
@@ -693,6 +998,44 @@ class XlsxReaderTest(unittest.TestCase):
             stations = eo.read_stations(path)
         self.assertEqual(stations[0]["label"], eo.UNNAMED_STATION_LABEL)
         self.assertEqual(stations[0]["role"], "check_point")
+
+    def test_the_one_missing_grid_cell_names_the_unnamed_row(self):
+        # The published sheet carries every 6x8 grid cell but A1, and the
+        # unlabelled row is that cell. The label is recovered from the labels the
+        # sheet does carry, so the station is named A1 at the source.
+        rows = []
+        for label in eo.grid_labels():
+            if label == "A1":
+                rows.append([None, 0.0, 0.0, 0.0, 55.262911463, -1.876660186,
+                             222.2881, 0.0, 0.0, 171.0])
+            else:
+                rows.append([label, 0.0, 0.0, 0.0, 55.26, -1.87, 220.0,
+                             0.0, 0.0, 170.0])
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_workbook(directory, rows)
+            stations = eo.read_stations(path)
+        unnamed = [station for station in stations
+                   if station["label"] == "A1"]
+        self.assertEqual(len(unnamed), 1)
+        self.assertEqual(unnamed[0]["role"], "check_point")
+        self.assertNotIn(eo.UNNAMED_STATION_LABEL,
+                         [station["label"] for station in stations])
+
+    def test_infer_unnamed_label_returns_the_single_missing_cell(self):
+        labels = [label for label in eo.grid_labels() if label != "A1"]
+        self.assertEqual(eo.infer_unnamed_label(labels), "A1")
+
+    def test_infer_unnamed_label_is_none_when_several_cells_are_missing(self):
+        labels = [label for label in eo.grid_labels()
+                  if label not in ("A1", "B2")]
+        self.assertIsNone(eo.infer_unnamed_label(labels))
+
+    def test_infer_unnamed_label_ignores_gcp_and_supplementary_labels(self):
+        # GCP labels (GA1) and S1-S3 are not grid cells; they must not be
+        # mistaken for the missing cell.
+        labels = [label for label in eo.grid_labels() if label != "A1"]
+        labels += ["GA1", "GA5", "S1", "S2", "S3"]
+        self.assertEqual(eo.infer_unnamed_label(labels), "A1")
 
     def test_a_partial_coordinate_raises(self):
         with tempfile.TemporaryDirectory() as directory:

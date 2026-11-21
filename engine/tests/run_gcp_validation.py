@@ -526,6 +526,112 @@ def project_world(rotation, centre, focal, width, height, point):
             height / 2.0 + focal * camera[1] / camera[2])
 
 
+def project_marker_pixel(point_local, pose, calibration):
+    """Project a chunk-local point through one camera's full Brown model.
+
+    ``pose`` is the 4x4 world->camera transform (``Camera.pose``) and
+    ``calibration`` a ``Sensor.calibration`` (or any object with the same
+    attributes). Returns ``(u, v)`` in the engine's corner-origin pixel
+    convention, or ``None`` when the point is behind the camera or the
+    projection is not finite. This is the same forward model the engine's
+    ``project_marker`` uses for a frame camera, so a marker's reprojection
+    residual computed here matches the one the bundle adjustment minimises.
+
+    A fisheye sensor is refused rather than projected with the wrong model: the
+    real-block protocol's blocks are frame cameras, and a silent wrong model
+    would make the residual meaningless.
+    """
+    if str(getattr(calibration, "type", "frame")).strip().lower() != "frame":
+        raise ValueError(
+            "project_marker_pixel: only the frame model is supported; got "
+            f"{getattr(calibration, 'type', None)!r}")
+    x = pose[0][0] * point_local[0] + pose[0][1] * point_local[1] + \
+        pose[0][2] * point_local[2] + pose[0][3]
+    y = pose[1][0] * point_local[0] + pose[1][1] * point_local[1] + \
+        pose[1][2] * point_local[2] + pose[1][3]
+    z = pose[2][0] * point_local[0] + pose[2][1] * point_local[1] + \
+        pose[2][2] * point_local[2] + pose[2][3]
+    if not (z > 0.0):
+        return None
+    xs = x / z
+    ys = y / z
+    k1 = float(getattr(calibration, "k1", 0.0))
+    k2 = float(getattr(calibration, "k2", 0.0))
+    k3 = float(getattr(calibration, "k3", 0.0))
+    k4 = float(getattr(calibration, "k4", 0.0))
+    p1 = float(getattr(calibration, "p1", 0.0))
+    p2 = float(getattr(calibration, "p2", 0.0))
+    p3 = float(getattr(calibration, "p3", 0.0))
+    p4 = float(getattr(calibration, "p4", 0.0))
+    r2 = xs * xs + ys * ys
+    r4 = r2 * r2
+    radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r4 * r2 + k4 * r4 * r4
+    xd = xs * radial + p1 * (r2 + 2.0 * xs * xs) + 2.0 * p2 * xs * ys
+    yd = ys * radial + p2 * (r2 + 2.0 * ys * ys) + 2.0 * p1 * xs * ys
+    if p3 != 0.0 or p4 != 0.0:
+        q1 = p1 + p3 * r2
+        q2 = p2 + p4 * r2
+        xd = xs * radial + q1 * (r2 + 2.0 * xs * xs) + 2.0 * q2 * xs * ys
+        yd = ys * radial + q2 * (r2 + 2.0 * ys * ys) + 2.0 * q1 * xs * ys
+    width = float(getattr(calibration, "width", 0))
+    height = float(getattr(calibration, "height", 0))
+    f = float(getattr(calibration, "f", 0.0))
+    b1 = float(getattr(calibration, "b1", 0.0))
+    b2 = float(getattr(calibration, "b2", 0.0))
+    u = width * 0.5 + float(getattr(calibration, "cx", 0.0)) + xd * (f + b1) + yd * b2
+    v = height * 0.5 + float(getattr(calibration, "cy", 0.0)) + yd * f
+    if not (math.isfinite(u) and math.isfinite(v)):
+        return None
+    return (u, v)
+
+
+def marker_reprojection_rms(chunk, labels):
+    """Post-adjustment marker reprojection RMS in pixels, per label and overall.
+
+    For every marker in ``labels`` that has a computed position, each of its
+    projections is reprojected through the camera's own pose and calibration and
+    compared with the measured pixel. Returns ``(per_label, overall)`` where
+    ``per_label`` maps a label to ``{"observations", "rms_px"}`` (``rms_px`` is
+    ``None`` when the marker has no usable projection) and ``overall`` is the
+    RMS over every residual, or ``None`` when there is none. A projection onto a
+    camera that is not in the chunk, or a point that does not project, is
+    skipped rather than counted as a zero residual.
+    """
+    sensors = list(chunk.sensors)
+    cameras = {camera.label: camera for camera in chunk.cameras}
+    per_label = {}
+    residuals = []
+    for marker in chunk.markers:
+        if marker.label not in labels:
+            continue
+        position = marker.position
+        label_residuals = []
+        observations = 0
+        for projection in marker.projections:
+            camera = cameras.get(projection.camera.label)
+            if camera is None or position is None:
+                continue
+            sensor_id = camera.sensor_id
+            if not (0 <= sensor_id < len(sensors)):
+                continue
+            observations += 1
+            pixel = project_marker_pixel(position, camera.pose,
+                                         sensors[sensor_id].calibration)
+            if pixel is None:
+                continue
+            measured = projection.pixel
+            label_residuals.append(
+                math.hypot(pixel[0] - measured[0], pixel[1] - measured[1]))
+        per_label[marker.label] = {
+            "observations": observations,
+            "rms_px": (root_mean_square(label_residuals)
+                       if label_residuals else None),
+        }
+        residuals.extend(label_residuals)
+    overall = root_mean_square(residuals) if residuals else None
+    return per_label, overall
+
+
 def load_truth():
     with open(os.path.join(DATA_DIR, "aerial_truth.json"),
               encoding="utf-8") as handle:
@@ -3500,19 +3606,34 @@ def run_control_check(args, control_gcps, check_gcps, camera_refs,
     unscored = [label for label in labels if label not in positioned]
     targets = reference_local_targets(chunk, positioned)
     errors = check_point_errors(chunk, positioned, targets)
+    # The post-adjustment marker reprojection RMS, per check point and overall.
+    # It is the image-space residual the bundle adjustment minimised, so a point
+    # with a large reprojection RMS is one whose observations do not agree with
+    # the fitted block (a wrong target, or too few well-spread views).
+    reprojection, reprojection_rms = marker_reprojection_rms(chunk, positioned)
     per_point = []
     for label, error in zip(positioned, errors):
         position = markers[label].position
         target = targets[label]
+        record = reprojection.get(label, {})
         per_point.append({
             "label": label,
             "dx_m": position[0] - target[0],
             "dy_m": position[1] - target[1],
             "dz_m": position[2] - target[2],
             "horizontal_m": error["horizontal"],
+            "observations": record.get("observations", 0),
+            "reprojection_rms_px": record.get("rms_px"),
         })
     horizontal = [error["horizontal"] for error in errors]
     vertical = [error["vertical"] for error in errors]
+    # Split the horizontal RMS by observation count: a point with fewer than six
+    # observations is the one whose intersection is least constrained, so the
+    # two RMS values say whether the block's error is concentrated there.
+    few = [record["horizontal_m"] for record in per_point
+           if record["observations"] < 6]
+    many = [record["horizontal_m"] for record in per_point
+            if record["observations"] >= 6]
     return {
         "control": len(control_gcps),
         "checks": len(positioned),
@@ -3520,6 +3641,13 @@ def run_control_check(args, control_gcps, check_gcps, camera_refs,
         "rms_horizontal_m": root_mean_square(horizontal) if horizontal else None,
         "rms_vertical_m": root_mean_square(vertical) if vertical else None,
         "max_horizontal_m": max(horizontal) if horizontal else None,
+        "reprojection_rms_px": reprojection_rms,
+        "rms_horizontal_few_observations_m": (
+            root_mean_square(few) if few else None),
+        "rms_horizontal_many_observations_m": (
+            root_mean_square(many) if many else None),
+        "few_observations": len(few),
+        "many_observations": len(many),
         "per_point": per_point,
     }
 
@@ -4291,6 +4419,26 @@ def run_real_odm(args):
                       if record["rms_vertical_m"] is not None else "n/a",
                       "{:.2f}".format(record["max_horizontal_m"] * 100.0)
                       if record["max_horizontal_m"] is not None else "n/a"))
+            # The observation-count split and the marker reprojection RMS: a
+            # point with few observations is the one whose intersection is least
+            # constrained, so the two RMS values say whether the block's error is
+            # concentrated there.
+            print("[gcp validation] control/check ({}): h RMS {} cm over {} "
+                  "points with >= 6 observations, {} cm over {} with < 6; "
+                  "marker reprojection RMS {} px".format(
+                      name,
+                      "{:.2f}".format(
+                          record["rms_horizontal_many_observations_m"] * 100.0)
+                      if record["rms_horizontal_many_observations_m"] is not None
+                      else "n/a",
+                      record["many_observations"],
+                      "{:.2f}".format(
+                          record["rms_horizontal_few_observations_m"] * 100.0)
+                      if record["rms_horizontal_few_observations_m"] is not None
+                      else "n/a",
+                      record["few_observations"],
+                      "{:.2f}".format(record["reprojection_rms_px"])
+                      if record["reprojection_rms_px"] is not None else "n/a"))
     best_horizontal = variants["camera_rtk_gcps"]["rms_horizontal_m"]
     target = args.horizontal_target
     passed = (best_horizontal is not None and best_horizontal <= target)

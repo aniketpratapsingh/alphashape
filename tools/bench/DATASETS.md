@@ -315,11 +315,18 @@ data (see below), so the ordinary `gcp-eurosdr` run needs no measurement step.
      with `OptimizeCameras`, which uses each camera's RTK position as a prior. No
      station exists yet, so the surveyed control cannot influence the alignment;
   4. read the xlsx with openpyxl and add all 59 stations as markers in EPSG:4979
-     (ETRS89 geodetic, ellipsoidal height);
+     (ETRS89 geodetic, ellipsoidal height). The one xlsx row with no station label is
+     the missing `A1` grid cell: the sheet carries every cell of the 6x8 `A1`..`F8`
+     array but `A1`, and the unlabelled row sits at that lattice cell, so the script
+     recovers the label from the labels the sheet does carry rather than writing
+     `UNNAMED`;
   5. project each point into every aligned camera that sees it, then run `DetectMarkers`
      (non-coded `Circular`, full resolution, 2 px floor, both polarities) to FIND the
      printed target near each projection, and `RefineMarkers` to snap the detected centre
-     onto the printed centre with multi-view consensus;
+     onto the printed centre with multi-view consensus. The refinement runs on the
+     `max_views` observers that best span the station (farthest-point sampling on the
+     camera centres), so the triangulation is well conditioned; **every** detected view
+     is then a candidate observation, not only the refined ones;
   6. keep only detections within the search radius of the projection and, where the
      refinement triangulated the marker, a small reprojection residual; write the
      accepted observations as an ODM `gcp_list.txt` plus a JSON summary.
@@ -329,6 +336,20 @@ data (see below), so the ordinary `gcp-eurosdr` run needs no measurement step.
   committed file is the GCP-only list (the eight GCPs): the protocol does leave-one-out
   over every point in the list, so a 59-station list would be 59 folds, while the eight
   GCPs give eight folds — the same shape as `gcp-rtk`'s five.
+- **Stations excluded from scoring.** A station is scored only when its accepted
+  observations give a well-conditioned intersection. The rule is fixed before any
+  result is seen: fewer than 3 accepted images (two views have no redundancy), or a
+  baseline/height ratio below 0.1 (the largest camera-pair baseline over the mean
+  range; a ratio `r` is a parallax of `atan(r)`, and the vertical precision scales as
+  `sigma_xy / r`, so at `r = 0.1` the height is already ~10x worse than the
+  horizontal). A station that fails either test is excluded from scoring and listed
+  with its reason in the run output and the JSON summary (`excluded_stations`). The
+  two consecutive D3 frames are the canonical case: a few metres of baseline at ~55 m
+  range is a ratio of ~0.05, which is why D3's height was undetermined. The
+  control/check measure (`run_control_check`) also reports, per variant, the
+  horizontal RMS split by observation count (>= 6 vs < 6) and the post-adjustment
+  marker reprojection RMS in pixels, so a point limited by its own geometry can be
+  told from a block-wide residual.
 - A label trap worth recording: the `Phase3` text file's GCP labels are shifted by one
   against the xlsx. `Phase3` `GA1` is the xlsx `GA5`, `GA5` is `GA8`, and so on, with
   `Phase3` `GF8` matching no xlsx row within 9 m. The coordinates are identical to the

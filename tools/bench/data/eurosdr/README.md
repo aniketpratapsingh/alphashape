@@ -51,10 +51,17 @@ give eight folds, the same shape as `gcp-rtk`'s five.
    a prior. No station exists yet, so the surveyed control cannot influence the
    alignment used to project it.
 4. Add all 59 stations as markers in EPSG:4979 (ETRS89 geodetic, ellipsoidal height).
+   The one xlsx row with no station label is the missing `A1` grid cell: the sheet
+   carries every cell of the 6x8 `A1`..`F8` array but `A1`, and the unlabelled row
+   sits at that lattice cell, so the script recovers the label from the labels the
+   sheet does carry rather than writing `UNNAMED`.
 5. Project each point into every aligned camera that sees it, run `DetectMarkers`
    (non-coded `Circular`, full resolution, 2 px floor, both polarities) to find the
    printed target near each projection, and `RefineMarkers` to snap the detected
-   centre onto the printed centre with multi-view consensus.
+   centre onto the printed centre with multi-view consensus. The refinement runs on
+   the `max_views` observers that best span the station (farthest-point sampling on
+   the camera centres), so the triangulation is well conditioned; **every** detected
+   view is then a candidate observation, not only the refined ones.
 6. Keep only detections within the search radius of the projection and, where the
    refinement triangulated the marker, a small reprojection residual.
 
@@ -64,9 +71,30 @@ The measurement run that produced these files is GitHub Actions run
 2.19 -> 0.62 px with a prior RMS of 0.14 sigma, 2228 targets detected over 58
 stations, 454 observations accepted (9.9%), 8/8 GCPs with at least two views.
 
+## Stations excluded from scoring
+
+A station is scored only when its accepted observations give a well-conditioned
+intersection. The rule is fixed before any result is seen, from photogrammetric
+first principles:
+
+- **fewer than 3 accepted images** — two views have no redundancy, so a blunder
+  cannot be detected and the point is not an independent check;
+- **a baseline/height ratio below 0.1** — the ratio is the largest camera-pair
+  baseline over the mean range to the target. A ratio `r` is a parallax of
+  `atan(r)`; the vertical precision scales as `sigma_xy / r` relative to the
+  horizontal, so at `r = 0.1` (parallax ~5.7 deg) the height is already ~10x worse
+  than the horizontal. Below that the point's error is set by its own geometry, not
+  by the block.
+
+A station that fails either test is excluded from scoring and listed with its
+reason in the run output and the JSON summary (`excluded_stations`). The two
+consecutive D3 frames are the canonical case: a few metres of baseline at ~55 m
+range is a ratio of ~0.05, which is why D3's height was undetermined.
+
 ## Regenerating
 
 The files are committed so the weekly bench never re-measures. To regenerate them
 (a new engine version, a changed refinement parameter), dispatch
 `eurosdr-observations.yml` on the branch and commit the artifact's
-`gcp_list_gcps.txt`, `gcp_list.txt` and `gcp_names.csv` here.
+`gcp_list_gcps.txt`, `gcp_list.txt` and `gcp_names.csv` here. The data files are
+never hand-edited: the workflow regenerates them.
