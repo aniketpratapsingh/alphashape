@@ -140,6 +140,16 @@ class GcpManifestTest(unittest.TestCase):
         for kind in ("gcp_list", "gcp_names"):
             self.assertTrue(kinds[kind].get("repo_path"), kind)
 
+    def test_the_full_station_list_is_a_committed_check_list(self):
+        # The report-only control/check measure reads the full station list
+        # from the repository, exactly like the GCP-only list.
+        kinds = {reference["kind"]: reference
+                 for reference in self.dataset["reference_files"]}
+        self.assertIn("check_list", kinds)
+        self.assertTrue(kinds["check_list"].get("repo_path"))
+        self.assertEqual(kinds["check_list"]["repo_path"],
+                         "tools/bench/data/eurosdr/gcp_list.txt")
+
     def test_an_unknown_version_is_rejected(self):
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as handle:
             json.dump({"version": 99, "datasets": {}}, handle)
@@ -1474,6 +1484,61 @@ class MatchParamsTest(unittest.TestCase):
     def test_no_parameters_returns_the_dataset_unchanged(self):
         dataset = run_bench.load_manifest()["datasets"]["gcp-rtk"]
         self.assertEqual(run_bench.merge_match_params(dataset, {}), dataset)
+
+
+class GcpCommandTest(unittest.TestCase):
+    """The GCP protocol's command line: the check list reaches only the dataset
+    that names one, and never changes the leave-one-out gate."""
+
+    def _run(self, dataset_name: str) -> list[str]:
+        import unittest.mock as mock
+
+        dataset = run_bench.load_manifest()["datasets"][dataset_name]
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            # collect_images globs the manifest's extract_glob under work/images,
+            # so the stand-in frames go where that pattern looks.
+            pattern = dataset["images_archive"]["extract_glob"]
+            images = work / "images" / Path(pattern).parent
+            images.mkdir(parents=True)
+            for index in range(dataset["expected_images"]):
+                (images / f"IMG_{index:04d}.JPG").write_bytes(b"x")
+            references = {
+                "gcp_list": str(work / "reference" / "gcp_list.txt"),
+                "gcp_names": str(work / "reference" / "gcp_names.csv"),
+            }
+            if any(ref["kind"] == "check_list"
+                   for ref in dataset["reference_files"]):
+                references["check_list"] = str(
+                    work / "reference" / "gcp_list_all.txt")
+            out_json = work / "gcp_report.json"
+            out_json.write_text(json.dumps({"variants": {}}), encoding="utf-8")
+            captured: dict = {}
+
+            def fake_run(command, **kwargs):
+                captured["command"] = command
+                return mock.Mock(returncode=0, stdout="")
+
+            with mock.patch.dict(os.environ,
+                                 {"ALPHASHAPE_PYTHON_DIR": str(work)}), \
+                    mock.patch.object(run_bench.subprocess, "run",
+                                      side_effect=fake_run):
+                run_bench.run_gcp_validation(
+                    dataset_name, dataset, work, references,
+                    report_dir=work)
+        return captured["command"]
+
+    def test_the_eurosdr_command_passes_the_check_list(self):
+        command = self._run("gcp-eurosdr")
+        self.assertIn("--check-list", command)
+        index = command.index("--check-list")
+        self.assertTrue(command[index + 1].endswith("gcp_list_all.txt"))
+
+    def test_the_rtk_command_has_no_check_list(self):
+        # gcp-rtk names no check_list reference, so the report-only measure is
+        # not run and the command is unchanged.
+        command = self._run("gcp-rtk")
+        self.assertNotIn("--check-list", command)
 
 
 class IsExperimentTest(unittest.TestCase):

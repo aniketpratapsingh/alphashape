@@ -42,6 +42,11 @@ All notable changes to alphashape are recorded here. The format follows
   data (CC BY 4.0, Mills et al. 2023, Newcastle University / EuroSDR) and read by the
   `gcp-eurosdr` bench dataset. The first measured result is 5.76 cm horizontal
   check-point RMS over the eight folds, a miss against the 5 cm target.
+- **Report-only control/check measure for the EuroSDR block.** The GCP protocol
+  gains an optional `--check-list`: the eight GCPs are control and the remaining
+  stations are scored as independent check points in one adjustment per variant,
+  reported beside the leave-one-out result. It never changes `passed` or any
+  variant result; the leave-one-out over the eight GCPs remains the gate.
 
 ### Changed
 

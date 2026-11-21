@@ -219,6 +219,11 @@
           "path": "reference/gcp_names.csv",
           "repo_path": "tools/bench/data/eurosdr/gcp_names.csv",
           "kind": "gcp_names"
+        },
+        {
+          "path": "reference/gcp_list_all.txt",
+          "repo_path": "tools/bench/data/eurosdr/gcp_list.txt",
+          "kind": "check_list"
         }
       ],
       "expected_images": 430,

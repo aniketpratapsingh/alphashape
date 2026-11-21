@@ -1744,6 +1744,10 @@ def run_gcp_validation(
     gcp_names = references.get("gcp_names")
     if not gcp_list or not gcp_names:
         raise SystemExit(f"{dataset_name}: the gcp-rtk manifest must name gcp_list and gcp_names references")
+    # An optional full station list turns on the report-only control/check
+    # measure (the dataset's intended 8-control/51-check protocol) alongside
+    # the leave-one-out gate. It never changes the gate.
+    check_list = references.get("check_list")
 
     script = HERE.parent.parent / "engine" / "tests" / "run_gcp_validation.py"
     gcp = dataset.get("gcp") or {}
@@ -1785,6 +1789,8 @@ def run_gcp_validation(
     if gcp.get("camera_accuracy_uniform_m") is not None:
         command.extend(["--camera-accuracy-uniform",
                         str(gcp["camera_accuracy_uniform_m"])])
+    if check_list:
+        command.extend(["--check-list", str(check_list)])
     # A long flight whose single global similarity fit keeps only a small
     # fraction of the cameras needs the RTK-first alignment instead; the
     # manifest opts a dataset in.

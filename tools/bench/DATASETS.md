@@ -364,6 +364,13 @@ data (see below), so the ordinary `gcp-eurosdr` run needs no measurement step.
   so the miss is not one bad point: it is a block-wide residual of a few
   centimetres. The protocol time is 98 min for the full flight and 8 folds, well
   inside the 330-minute job ceiling, so the whole flight is affordable.
+- **Report-only control/check measure (2026-11-21).** Alongside the leave-one-out
+  gate, the run also reports the dataset's intended protocol: the eight GCPs as
+  control and the remaining stations as independent check points, scored in one
+  adjustment per variant (`--check-list`, the full station list). It never changes
+  `passed` or any variant result; the leave-one-out over the eight GCPs remains the
+  gate. The committed full list carries 58 stations (S1 has no observations), so the
+  measure scores 8 control and 50 checks.
 
 ## Adding a dataset
 

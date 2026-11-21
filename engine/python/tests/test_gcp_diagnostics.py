@@ -183,5 +183,39 @@ class TestMatchParams(unittest.TestCase):
         self.assertEqual(SCRIPT.parse_args(["--real", "/x"]).match_params, {})
 
 
+class TestControlCheckSplit(unittest.TestCase):
+    """The report-only control/check split: control is --gcp-list, checks are
+    the --check-list stations not already control."""
+
+    def _station(self, label):
+        return {"label": label, "lon": 0.0, "lat": 0.0, "height": 0.0,
+                "observations": []}
+
+    def test_checks_are_the_stations_not_in_control(self):
+        control = [self._station("A"), self._station("B")]
+        stations = [self._station("A"), self._station("B"),
+                    self._station("C"), self._station("D")]
+        controls, checks = SCRIPT.split_control_check(control, stations)
+        self.assertEqual([gcp["label"] for gcp in controls], ["A", "B"])
+        self.assertEqual([gcp["label"] for gcp in checks], ["C", "D"])
+
+    def test_a_station_in_both_lists_is_control_not_a_check(self):
+        # A point that constrains the fit must never also be scored as a check.
+        control = [self._station("A")]
+        stations = [self._station("A"), self._station("B")]
+        _, checks = SCRIPT.split_control_check(control, stations)
+        self.assertEqual([gcp["label"] for gcp in checks], ["B"])
+
+    def test_control_is_every_gcp_list_station(self):
+        control = [self._station("A"), self._station("B")]
+        _, checks = SCRIPT.split_control_check(control, [self._station("A")])
+        self.assertEqual(checks, [])
+
+    def test_the_check_list_argument_is_optional(self):
+        self.assertIsNone(SCRIPT.parse_args(["--real", "/x"]).check_list)
+        args = SCRIPT.parse_args(["--real", "/x", "--check-list", "/y"])
+        self.assertEqual(args.check_list, "/y")
+
+
 if __name__ == "__main__":
     unittest.main()

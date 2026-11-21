@@ -1524,6 +1524,21 @@ def match_gcp_names(gcps, names):
     return gcps
 
 
+def split_control_check(control_gcps, check_gcps):
+    """Split a full station list into control and check points.
+
+    The dataset's intended protocol: every station of ``--gcp-list`` is
+    control, and every station of ``--check-list`` whose label is not already
+    a control point is a check. A station that appears in both lists is
+    control (it constrains the fit) and is never scored as a check, so the two
+    sets are disjoint. Pure: no chunk, no engine, so it is unit-testable on its
+    own.
+    """
+    control_labels = {gcp["label"] for gcp in control_gcps}
+    checks = [gcp for gcp in check_gcps if gcp["label"] not in control_labels]
+    return list(control_gcps), checks
+
+
 def z_consistency(gcps, gcp_height):
     """Record how the two survey files' z values compare, and what z means.
 
@@ -3194,6 +3209,29 @@ def optimize_options(options):
     return kwargs
 
 
+def add_marker_projections(chunk, gcps, shift=0.0):
+    """Add every GCP as a marker and set its image projections.
+
+    ``shift`` is the projection pixel shift a diagnostic variant asks for. An
+    observation whose image is not among the chunk's cameras is skipped: the
+    block may have been aligned from a subset, and a projection onto a camera
+    that is not there cannot be set.
+    """
+    cameras = {camera.label: camera for camera in chunk.cameras}
+    for gcp in gcps:
+        chunk.addMarker(label=gcp["label"])
+    for gcp in gcps:
+        for observation in gcp["observations"]:
+            stem = os.path.splitext(observation["image"])[0]
+            target = stem if stem in cameras else (
+                observation["image"] if observation["image"] in cameras else None)
+            if target is None:
+                continue
+            chunk.setMarkerProjection(gcp["label"], target,
+                                      observation["px"] + shift,
+                                      observation["py"] + shift)
+
+
 def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
     """One leave-one-out fold: reload, project, import, fit, measure the check.
 
@@ -3214,19 +3252,7 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
     if "marker_projection_accuracy" in options:
         chunk.marker_projection_accuracy = options["marker_projection_accuracy"]
     shift = options.get("projection_shift_px", 0.0)
-    cameras = {camera.label: camera for camera in chunk.cameras}
-    for gcp in gcps:
-        chunk.addMarker(label=gcp["label"])
-    for gcp in gcps:
-        for observation in gcp["observations"]:
-            stem = os.path.splitext(observation["image"])[0]
-            target = stem if stem in cameras else (
-                observation["image"] if observation["image"] in cameras else None)
-            if target is None:
-                continue
-            chunk.setMarkerProjection(gcp["label"], target,
-                                      observation["px"] + shift,
-                                      observation["py"] + shift)
+    add_marker_projections(chunk, gcps, shift)
 
     refine = None
     if options.get("refine_markers"):
@@ -3389,6 +3415,113 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
             fold["frame_fit"] = camera_reference_frame_fit(
                 chunk, gcp_frame_origin(gcps, check_index))
     return fold
+
+
+def run_control_check(args, control_gcps, check_gcps, camera_refs,
+                      align_report, options=None):
+    """One control/check adjustment: fit on every control point, score the checks.
+
+    This is the dataset's intended protocol (8 control, 51 check) rather than
+    the leave-one-out the gate uses. It follows ``run_fold``'s non-diagnostic
+    path exactly: reload the saved alignment, add every marker and its
+    projections, import the control rows as ``gcp`` and the check rows as
+    ``check_point``, then the same camera-reference / ``updateTransform`` /
+    ``optimizeCameras`` sequence. The check points never constrain the fit, so
+    their errors are an independent measure. Report-only: nothing here changes
+    a variant result or the pass/fail verdict.
+
+    Returns the control count, the scored and unscored check labels, the
+    horizontal/vertical RMS and maximum horizontal error, and the per-point
+    deltas. A check point with no computed position is listed in
+    ``checks_unscored`` rather than failing the run.
+    """
+    options = options or {}
+    doc = alphashape.load_project(align_report["project"])
+    chunk = doc.active_chunk
+
+    chunk.marker_location_accuracy = args.marker_accuracy
+    if "marker_projection_accuracy" in options:
+        chunk.marker_projection_accuracy = options["marker_projection_accuracy"]
+    shift = options.get("projection_shift_px", 0.0)
+    add_marker_projections(chunk, list(control_gcps) + list(check_gcps), shift)
+
+    accuracy = options.get("camera_accuracy", args.camera_accuracy)
+    accuracy_scale = options.get("camera_accuracy_scale", 1.0)
+    along_shift = options.get("along_shift_m", 0.0)
+    frame_mode = options.get("frame_correction")
+    frame_transform = None
+    if frame_mode in FRAME_CRS_EPSG:
+        frame_transform, _ = make_published_frame_transform(
+            frame_mode, options.get("capture_epoch"))
+    frame_shift = options.get("frame_shift_enu_m")
+    with tempfile.TemporaryDirectory() as directory:
+        control_rows = [(gcp["label"], gcp["lon"], gcp["lat"], gcp["height"])
+                        for gcp in control_gcps]
+        check_rows = [(gcp["label"], gcp["lon"], gcp["lat"], gcp["height"])
+                      for gcp in check_gcps]
+        control_path = os.path.join(directory, "control.csv")
+        check_path = os.path.join(directory, "check.csv")
+        write_reference_csv(control_path, control_rows)
+        write_reference_csv(check_path, check_rows)
+        if camera_refs:
+            # Same rule as run_fold: per-image mode without a shift needs no
+            # re-import, because AddPhotos already stored each camera's own
+            # accuracy; anything else re-imports the rows.
+            if (accuracy != CAMERA_ACCURACY_PER_IMAGE or along_shift
+                    or accuracy_scale != 1.0
+                    or frame_transform is not None or frame_shift is not None):
+                import_camera_references_for_block(
+                    chunk, accuracy, directory, along_shift, accuracy_scale,
+                    frame_shift_enu_m=frame_shift,
+                    frame_transform=frame_transform)
+        else:
+            for camera in chunk.cameras:
+                camera.reference_enabled = False
+        chunk.importReference(path=control_path, marker_type="gcp")
+        chunk.importReference(path=check_path, marker_type="check_point")
+
+    antenna = options.get("antenna_offset_m")
+    if antenna is not None:
+        for sensor_index in range(len(chunk.sensors)):
+            chunk.set_sensor_antenna_offset(
+                sensor_index, antenna[0], antenna[1], antenna[2])
+
+    chunk.updateTransform()
+    chunk.optimizeCameras(**optimize_options(options))
+
+    labels = [gcp["label"] for gcp in check_gcps]
+    markers = {marker.label: marker for marker in chunk.markers}
+    # A check point is scorable only when it has both a computed position and
+    # the reference it is scored against; anything else is reported unscored
+    # rather than failing the whole run.
+    positioned = [label for label in labels
+                  if label in markers and markers[label].position is not None
+                  and markers[label].reference is not None]
+    unscored = [label for label in labels if label not in positioned]
+    targets = reference_local_targets(chunk, positioned)
+    errors = check_point_errors(chunk, positioned, targets)
+    per_point = []
+    for label, error in zip(positioned, errors):
+        position = markers[label].position
+        target = targets[label]
+        per_point.append({
+            "label": label,
+            "dx_m": position[0] - target[0],
+            "dy_m": position[1] - target[1],
+            "dz_m": position[2] - target[2],
+            "horizontal_m": error["horizontal"],
+        })
+    horizontal = [error["horizontal"] for error in errors]
+    vertical = [error["vertical"] for error in errors]
+    return {
+        "control": len(control_gcps),
+        "checks": len(positioned),
+        "checks_unscored": unscored,
+        "rms_horizontal_m": root_mean_square(horizontal) if horizontal else None,
+        "rms_vertical_m": root_mean_square(vertical) if vertical else None,
+        "max_horizontal_m": max(horizontal) if horizontal else None,
+        "per_point": per_point,
+    }
 
 
 def summarise_camera_consistency(measured):
@@ -3777,6 +3910,16 @@ def run_real_odm(args):
     _, names = parse_gcp_names_csv(args.gcp_names)
     gcps = match_gcp_names(gcps, names)
     z_record = z_consistency(gcps, args.gcp_height)
+    # The dataset's intended control/check protocol, when a full station list
+    # is supplied: every --gcp-list station is control, and every --check-list
+    # station not already control is a check. Report-only, alongside the
+    # leave-one-out gate; the same names CSV covers both lists.
+    control_gcps = None
+    check_gcps = None
+    if args.check_list:
+        _, check_stations = parse_odm_gcp_list(args.check_list, pixel_shift)
+        check_stations = match_gcp_names(check_stations, names)
+        control_gcps, check_gcps = split_control_check(gcps, check_stations)
     images = collect_images(args.real)
     if len(images) < 3:
         raise ValueError("need at least three images in " + args.real)
@@ -4107,6 +4250,47 @@ def run_real_odm(args):
               "{:.3f} / {:.3f} / {:.3f} m".format(
                   label, applied_frame_shift_source, shift[0], shift[1],
                   shift[2]))
+    # The dataset's intended control/check measure, report-only and alongside
+    # the leave-one-out gate. One adjustment per variant: the same options the
+    # variant itself uses, so the two numbers are comparable. A failure here is
+    # recorded, never fatal, and never touches passed/gate_variant.
+    control_check = None
+    if control_gcps is not None:
+        control_check = {"check_list": args.check_list, "variants": {}}
+
+        def control_options(options):
+            # The control/check adjustment is a single fit, not a fold, so a
+            # per-fold estimated frame shift has no value to apply; drop it and
+            # keep every other option the variant uses.
+            return {key: value for key, value in (options or {}).items()
+                    if key != "estimated_frame_shift"}
+
+        control_check_runs = (
+            ("camera_rtk_gcps", True, control_options(camera_options)),
+            ("camera_rtk_adaptive", True, {"adaptive_fitting": True}),
+            ("gcps_only", False, control_options(base_options)),
+        )
+        for name, camera_refs, options in control_check_runs:
+            try:
+                record = run_control_check(
+                    args, control_gcps, check_gcps, camera_refs,
+                    align_report, options)
+            except Exception as error:  # noqa: BLE001 - report-only, never fatal
+                record = {"error": str(error)}
+            control_check["variants"][name] = record
+            if "error" in record:
+                print("[gcp validation] control/check ({}): error: {}".format(
+                    name, record["error"]))
+                continue
+            print("[gcp validation] control/check ({}): {} control, {} check, "
+                  "h RMS {} cm, v RMS {} cm, max h {} cm".format(
+                      name, record["control"], record["checks"],
+                      "{:.2f}".format(record["rms_horizontal_m"] * 100.0)
+                      if record["rms_horizontal_m"] is not None else "n/a",
+                      "{:.2f}".format(record["rms_vertical_m"] * 100.0)
+                      if record["rms_vertical_m"] is not None else "n/a",
+                      "{:.2f}".format(record["max_horizontal_m"] * 100.0)
+                      if record["max_horizontal_m"] is not None else "n/a"))
     best_horizontal = variants["camera_rtk_gcps"]["rms_horizontal_m"]
     target = args.horizontal_target
     passed = (best_horizontal is not None and best_horizontal <= target)
@@ -4150,6 +4334,8 @@ def run_real_odm(args):
         "target_horizontal_m": target,
         "passed": passed,
     }
+    if control_check is not None:
+        report["control_check"] = control_check
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2, sort_keys=True)
@@ -4177,6 +4363,12 @@ def parse_args(argv):
     parser.add_argument("--gcp-list", metavar="PATH",
                         help="ODM gcp_list.txt (header EPSG:4326, rows "
                              "'x y z px py image [label]') for --real")
+    parser.add_argument("--check-list", metavar="PATH",
+                        help="ODM gcp_list.txt of every surveyed station, for "
+                             "the report-only control/check measure: the "
+                             "--gcp-list stations are control and the rest are "
+                             "check points, scored in one adjustment per "
+                             "variant. Never changes the leave-one-out gate")
     parser.add_argument("--gcp-names", metavar="CSV",
                         help="Name;Easting;Northing;Elevation;Longitude;Latitude "
                              "CSV whose points are matched to --gcp-list by "
