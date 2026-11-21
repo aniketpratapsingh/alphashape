@@ -3802,6 +3802,9 @@ DIAGNOSTIC_VARIANTS = (
     ("px_shift_minus", False, {"projection_shift_px": -0.5}),
     ("marker_sigma_0p25", False, {"marker_projection_accuracy": 0.25}),
     ("marker_sigma_1p0", False, {"marker_projection_accuracy": 1.0}),
+    ("camera_rtk_marker_sigma_1p0", True, {"marker_projection_accuracy": 1.0}),
+    ("camera_rtk_marker_sigma_2p0", True, {"marker_projection_accuracy": 2.0}),
+    ("camera_rtk_marker_sigma_3p0", True, {"marker_projection_accuracy": 3.0}),
     ("camera_rtk_loose", True, {"camera_accuracy": 0.5}),
     # Combinations of the probes above that each moved the check error.
     ("adaptive_px_minus", False,

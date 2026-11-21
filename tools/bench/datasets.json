@@ -233,7 +233,7 @@
         "camera_accuracy_uniform_m": 0.05,
         "marker_location_accuracy_m": 0.015,
         "gcp_height": "ellipsoidal",
-        "diagnostics": false,
+        "diagnostics": true,
         "align_from_reference": true
       },
       "param_overrides": {
