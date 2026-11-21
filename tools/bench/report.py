@@ -571,6 +571,35 @@ def gcp_markdown(current: dict) -> str:
                          f"{label} {_fmt_offset(value)} m"
                          for label, value in estimates.items()) + " |")
     lines.append("")
+    control_check = current.get("control_check") or {}
+    control_variants = control_check.get("variants") or {}
+    if control_variants:
+        # The dataset's intended protocol, report-only: one adjustment per
+        # variant on the control points, every other station scored as a check.
+        # It sits beside the leave-one-out tables and never changes the verdict.
+        first = next((record for record in control_variants.values()
+                      if "error" not in record), {})
+        control_n = first.get("control")
+        check_n = first.get("checks")
+        lines.append(f"## Control {control_n} / check {check_n} (report-only)")
+        lines.append("")
+        lines.append("| Variant | Checks | Horizontal RMS (m) | Vertical RMS (m) | "
+                     "Max horizontal (m) | H RMS, >= 6 obs (m) | H RMS, < 6 obs (m) | "
+                     "Marker reprojection RMS (px) |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        for variant, record in control_variants.items():
+            if "error" in record:
+                lines.append(f"| {variant} | _error: {record.get('error')}_ | | | | | | |")
+                continue
+            lines.append(
+                f"| {variant} | {record.get('checks')} | "
+                f"{_fmt(record.get('rms_horizontal_m'))} | "
+                f"{_fmt(record.get('rms_vertical_m'))} | "
+                f"{_fmt(record.get('max_horizontal_m'))} | "
+                f"{_fmt(record.get('rms_horizontal_many_observations_m'))} | "
+                f"{_fmt(record.get('rms_horizontal_few_observations_m'))} | "
+                f"{_fmt(record.get('reprojection_rms_px'))} |")
+        lines.append("")
     for variant, data in (current.get("variants") or {}).items():
         options = data.get("options") or {}
         # A standard variant can now carry an option too: the benchmark's

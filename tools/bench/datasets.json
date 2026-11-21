@@ -188,6 +188,61 @@
       },
       "param_overrides_reason": "keypoint_limit_per_mpx=500 (~10000 keypoints per 20 MP image) was measured best on this block with the match_params experiments: 250 aligned 146 of 176 cameras at 5.31 cm horizontal check RMS in 12342 s, 500 aligned 169 at 4.36 cm in 5924 s, and 1000 aligned 174 at 4.47 cm in 14980 s. 500 is the most accurate and the fastest of the three. Reference preselection (GPS neighbours) caps the match work at ~20 pairs per camera. The GCP validation never runs the dense stage.",
       "notes": "35 image observations of 5 surveyed GCPs (ODM gcp_list format, header EPSG:4326) and a 5-point CSV (Name;Easting;Northing;Elevation;Longitude;Latitude) surveyed with an Emlid Reach RS2 via NTRIP at a stated 1-2 cm accuracy. Every image's XMP carries RtkFlag 50 (fixed) and RtkStdLon/Lat/Hgt, and RTK_Data/101FTASK_Timestamp.mrk carries the same per-exposure antenna positions, deviations and the GPS event time; the benchmark runs the protocol with --camera-accuracy per-image, so each camera is weighted by its own solution, and uses the event-mark log for the timing comparison. Photographs by Daniel Dobosi, published by OpenDroneMap under GPL-3.0."
+    },
+    "gcp-eurosdr": {
+      "title": "Wards Hill quarry, Northumberland, UK (EuroSDR RPAS benchmark, DJI P4 RTK)",
+      "publisher": "Zenodo record 10059050 (Newcastle University Geospatial Engineering for EuroSDR)",
+      "doi": "10.5281/zenodo.10059050",
+      "flight": "nadir RTK drone",
+      "validation": "gcp",
+      "licence": {
+        "spdx": "CC-BY-4.0",
+        "name": "Creative Commons Attribution 4.0 International",
+        "url": "https://creativecommons.org/licenses/by/4.0/",
+        "redistribution": "allowed with attribution; the imagery is downloaded and measured, never redistributed, and the committed observations are our own derived data"
+      },
+      "images_archive": {
+        "download": "Phase2.7z",
+        "url": "https://zenodo.org/api/records/10059050/files/Phase2.7z/content",
+        "sha256": "8f321443ce33b45155742c12f2baa8c008c57bb08de1577d291528a17d795c4a",
+        "bytes": 9904885993,
+        "extract_include": "Phase2/250821_DJI_Phantom_P4RTK_RTKenabled/100_0004/*",
+        "extract_glob": "Phase2/250821_DJI_Phantom_P4RTK_RTKenabled/100_0004/*.JPG"
+      },
+      "reference_files": [
+        {
+          "path": "reference/gcp_list.txt",
+          "repo_path": "tools/bench/data/eurosdr/gcp_list_gcps.txt",
+          "kind": "gcp_list"
+        },
+        {
+          "path": "reference/gcp_names.csv",
+          "repo_path": "tools/bench/data/eurosdr/gcp_names.csv",
+          "kind": "gcp_names"
+        },
+        {
+          "path": "reference/gcp_list_all.txt",
+          "repo_path": "tools/bench/data/eurosdr/gcp_list.txt",
+          "kind": "check_list"
+        }
+      ],
+      "expected_images": 430,
+      "gcp": {
+        "target_horizontal_m": 0.05,
+        "camera_accuracy": "per-image",
+        "camera_accuracy_uniform_m": 0.05,
+        "marker_location_accuracy_m": 0.015,
+        "gcp_height": "ellipsoidal",
+        "diagnostics": false,
+        "align_from_reference": true
+      },
+      "param_overrides": {
+        "MatchPhotos": {
+          "keypoint_limit_per_mpx": 250
+        }
+      },
+      "param_overrides_reason": "keypoint_limit_per_mpx=250 is the density the aerial-nadir and terrestrial-laser datasets use and what fits a 16 GB runner: 430 images at 500 is 2.4x the gcp-rtk block's keypoint load, which killed the measurement runner out of memory on its first attempt. Reference preselection (GPS neighbours) caps the match work at ~20 pairs per camera. The GCP validation never runs the dense stage.",
+      "notes": "The publisher ships the surveyed coordinates of 8 GCPs and 51 check points but NOT the pixel observations of their printed targets, so the benchmark measures them itself in a CI-only workflow (eurosdr-observations.yml) and commits the accepted observations as our own derived data under tools/bench/data/eurosdr/ (CC BY 4.0, Mills et al. 2023, Newcastle University / EuroSDR). The targets are 300 mm circular Perspex disks with a 100 mm black centre (white for check points, yellow for GCPs) on stakes 0.15-0.45 m above ground; the P4 RTK flew at 55 m AGL with an 8.8 mm lens and 2.41 um pixels, so the GSD is ~1.5 cm. The coordinates come from GCPsandCPs_coords.xlsx in ETRS89 geodetic lat/lon with ELLIPSOIDAL height on GRS80, so --gcp-height ellipsoidal applies directly and no geoid model is needed. The xlsx is the authoritative label source: the Phase3 text file's labels are shifted by one against it and are never read. The committed gcp_list is the GCP-only list (the eight GCPs) because the protocol does leave-one-out over every point in the list; the full 59-station list is kept alongside it as the complete derived data. The whole 430-image flight is used: a strided subset was tried and rejected, because taking every fourth frame halves the forward overlap and only 23 of 108 cameras registered. The block is aligned RTK-first (align_from_reference): AlignCameras' single global similarity fit keeps only 6 of 430 cameras inside its inlier threshold on this flight, so the block registers a small fraction of its images; placing each camera from its own RTK position and gimbal attitude registers all 430."
     }
   }
 }

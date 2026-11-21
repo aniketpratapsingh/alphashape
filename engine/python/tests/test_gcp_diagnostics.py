@@ -14,6 +14,8 @@ Plain unittest, no pytest.
 
 import importlib.util
 import pathlib
+import sys
+import types
 import unittest
 
 
@@ -22,6 +24,15 @@ def load_script():
             "tests" / "run_gcp_validation.py")
     spec = importlib.util.spec_from_file_location("run_gcp_validation", path)
     module = importlib.util.module_from_spec(spec)
+    # The script imports the built `alphashape` module at top level. These tests
+    # exercise only pure helpers, so a stub satisfies the import when the module
+    # is not built (the same trick the previous change used). When the real
+    # module is importable it is used unchanged.
+    if "alphashape" not in sys.modules:
+        try:
+            import alphashape  # noqa: F401, PLC0415
+        except ImportError:
+            sys.modules["alphashape"] = types.ModuleType("alphashape")
     spec.loader.exec_module(module)
     return module
 
@@ -181,6 +192,191 @@ class TestMatchParams(unittest.TestCase):
         args = SCRIPT.parse_args(["--real", "/x", "--match-param", "tiepoint_limit=8000"])
         self.assertEqual(args.match_params, {"tiepoint_limit": 8000})
         self.assertEqual(SCRIPT.parse_args(["--real", "/x"]).match_params, {})
+
+
+class TestControlCheckSplit(unittest.TestCase):
+    """The report-only control/check split: control is --gcp-list, checks are
+    the --check-list stations not already control."""
+
+    def _station(self, label):
+        return {"label": label, "lon": 0.0, "lat": 0.0, "height": 0.0,
+                "observations": []}
+
+    def test_checks_are_the_stations_not_in_control(self):
+        control = [self._station("A"), self._station("B")]
+        stations = [self._station("A"), self._station("B"),
+                    self._station("C"), self._station("D")]
+        controls, checks = SCRIPT.split_control_check(control, stations)
+        self.assertEqual([gcp["label"] for gcp in controls], ["A", "B"])
+        self.assertEqual([gcp["label"] for gcp in checks], ["C", "D"])
+
+    def test_a_station_in_both_lists_is_control_not_a_check(self):
+        # A point that constrains the fit must never also be scored as a check.
+        control = [self._station("A")]
+        stations = [self._station("A"), self._station("B")]
+        _, checks = SCRIPT.split_control_check(control, stations)
+        self.assertEqual([gcp["label"] for gcp in checks], ["B"])
+
+    def test_control_is_every_gcp_list_station(self):
+        control = [self._station("A"), self._station("B")]
+        _, checks = SCRIPT.split_control_check(control, [self._station("A")])
+        self.assertEqual(checks, [])
+
+    def test_the_check_list_argument_is_optional(self):
+        self.assertIsNone(SCRIPT.parse_args(["--real", "/x"]).check_list)
+        args = SCRIPT.parse_args(["--real", "/x", "--check-list", "/y"])
+        self.assertEqual(args.check_list, "/y")
+
+
+class _Calibration:
+    """A frame calibration with the attributes the projector reads."""
+
+    def __init__(self, **overrides):
+        self.type = "frame"
+        self.width = 200
+        self.height = 200
+        self.f = 1.0
+        self.cx = 0.0
+        self.cy = 0.0
+        self.b1 = 0.0
+        self.b2 = 0.0
+        self.k1 = 0.0
+        self.k2 = 0.0
+        self.k3 = 0.0
+        self.k4 = 0.0
+        self.p1 = 0.0
+        self.p2 = 0.0
+        self.p3 = 0.0
+        self.p4 = 0.0
+        for key, value in overrides.items():
+            setattr(self, key, value)
+
+
+IDENTITY_POSE = [[1.0, 0.0, 0.0, 0.0],
+                 [0.0, 1.0, 0.0, 0.0],
+                 [0.0, 0.0, 1.0, 0.0],
+                 [0.0, 0.0, 0.0, 1.0]]
+
+
+class TestProjectMarkerPixel(unittest.TestCase):
+    """The forward Brown model the marker reprojection RMS is measured with."""
+
+    def test_a_point_on_the_axis_lands_at_the_image_centre(self):
+        pixel = SCRIPT.project_marker_pixel((0.0, 0.0, 10.0), IDENTITY_POSE,
+                                            _Calibration())
+        self.assertIsNotNone(pixel)
+        self.assertAlmostEqual(pixel[0], 100.0, places=9)
+        self.assertAlmostEqual(pixel[1], 100.0, places=9)
+
+    def test_a_point_behind_the_camera_has_no_projection(self):
+        self.assertIsNone(SCRIPT.project_marker_pixel(
+            (0.0, 0.0, -10.0), IDENTITY_POSE, _Calibration()))
+
+    def test_the_principal_point_offset_shifts_the_projection(self):
+        pixel = SCRIPT.project_marker_pixel(
+            (0.0, 0.0, 10.0), IDENTITY_POSE, _Calibration(cx=10.0, cy=-5.0))
+        self.assertAlmostEqual(pixel[0], 110.0, places=9)
+        self.assertAlmostEqual(pixel[1], 95.0, places=9)
+
+    def test_a_fisheye_sensor_is_refused(self):
+        with self.assertRaises(ValueError):
+            SCRIPT.project_marker_pixel((0.0, 0.0, 10.0), IDENTITY_POSE,
+                                        _Calibration(type="fisheye"))
+
+
+class _Projection:
+    def __init__(self, camera, px, py):
+        self.camera = type("Camera", (), {"label": camera})()
+        self.pixel = (px, py)
+
+
+class _Camera:
+    def __init__(self, label, sensor_id=0):
+        self.label = label
+        self.sensor_id = sensor_id
+        self.pose = IDENTITY_POSE
+
+
+class _Sensor:
+    def __init__(self, calibration):
+        self.calibration = calibration
+
+
+class _Marker:
+    def __init__(self, label, position, projections):
+        self.label = label
+        self.position = position
+        self.projections = projections
+
+
+class _Chunk:
+    def __init__(self, cameras, sensors, markers):
+        self.cameras = cameras
+        self.sensors = sensors
+        self.markers = markers
+
+
+class TestMarkerReprojectionRms(unittest.TestCase):
+    """The post-adjustment marker reprojection RMS, per point and overall."""
+
+    def test_a_perfect_reprojection_has_zero_rms(self):
+        # The marker at (0, 0, 10) reprojects to (100, 100); the measured pixel
+        # is exactly there, so the residual is zero.
+        chunk = _Chunk(
+            cameras=[_Camera("a"), _Camera("b")],
+            sensors=[_Sensor(_Calibration())],
+            markers=[_Marker("A1", (0.0, 0.0, 10.0),
+                             [_Projection("a", 100.0, 100.0),
+                              _Projection("b", 100.0, 100.0)])])
+        per_label, overall = SCRIPT.marker_reprojection_rms(chunk, ["A1"])
+        self.assertEqual(per_label["A1"]["observations"], 2)
+        self.assertAlmostEqual(per_label["A1"]["rms_px"], 0.0, places=9)
+        self.assertAlmostEqual(overall, 0.0, places=9)
+
+    def test_a_known_offset_gives_the_expected_rms(self):
+        # Both measured pixels are 3 px off in x, so the RMS is 3 px.
+        chunk = _Chunk(
+            cameras=[_Camera("a"), _Camera("b")],
+            sensors=[_Sensor(_Calibration())],
+            markers=[_Marker("A1", (0.0, 0.0, 10.0),
+                             [_Projection("a", 103.0, 100.0),
+                              _Projection("b", 103.0, 100.0)])])
+        per_label, overall = SCRIPT.marker_reprojection_rms(chunk, ["A1"])
+        self.assertAlmostEqual(per_label["A1"]["rms_px"], 3.0, places=9)
+        self.assertAlmostEqual(overall, 3.0, places=9)
+
+    def test_a_projection_onto_a_missing_camera_is_skipped(self):
+        # A projection whose camera is not in the chunk is not counted.
+        chunk = _Chunk(
+            cameras=[_Camera("a")],
+            sensors=[_Sensor(_Calibration())],
+            markers=[_Marker("A1", (0.0, 0.0, 10.0),
+                             [_Projection("a", 100.0, 100.0),
+                              _Projection("gone", 500.0, 500.0)])])
+        per_label, _overall = SCRIPT.marker_reprojection_rms(chunk, ["A1"])
+        self.assertEqual(per_label["A1"]["observations"], 1)
+        self.assertAlmostEqual(per_label["A1"]["rms_px"], 0.0, places=9)
+
+    def test_a_marker_with_no_position_has_no_rms(self):
+        chunk = _Chunk(
+            cameras=[_Camera("a")],
+            sensors=[_Sensor(_Calibration())],
+            markers=[_Marker("A1", None, [_Projection("a", 100.0, 100.0)])])
+        per_label, overall = SCRIPT.marker_reprojection_rms(chunk, ["A1"])
+        self.assertEqual(per_label["A1"]["observations"], 0)
+        self.assertIsNone(per_label["A1"]["rms_px"])
+        self.assertIsNone(overall)
+
+    def test_only_the_requested_labels_are_measured(self):
+        chunk = _Chunk(
+            cameras=[_Camera("a")],
+            sensors=[_Sensor(_Calibration())],
+            markers=[_Marker("A1", (0.0, 0.0, 10.0),
+                             [_Projection("a", 100.0, 100.0)]),
+                     _Marker("B2", (0.0, 0.0, 10.0),
+                             [_Projection("a", 100.0, 100.0)])])
+        per_label, _overall = SCRIPT.marker_reprojection_rms(chunk, ["A1"])
+        self.assertEqual(set(per_label), {"A1"})
 
 
 if __name__ == "__main__":

@@ -606,13 +606,17 @@ def seven_zip_members(archive: Path) -> list[str]:
     return [line[len("Path = "):] for line in listing.splitlines() if line.startswith("Path = ")]
 
 
-def extract_archive(archive: Path, destination: Path, *, members: list[str] | None = None) -> None:
+def extract_archive(archive: Path, destination: Path, *, members: list[str] | None = None,
+                    include: str | None = None) -> None:
     """Extract ``archive`` under ``destination``.
 
     ``members`` limits the extraction to the named entries, which is how a single
     reference archive is unpacked once even when several reference files come out
-    of it. Zip and tar (including .tar.zst handled by the external `tar`) are
-    supported; a `.7z` needs `7z`, which the workflow installs.
+    of it. ``include`` is a 7-Zip include pattern (``-ir!<pattern>``) that limits
+    a large multi-flight archive to one subfolder; it is resolved to the matching
+    members first, so the same name check applies. The two are mutually exclusive.
+    Zip and tar (including .tar.zst handled by the external `tar`) are supported;
+    a `.7z` needs `7z`, which the workflow installs.
 
     Every entry is checked against :func:`check_member_name` BEFORE it is written,
     including the entries of a full extraction: an archive is downloaded from a
@@ -620,6 +624,9 @@ def extract_archive(archive: Path, destination: Path, *, members: list[str] | No
     malformed archive or an attempt to write outside it. Both fail the run here,
     with the offending name, rather than landing a file somewhere else.
     """
+    if members is not None and include is not None:
+        raise SystemExit(
+            f"{archive.name}: pass either members or include, not both")
     destination.mkdir(parents=True, exist_ok=True)
     root = destination.resolve()
     name = archive.name.lower()
@@ -640,37 +647,42 @@ def extract_archive(archive: Path, destination: Path, *, members: list[str] | No
 
     if name.endswith(".zip"):
         with zipfile.ZipFile(archive) as bundle:
-            wanted = members if members is not None else bundle.namelist()
+            present = bundle.namelist()
+            wanted = _resolve_include(present, include, archive) if include else (
+                members if members is not None else present)
             for member in wanted:
                 checked(member)
                 check_resolved(destination / member, member)
-            if members is None:
+            if members is None and include is None:
                 bundle.extractall(destination)
             else:
-                for member in members:
+                for member in wanted:
                     bundle.extract(member, destination)
         return
 
     if name.endswith((".tar", ".tar.gz", ".tgz", ".tar.zst", ".tar.xz", ".tar.bz2")):
         with tarfile.open(archive) as bundle:
-            wanted = members if members is not None else [entry.name for entry in bundle.getmembers()]
+            present = [entry.name for entry in bundle.getmembers()]
+            wanted = _resolve_include(present, include, archive) if include else (
+                members if members is not None else present)
             for member in wanted:
                 checked(member)
                 check_resolved(destination / member, member)
-            if members is None:
+            if members is None and include is None:
                 # `data` refuses absolute paths on its own, but the names are
                 # already checked above and leaving it off keeps the behaviour
                 # identical to the named-member path.
                 bundle.extractall(destination)
             else:
-                for member in members:
+                for member in wanted:
                     bundle.extract(member, destination)
         return
 
     if name.endswith(".7z"):
         seven = _seven_zip()
         present = seven_zip_members(archive)
-        wanted = members if members is not None else present
+        wanted = _resolve_include(present, include, archive) if include else (
+            members if members is not None else present)
         for member in wanted:
             checked(member)
             check_resolved(destination / member, member)
@@ -686,12 +698,36 @@ def extract_archive(archive: Path, destination: Path, *, members: list[str] | No
                     f"{len(present)} entries, e.g. {present[:3]!r}"
                 )
         command = [seven, "x", "-y", f"-o{destination}", str(archive)]
-        if members:
+        if include:
+            # The include pattern is passed to 7-Zip directly so it does not
+            # have to be expanded into hundreds of member names on the command
+            # line; the members it selects were already checked above.
+            command.append(f"-ir!{include}")
+        elif members:
             command.extend(members)
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
         return
 
     raise SystemExit(f"{archive}: unsupported archive type")
+
+
+def _resolve_include(present: list[str], include: str, archive: Path) -> list[str]:
+    """The members of ``present`` that match a 7-Zip include pattern.
+
+    The pattern is a shell-style glob (``*`` and ``?``), matched against the
+    whole member path, which is what ``-ir!`` does. A pattern that matches
+    nothing is a named error: 7-Zip exits 0 on an unmatched include and unpacks
+    nothing, which would leave the images silently absent.
+    """
+    import fnmatch  # noqa: PLC0415 - only needed for the include path
+
+    matched = [member for member in present if fnmatch.fnmatchcase(member, include)]
+    if not matched:
+        raise SystemExit(
+            f"{archive.name}: include pattern {include!r} matched no member; "
+            f"the archive holds {len(present)} entries, e.g. {present[:3]!r}"
+        )
+    return matched
 
 
 def collect_images(dataset: dict, work: Path) -> list[Path]:
@@ -772,6 +808,34 @@ def select_subset(images: list[Path], limit: int | None) -> tuple[list[Path], di
         "selected": len(selected),
         "mode": "nearest-to-centroid cluster" if positions is not None
                 else "middle file-order block",
+        "images": [path.name for path in selected],
+    }
+
+
+def _stride_subset(images: list[Path], limit: int) -> tuple[list[Path], dict]:
+    """Every ``stride``-th image, keeping the whole site covered.
+
+    A lawnmower flight is a set of parallel strips; taking every ``stride``-th
+    frame keeps every strip (and therefore every control point, including the
+    ones at the site's edges) while leaving enough forward overlap within a
+    strip to match. ``stride`` is ``ceil(len / limit)``. This is the right
+    selection when the control points span the site: the nearest-to-centroid
+    cluster keeps the middle and drops the edges, which is exactly where several
+    of the EuroSDR GCPs sit.
+    """
+    if limit <= 0 or len(images) <= limit:
+        return images, {
+            "requested": limit,
+            "selected": len(images),
+            "mode": "all",
+            "images": [path.name for path in images],
+        }
+    stride = math.ceil(len(images) / limit)
+    selected = images[::stride]
+    return selected, {
+        "requested": limit,
+        "selected": len(selected),
+        "mode": f"stride {stride}",
         "images": [path.name for path in selected],
     }
 
@@ -1387,15 +1451,29 @@ def run(
     archive = cache / dataset["images_archive"]["download"]
     image_root = work / "images"
     if not any(image_root.rglob("*")):
-        extract_archive(archive, image_root)
+        # `extract_include` limits a large multi-flight archive to the one
+        # subfolder the dataset uses. The EuroSDR Phase2 archive is 9.9 GB and
+        # holds three P4 RTK flights plus lidar; the benchmark needs one flight,
+        # so extracting the whole archive would spend the runner's disk on data
+        # it never reads. The pattern is a 7-Zip include (`-ir!<pattern>`), and
+        # the members it selects are still checked by `extract_archive`.
+        include = dataset["images_archive"].get("extract_include")
+        if include:
+            extract_archive(archive, image_root, include=include)
+        else:
+            extract_archive(archive, image_root)
     else:
         print(f"  cached   {image_root}")
 
     # References: one extraction per download, then the named members. Keyed by the
     # cache file name so a single archive that supplies several members (two laser
-    # scans, both GeoTIFFs from one ODM run) is unpacked once.
+    # scans, both GeoTIFFs from one ODM run) is unpacked once. A reference with a
+    # `repo_path` is committed to this repository (our own derived data, e.g. the
+    # EuroSDR observations) and is copied from the checkout, not downloaded.
     by_download: dict[str, list[str]] = {}
     for reference in dataset["reference_files"]:
+        if reference.get("repo_path"):
+            continue
         source = reference.get("from_archive") or reference["download"]
         by_download.setdefault(source, [])
         if reference.get("archive_member"):
@@ -1415,6 +1493,18 @@ def run(
         if target.exists():
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
+        repo_path = reference.get("repo_path")
+        if repo_path:
+            # A committed reference: copy it from the checkout. The path is
+            # relative to the repository root, so the run is reproducible from
+            # the commit alone.
+            found = HERE.parent.parent / repo_path
+            if not found.exists():
+                raise SystemExit(
+                    f"{dataset_name}: committed reference {repo_path!r} is missing "
+                    f"from the checkout ({found})")
+            shutil.copy2(found, target)
+            continue
         archive_name = reference.get("from_archive") or reference["download"]
         source_root = work / "reference_raw" / Path(archive_name).stem
         member = reference.get("archive_member")
@@ -1620,10 +1710,44 @@ def run_gcp_validation(
     """
     available = collect_images(dataset, work)
     images_dir = available[0].parent
+    # `max_images` caps the block for a dataset whose full flight does not fit
+    # the weekly budget. The protocol reads a flat directory, so the subset is
+    # exposed as a directory of symlinks to the selected frames, and the
+    # protocol's own image list is then exactly that subset. A dataset with no
+    # cap (gcp-rtk) keeps the whole directory, unchanged.
+    #
+    # `max_images_mode` picks the selection. "cluster" (the default) is the
+    # nearest-to-centroid block the pipeline datasets use: a contiguous
+    # neighbourhood with the overlap the alignment needs. "stride" takes every
+    # n-th frame, which keeps the whole site covered — the right choice when the
+    # control points span the site, because a centroid cluster would drop the
+    # edge points and leave the block under-constrained at its margins.
+    limit = dataset.get("max_images")
+    if limit:
+        mode = dataset.get("max_images_mode", "cluster")
+        if mode == "stride":
+            selected, selection = _stride_subset(available, limit)
+        else:
+            selected, selection = select_subset(available, limit)
+        if selection["mode"] != "all":
+            subset_dir = work / "images_subset"
+            subset_dir.mkdir(parents=True, exist_ok=True)
+            for path in selected:
+                link = subset_dir / path.name
+                if not link.exists():
+                    link.symlink_to(path.resolve())
+            images_dir = subset_dir
+            print(f"   {len(selected)} of {len(available)} images "
+                  f"({selection['mode']})")
+            print("   selected: " + ", ".join(selection["images"]))
     gcp_list = references.get("gcp_list")
     gcp_names = references.get("gcp_names")
     if not gcp_list or not gcp_names:
         raise SystemExit(f"{dataset_name}: the gcp-rtk manifest must name gcp_list and gcp_names references")
+    # An optional full station list turns on the report-only control/check
+    # measure (the dataset's intended 8-control/51-check protocol) alongside
+    # the leave-one-out gate. It never changes the gate.
+    check_list = references.get("check_list")
 
     script = HERE.parent.parent / "engine" / "tests" / "run_gcp_validation.py"
     gcp = dataset.get("gcp") or {}
@@ -1665,6 +1789,13 @@ def run_gcp_validation(
     if gcp.get("camera_accuracy_uniform_m") is not None:
         command.extend(["--camera-accuracy-uniform",
                         str(gcp["camera_accuracy_uniform_m"])])
+    if check_list:
+        command.extend(["--check-list", str(check_list)])
+    # A long flight whose single global similarity fit keeps only a small
+    # fraction of the cameras needs the RTK-first alignment instead; the
+    # manifest opts a dataset in.
+    if gcp.get("align_from_reference"):
+        command.append("--align-from-reference")
     # The timing diagnostics need the RTK module's per-exposure event marks.
     mrk = references.get("mrk")
     if mrk:

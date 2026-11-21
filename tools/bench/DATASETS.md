@@ -242,14 +242,19 @@ combination of licence, size, nadir flight and publisher-supplied reference.
 | OpenDroneMap `odm_data_*` (aukerman, seneca, bellus, ...) | CC0 / BSD-2 / none | **none** | The ODM sample repos publish images only. DroneDB Hub shows *user* runs, not publisher references, so they cannot support reference-based metrics |
 | `pierotofy/drone_dataset_*` (sand_key, brighton_beach) | BSD-2-Clause | none | Same problem: images only |
 | ETH3D `bridge` / `exhibition_hall` (test split) | CC BY-NC-SA 4.0 | laser scans | Ground truth for the test split is not published; only training scenes can be scored |
-| Zenodo 10059050 (EuroSDR RPAS benchmark, Wards Hill quarry) | CC BY 4.0 | 51 check points + 8 GCPs, 3-D coordinates only | **No image observations of the targets are published**, so the leave-one-out protocol cannot run. See the section below |
+| Zenodo 10059050 (EuroSDR RPAS benchmark, Wards Hill quarry) | CC BY 4.0 | 51 check points + 8 GCPs, ETRS89 ellipsoidal coordinates | **Observations are not published, so we measure them ourselves** in a CI-only workflow. See the section below |
 
-## Studied and rejected: EuroSDR RPAS benchmark (Zenodo 10059050)
+## Second ground control: EuroSDR RPAS benchmark (Zenodo 10059050)
 
 **Wards Hill quarry, Morpeth, Northumberland, UK — August 2021.** Studied 2026-11-18 as
 the second independent ground-control block, so the 5 cm horizontal target would not be
-tuned to one survey. Rejected: the published data has no pixel observations of the
-targets, which the protocol requires.
+tuned to one survey. The publisher releases the surveyed coordinates of 8 GCPs and 51
+check points but **not** the pixel observations of their targets. Rather than reject the
+block, the benchmark measures the observations itself: a CI-only workflow aligns the
+RTK flight with no ground control, projects each surveyed point into every camera that
+sees it, and snaps the projection onto the printed target with the engine's own
+multi-view marker refinement. The accepted observations are committed as our own derived
+data (see below), so the ordinary `gcp-eurosdr` run needs no measurement step.
 
 - Publisher: Zenodo record 10059050, DOI [10.5281/zenodo.10059050](https://doi.org/10.5281/zenodo.10059050)
   (concept DOI 10.5281/zenodo.8309678). Newcastle University Geospatial Engineering for
@@ -257,10 +262,11 @@ targets, which the protocol requires.
   description and summary of key results*, ISPRS Archives XLVIII-1/W3-2023, 107–114,
   DOI [10.5194/isprs-archives-XLVIII-1-W3-2023-107-2023](https://doi.org/10.5194/isprs-archives-XLVIII-1-W3-2023-107-2023).
 - Licence: **CC BY 4.0** (`metadata.license.id == "cc-by-4.0"`). Redistribution is
-  allowed with attribution, so the licence is not the obstacle.
+  allowed with attribution, so the licence is not an obstacle. The derived observation
+  file committed under `tools/bench/data/eurosdr/` carries that attribution.
 - Files (four, all on the record):
   - `GCPsandCPs_coords.xlsx` (30 KB) — 59 stations, each with ETRS89 Cartesian
-    (X/Y/Z), ETRS89 geodetic on GRS80 (lat/lon/ellipsoidal height) and OSGB36/ODN
+    (X/Y/Z), ETRS89 geodetic on GRS80 (lat/lon/**ellipsoidal** height) and OSGB36/ODN
     (E/N/orthometric height). 51 check points (50 named `A2`–`F8`, `S1`–`S3`, plus one
     unnamed row) and 8 GCPs (`GA1`, `GA5`, `GA8`, `GC6`, `GD4`, `GF1`, `GF4`, `GF8`),
     matching the paper's "51 CP and eight GCP targets". Surveyed with Leica GS18
@@ -270,31 +276,122 @@ targets, which the protocol requires.
     DJI P1 (1024 nadir), DJI L1 (254), Riegl MiniVUX, Routescene LidarPod.
   - `Phase2.7z` (9.9 GB) — RTK / local base station: P4 RTK (500 images, 3 flights),
     DJI L1 (252), Riegl MiniVUX, Routescene LidarPod, plus the local base-station RINEX.
+    The measurement workflow extracts only the P4 RTK flight `100_0004` (430 JPEGs and
+    its `100_0004_Timestamp.MRK`) from this archive.
   - `Phase3.7z` (401 bytes) — a single text file, `EuroSDR-Phase3-GCPs.txt`: the 8 GCPs
     as `id E N H` in OSGB36/ODN. Coordinates only.
-- **Why it cannot be used.** The protocol needs, for every control point, its 3-D
-  coordinate *and* the pixel position of its target in the images that see it. The
-  record publishes the coordinates but not the observations. The complete file lists of
-  both large archives were read from their 7z headers over HTTP range requests (no
-  multi-GB download): they contain imagery, PPK/RINEX/event-mark logs, lidar, and
-  dataset-information PDFs, and **no** GCP list, marker file or observation table. The
-  paper's method section confirms the participants were asked to submit CP coordinates
-  and products, and that the ground truth is the surveyed coordinates — the image
-  observations were never part of the release. The targets are 300 mm circular
-  photogrammetric targets with a 100 mm black centre, which the engine's non-coded
-  circular detector could in principle find, but the protocol's real mode takes its
-  observations from a `gcp_list` and does not run detection, so that is not a
-  substitute without new work.
-- Two further obstacles, recorded for completeness: the GCP heights are orthometric
-  (OSGB36/ODN), and the protocol refuses a non-ellipsoidal `--gcp-height` because it
-  carries no geoid model; and the smallest usable photogrammetric flight (P4 RTK,
-  ~430 images at 3.7 GB) is larger than the current ground-control block (176 images).
+- **The point coordinates come from the xlsx, in ETRS89 ellipsoidal terms.** The xlsx
+  carries ETRS89 geodetic latitude, longitude and **ellipsoidal** height on the GRS80
+  ellipsoid for every station, so the protocol's `--gcp-height ellipsoidal` applies
+  directly and no geoid model is needed. (The OSGB36/ODN columns in the same sheet are
+  orthometric, but they are not the source: the xlsx's ETRS89 geodetic columns are.)
+  The engine's geodesy is WGS84, which differs from ETRS89 by well under a metre at
+  this site and is the same frame the RTK camera positions are recorded in, so the
+  block is internally consistent.
+- **The observations are measured, not published.** The record ships no GCP list,
+  marker file or observation table — the complete file lists of both large archives
+  were read from their 7z headers over HTTP range requests (no multi-GB download) and
+  contain imagery, PPK/RINEX/event-mark logs, lidar and dataset-information PDFs only.
+  The targets are 300 mm circular Perspex disks with a 100 mm black centre (white for
+  check points, yellow for GCPs), mounted on stakes 0.15–0.45 m above ground (Mills
+  et al. 2023, §2.1.2). The P4 RTK flew at 55 m AGL with an 8.8 mm lens and 2.41 µm
+  pixels, so the GSD is ~1.5 cm: the black centre is only ~3.3 px radius and the disk
+  ~10 px. The measurement workflow (`.github/workflows/eurosdr-observations.yml`,
+  driving `tools/bench/eurosdr_observations.py`) does exactly that:
+  1. import the 430 P4 RTK images with their DJI RTK XMP positions, accuracies and
+     gimbal attitudes, then `MatchPhotos` (`keypoint_limit_per_mpx=250`, reference
+     preselection);
+  2. place every camera from its **own** RTK position and gimbal attitude with
+     `AlignFromReference`, which builds a unit-scale local ENU frame. The incremental
+     `AlignCameras` is deliberately not used: it georeferences the block with one global
+     similarity fitted to the camera centres, and on this 430-frame flight that fit keeps
+     only 6 cameras inside its 0.5 m inlier threshold, so the similarity is extrapolated
+     from a small cluster and is metres off across the rest of the block. A bundle
+     adjustment started from that georeference diverges (its priors are ~19 m from the
+     poses it linearises around). Placing each camera from its own RTK solution avoids
+     the global fit entirely;
+  3. rebuild the tie points from the stored matches with `TriangulateTiePoints` (the
+     placement cleared them, as they belonged to the old frame), then refine the poses
+     with `OptimizeCameras`, which uses each camera's RTK position as a prior. No
+     station exists yet, so the surveyed control cannot influence the alignment;
+  4. read the xlsx with openpyxl and add all 59 stations as markers in EPSG:4979
+     (ETRS89 geodetic, ellipsoidal height). The one xlsx row with no station label is
+     the missing `A1` grid cell: the sheet carries every cell of the 6x8 `A1`..`F8`
+     array but `A1`, and the unlabelled row sits at that lattice cell, so the script
+     recovers the label from the labels the sheet does carry rather than writing
+     `UNNAMED`;
+  5. project each point into every aligned camera that sees it, then run `DetectMarkers`
+     (non-coded `Circular`, full resolution, 2 px floor, both polarities) to FIND the
+     printed target near each projection, and `RefineMarkers` to snap the detected centre
+     onto the printed centre with multi-view consensus. The refinement runs on the
+     `max_views` observers that best span the station (farthest-point sampling on the
+     camera centres), so the triangulation is well conditioned; **every** detected view
+     is then a candidate observation, not only the refined ones;
+  6. keep only detections within the search radius of the projection and, where the
+     refinement triangulated the marker, a small reprojection residual; write the
+     accepted observations as an ODM `gcp_list.txt` plus a JSON summary.
+  The accepted `gcp_list` is committed under `tools/bench/data/eurosdr/` as our own
+  derived data (CC BY 4.0, Mills et al. 2023, Newcastle University / EuroSDR), so the
+  weekly `gcp-eurosdr` run reads it from the repository and never re-measures. The
+  committed file is the GCP-only list (the eight GCPs): the protocol does leave-one-out
+  over every point in the list, so a 59-station list would be 59 folds, while the eight
+  GCPs give eight folds — the same shape as `gcp-rtk`'s five.
+- **Stations excluded from scoring.** A station is scored only when its accepted
+  observations give a well-conditioned intersection. The rule is fixed before any
+  result is seen: fewer than 3 accepted images (two views have no redundancy), or a
+  baseline/height ratio below 0.1 (the largest camera-pair baseline over the mean
+  range; a ratio `r` is a parallax of `atan(r)`, and the vertical precision scales as
+  `sigma_xy / r`, so at `r = 0.1` the height is already ~10x worse than the
+  horizontal). A station that fails either test is excluded from scoring and listed
+  with its reason in the run output and the JSON summary (`excluded_stations`). The
+  two consecutive D3 frames are the canonical case: a few metres of baseline at ~55 m
+  range is a ratio of ~0.05, which is why D3's height was undetermined. The
+  control/check measure (`run_control_check`) also reports, per variant, the
+  horizontal RMS split by observation count (>= 6 vs < 6) and the post-adjustment
+  marker reprojection RMS in pixels, so a point limited by its own geometry can be
+  told from a block-wide residual.
 - A label trap worth recording: the `Phase3` text file's GCP labels are shifted by one
   against the xlsx. `Phase3` `GA1` is the xlsx `GA5`, `GA5` is `GA8`, and so on, with
   `Phase3` `GF8` matching no xlsx row within 9 m. The coordinates are identical to the
   millimetre under the shifted labels, so a loader that joined the two files by label
   would silently pair every point with the wrong name. The xlsx is the authoritative
-  file (it is the one the paper describes).
+  file (it is the one the paper describes), and the measurement script reads labels
+  from the xlsx only.
+- The whole 430-image flight is used, and the block is aligned RTK-first. Two
+  attempts to shrink the block failed and are worth recording:
+  - A stride of 4 (108 images) halves the flight's forward overlap, so only 23 of
+    108 cameras registered, and the 23 that did formed a collinear strip, so
+    `UpdateTransform` refused the fit ("need 3 non-collinear reference points").
+    Every fold then reported "missing or unpositioned check point(s)".
+  - The incremental `AlignCameras` on the full flight registers all 430 cameras at
+    0.84 px, but its single global similarity fit keeps only 6 of 430 cameras
+    inside the 0.5 m inlier threshold: the similarity is extrapolated from a small
+    cluster and is metres off across the rest of the block. A bundle adjustment
+    started from that georeference diverges (RMS 0.84 -> 2.8e8 px, prior RMS 1082
+    sigma, because the priors are ~19 m from the poses it linearises around).
+  The protocol's `--align-from-reference` (the manifest's
+  `gcp.align_from_reference`) avoids the global fit: `AlignFromReference` places
+  every camera from its own RTK position and gimbal attitude in a fresh unit-scale
+  ENU frame, `TriangulateTiePoints` rebuilds the tie points, and `OptimizeCameras`
+  refines the poses with the RTK positions as priors. It registers 430/430 and
+  bundle-adjusts to 0.62 px with a prior RMS of 0.14 sigma (2.5 mm at the 1.8 cm
+  reported accuracy), which is the evidence that the RTK positions are good and
+  the global fit was the problem.
+- **First measured result (2026-11-20, run 44673527305): 5.76 cm horizontal
+  check-point RMS over the 8 folds, a MISS against the 5 cm target.** The
+  `camera_rtk_gcps` variant is the best of the four (uniform 5.71 cm, engine
+  defaults 8.40 cm, GCPs only 8.32 cm). The vertical RMS is 7.11 cm and the 3D
+  total 9.15 cm. The per-fold horizontal errors run 1.1 cm (GA1) to 10.5 cm (GF8),
+  so the miss is not one bad point: it is a block-wide residual of a few
+  centimetres. The protocol time is 98 min for the full flight and 8 folds, well
+  inside the 330-minute job ceiling, so the whole flight is affordable.
+- **Report-only control/check measure (2026-11-21).** Alongside the leave-one-out
+  gate, the run also reports the dataset's intended protocol: the eight GCPs as
+  control and the remaining stations as independent check points, scored in one
+  adjustment per variant (`--check-list`, the full station list). It never changes
+  `passed` or any variant result; the leave-one-out over the eight GCPs remains the
+  gate. The committed full list carries 58 stations (S1 has no observations), so the
+  measure scores 8 control and 50 checks.
 
 ## Adding a dataset
 

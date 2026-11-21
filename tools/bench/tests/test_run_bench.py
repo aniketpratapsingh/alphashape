@@ -62,10 +62,13 @@ class ManifestTest(unittest.TestCase):
                 self.assertEqual(cache_name, Path(cache_name).name, (name, cache_name))
 
     def test_a_reference_without_a_url_is_served_by_another_download(self):
-        # Every reference either downloads its own archive or names one that does.
+        # Every reference either downloads its own archive, names one that does,
+        # or is committed to the repository (repo_path, our own derived data).
         for name, dataset in run_bench.load_manifest()["datasets"].items():
             downloaded = {cache for cache, _ in run_bench.downloads_for(dataset)}
             for reference in dataset["reference_files"]:
+                if reference.get("repo_path"):
+                    continue
                 if reference.get("url"):
                     self.assertIn(reference["download"], downloaded, (name, reference["path"]))
                 else:
@@ -95,6 +98,57 @@ class ManifestTest(unittest.TestCase):
         reordered = json.loads(json.dumps(manifest))
         reordered["datasets"] = dict(reversed(list(reordered["datasets"].items())))
         self.assertEqual(run_bench.manifest_hash(reordered), baseline)
+
+
+class GcpManifestTest(unittest.TestCase):
+    """The EuroSDR block's manifest choices, which a silent edit would undo."""
+
+    def setUp(self):
+        self.dataset = run_bench.load_manifest()["datasets"]["gcp-eurosdr"]
+
+    def test_the_whole_flight_is_used(self):
+        # A strided subset was tried and rejected: taking every fourth frame
+        # halves the forward overlap and only 23 of 108 cameras registered, so
+        # the block could not be georeferenced. The full 430-image flight is
+        # what aligns.
+        self.assertIsNone(self.dataset.get("max_images"))
+
+    def test_the_block_is_aligned_from_its_rtk_solution(self):
+        # AlignCameras' single global similarity fit keeps only 6 of 430
+        # cameras inside its inlier threshold on this flight, so the block
+        # registers a small fraction of its images. The RTK-first path places
+        # every camera from its own position and attitude instead.
+        self.assertTrue(self.dataset["gcp"].get("align_from_reference"))
+
+    def test_the_horizontal_target_is_the_five_centimetre_gate(self):
+        # The second ground-control block exists to test the same 5 cm target
+        # as gcp-rtk; loosening it here would defeat the point.
+        self.assertEqual(self.dataset["gcp"]["target_horizontal_m"], 0.05)
+
+    def test_the_height_is_ellipsoidal(self):
+        # The xlsx carries ETRS89 ellipsoidal heights, so no geoid model is
+        # needed and the protocol must not be told otherwise.
+        self.assertEqual(self.dataset["gcp"]["gcp_height"], "ellipsoidal")
+
+    def test_the_observations_are_committed_derived_data(self):
+        # The publisher ships no observations, so the manifest must read ours
+        # from the repository rather than download them.
+        kinds = {reference["kind"]: reference
+                 for reference in self.dataset["reference_files"]}
+        self.assertIn("gcp_list", kinds)
+        self.assertIn("gcp_names", kinds)
+        for kind in ("gcp_list", "gcp_names"):
+            self.assertTrue(kinds[kind].get("repo_path"), kind)
+
+    def test_the_full_station_list_is_a_committed_check_list(self):
+        # The report-only control/check measure reads the full station list
+        # from the repository, exactly like the GCP-only list.
+        kinds = {reference["kind"]: reference
+                 for reference in self.dataset["reference_files"]}
+        self.assertIn("check_list", kinds)
+        self.assertTrue(kinds["check_list"].get("repo_path"))
+        self.assertEqual(kinds["check_list"]["repo_path"],
+                         "tools/bench/data/eurosdr/gcp_list.txt")
 
     def test_an_unknown_version_is_rejected(self):
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as handle:
@@ -173,6 +227,51 @@ class SubsetTest(unittest.TestCase):
 
     def test_dms_conversion(self):
         self.assertAlmostEqual(run_bench._dms((11.0, 40.0, 7.5477)), 11.0 + 40.0 / 60 + 7.5477 / 3600)
+
+
+class StrideSubsetTest(unittest.TestCase):
+    """A stride keeps the whole site, which a centroid cluster does not."""
+
+    def _images(self, tmp: Path, count: int) -> list[Path]:
+        paths = []
+        for index in range(count):
+            path = tmp / f"IMG_{index:04d}.JPG"
+            path.write_bytes(b"x")
+            paths.append(path)
+        return paths
+
+    def test_no_limit_keeps_everything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images = self._images(Path(tmp), 10)
+            selected, info = run_bench._stride_subset(images, 0)
+            self.assertEqual(len(selected), 10)
+            self.assertEqual(info["mode"], "all")
+
+    def test_a_stride_keeps_the_first_and_last_strips(self):
+        # The whole site is covered: the first frame survives and the selection
+        # reaches the end of the flight, which a centroid cluster would not.
+        with tempfile.TemporaryDirectory() as tmp:
+            images = self._images(Path(tmp), 430)
+            selected, info = run_bench._stride_subset(images, 100)
+            self.assertEqual(selected[0], images[0])
+            # The last selected frame is within one stride of the end.
+            self.assertGreaterEqual(images.index(selected[-1]), len(images) - 5)
+            self.assertLessEqual(len(selected), 100)
+            self.assertIn("stride", info["mode"])
+
+    def test_the_stride_is_the_ceiling_of_the_ratio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images = self._images(Path(tmp), 430)
+            selected, info = run_bench._stride_subset(images, 100)
+            self.assertEqual(info["mode"], "stride 5")  # ceil(430 / 100) = 5
+            self.assertEqual(len(selected), 86)  # 430 / 5 rounded up
+
+    def test_the_selection_names_every_image_it_chose(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images = self._images(Path(tmp), 20)
+            selected, info = run_bench._stride_subset(images, 7)
+            self.assertEqual(info["images"], [path.name for path in selected])
+            self.assertEqual(info["selected"], len(selected))
 
 
 class MedianTest(unittest.TestCase):
@@ -399,6 +498,48 @@ class ExtractTest(unittest.TestCase):
             self.assertTrue((out / "keep" / "ortho.tif").exists())
             self.assertFalse((out / "keep" / "dem.tif").exists())
             self.assertFalse((out / "skip" / "other.tif").exists())
+
+    def test_an_include_pattern_limits_the_extraction(self):
+        # The EuroSDR Phase2 archive holds three flights; the benchmark needs
+        # one. `extract_include` selects that subfolder and nothing else.
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "phase2.zip"
+            write_zip(
+                archive,
+                {
+                    "Phase2/flight_a/100_0004/one.JPG": b"1",
+                    "Phase2/flight_a/100_0004/two.JPG": b"2",
+                    "Phase2/flight_b/100_0005/three.JPG": b"3",
+                },
+            )
+            out = Path(tmp) / "out"
+            run_bench.extract_archive(
+                archive, out, include="Phase2/flight_a/100_0004/*")
+            self.assertTrue((out / "Phase2/flight_a/100_0004/one.JPG").exists())
+            self.assertTrue((out / "Phase2/flight_a/100_0004/two.JPG").exists())
+            self.assertFalse((out / "Phase2/flight_b/100_0005/three.JPG").exists())
+
+    def test_an_include_that_matches_nothing_is_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "phase2.zip"
+            write_zip(archive, {"Phase2/flight_a/one.JPG": b"1"})
+            with self.assertRaises(SystemExit):
+                run_bench.extract_archive(
+                    archive, Path(tmp) / "out", include="Phase2/missing/*")
+
+    def test_members_and_include_together_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "phase2.zip"
+            write_zip(archive, {"a.JPG": b"1"})
+            with self.assertRaises(SystemExit):
+                run_bench.extract_archive(
+                    archive, Path(tmp) / "out", members=["a.JPG"],
+                    include="*.JPG")
+
+    def test_resolve_include_matches_whole_paths(self):
+        present = ["Phase2/a/one.JPG", "Phase2/b/two.JPG"]
+        matched = run_bench._resolve_include(present, "Phase2/a/*", Path("x.7z"))
+        self.assertEqual(matched, ["Phase2/a/one.JPG"])
 
     def test_the_extension_decides_the_unpacker(self):
         # A zip named .7z would be a manifest error, and must fail rather than be
@@ -1343,6 +1484,61 @@ class MatchParamsTest(unittest.TestCase):
     def test_no_parameters_returns_the_dataset_unchanged(self):
         dataset = run_bench.load_manifest()["datasets"]["gcp-rtk"]
         self.assertEqual(run_bench.merge_match_params(dataset, {}), dataset)
+
+
+class GcpCommandTest(unittest.TestCase):
+    """The GCP protocol's command line: the check list reaches only the dataset
+    that names one, and never changes the leave-one-out gate."""
+
+    def _run(self, dataset_name: str) -> list[str]:
+        import unittest.mock as mock
+
+        dataset = run_bench.load_manifest()["datasets"][dataset_name]
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            # collect_images globs the manifest's extract_glob under work/images,
+            # so the stand-in frames go where that pattern looks.
+            pattern = dataset["images_archive"]["extract_glob"]
+            images = work / "images" / Path(pattern).parent
+            images.mkdir(parents=True)
+            for index in range(dataset["expected_images"]):
+                (images / f"IMG_{index:04d}.JPG").write_bytes(b"x")
+            references = {
+                "gcp_list": str(work / "reference" / "gcp_list.txt"),
+                "gcp_names": str(work / "reference" / "gcp_names.csv"),
+            }
+            if any(ref["kind"] == "check_list"
+                   for ref in dataset["reference_files"]):
+                references["check_list"] = str(
+                    work / "reference" / "gcp_list_all.txt")
+            out_json = work / "gcp_report.json"
+            out_json.write_text(json.dumps({"variants": {}}), encoding="utf-8")
+            captured: dict = {}
+
+            def fake_run(command, **kwargs):
+                captured["command"] = command
+                return mock.Mock(returncode=0, stdout="")
+
+            with mock.patch.dict(os.environ,
+                                 {"ALPHASHAPE_PYTHON_DIR": str(work)}), \
+                    mock.patch.object(run_bench.subprocess, "run",
+                                      side_effect=fake_run):
+                run_bench.run_gcp_validation(
+                    dataset_name, dataset, work, references,
+                    report_dir=work)
+        return captured["command"]
+
+    def test_the_eurosdr_command_passes_the_check_list(self):
+        command = self._run("gcp-eurosdr")
+        self.assertIn("--check-list", command)
+        index = command.index("--check-list")
+        self.assertTrue(command[index + 1].endswith("gcp_list_all.txt"))
+
+    def test_the_rtk_command_has_no_check_list(self):
+        # gcp-rtk names no check_list reference, so the report-only measure is
+        # not run and the command is unchanged.
+        command = self._run("gcp-rtk")
+        self.assertNotIn("--check-list", command)
 
 
 class IsExperimentTest(unittest.TestCase):

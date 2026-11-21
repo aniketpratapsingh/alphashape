@@ -21,7 +21,9 @@ Plain unittest, no pytest.
 import importlib.util
 import os
 import pathlib
+import sys
 import tempfile
+import types
 import unittest
 
 
@@ -30,6 +32,14 @@ def load_script():
             "tests" / "run_gcp_validation.py")
     spec = importlib.util.spec_from_file_location("run_gcp_validation", path)
     module = importlib.util.module_from_spec(spec)
+    # The script imports the built `alphashape` module at top level. These tests
+    # exercise only pure parsers, so a stub satisfies the import when the module
+    # is not built. When the real module is importable it is used unchanged.
+    if "alphashape" not in sys.modules:
+        try:
+            import alphashape  # noqa: F401, PLC0415
+        except ImportError:
+            sys.modules["alphashape"] = types.ModuleType("alphashape")
     spec.loader.exec_module(module)
     return module
 

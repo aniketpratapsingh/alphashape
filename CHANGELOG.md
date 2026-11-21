@@ -27,14 +27,45 @@ All notable changes to alphashape are recorded here. The format follows
   check RMS, with the triangulation validated against ODM's own control points
   to 0.14 cm horizontal. Only numbers are published; the GPL-3.0 dataset is
   downloaded and measured, never redistributed.
-- **Second ground-control dataset surveyed and rejected.** `tools/bench/DATASETS.md`
-  records why the EuroSDR RPAS benchmark (Zenodo 10059050, Wards Hill quarry) cannot
-  serve as a second ground-control block: it publishes 51 check points and 8 GCPs as
-  3-D coordinates but no image observations of the targets, which the leave-one-out
-  protocol requires. The complete file lists of both large archives were read from
-  their 7z headers over HTTP range requests, so the conclusion rests on the full
-  contents rather than a sample. The entry also records the orthometric-height and
-  label-shift traps a future attempt would hit.
+- **Second ground-control block: the EuroSDR RPAS benchmark.** `tools/bench/DATASETS.md`
+  now records the EuroSDR RPAS benchmark (Zenodo 10059050, Wards Hill quarry) as a
+  second ground-control block rather than a rejected candidate. The publisher ships
+  the surveyed coordinates of 8 GCPs and 51 check points but not the pixel
+  observations of their targets, so a CI-only workflow
+  (`.github/workflows/eurosdr-observations.yml`, driving
+  `tools/bench/eurosdr_observations.py`) measures them: it places every camera from
+  its own RTK position and gimbal attitude, projects each surveyed station into every
+  camera that sees it, and snaps the projection onto the circular target with the
+  engine's multi-view marker refinement. The point coordinates come from the xlsx in
+  ETRS89 ellipsoidal terms, so the orthometric-height obstacle the earlier entry
+  recorded does not apply. The accepted observations are committed as our own derived
+  data (CC BY 4.0, Mills et al. 2023, Newcastle University / EuroSDR) and read by the
+  `gcp-eurosdr` bench dataset. The first measured result is 5.76 cm horizontal
+  check-point RMS over the eight folds, a miss against the 5 cm target.
+- **Report-only control/check measure for the EuroSDR block.** The GCP protocol
+  gains an optional `--check-list`: the eight GCPs are control and the remaining
+  stations are scored as independent check points in one adjustment per variant,
+  reported beside the leave-one-out result. It never changes `passed` or any
+  variant result; the leave-one-out over the eight GCPs remains the gate. Each
+  per-point record now also carries the number of projections actually set on
+  cameras present in the chunk and the post-adjustment marker reprojection RMS in
+  pixels, and each variant reports the horizontal RMS split by observation count
+  (>= 6 vs < 6), so a point limited by its own intersection geometry can be told
+  from a block-wide residual.
+- **EuroSDR observations: every detected view is kept, and the unnamed station is
+  `A1`.** The measurement script accepted only the `max_views` refined views of
+  each station, so a target detected in 50 cameras but refined in 16 could never
+  exceed 16 observations, and the 16 closest observers formed a tight cluster
+  whose triangulation was ill-conditioned. The refinement now runs on the
+  observers that best span the station (farthest-point sampling on the camera
+  centres), and every detected view is a candidate observation, gated by the same
+  search radius and reprojection residual as before. The one xlsx row with no
+  station label is the missing `A1` grid cell (the sheet carries every cell of the
+  6x8 `A1`..`F8` array but `A1`), so the label is recovered from the labels the
+  sheet does carry rather than written as `UNNAMED`. A station whose accepted
+  observations cannot give a well-conditioned intersection (fewer than 3 images,
+  or a baseline/height ratio below 0.1) is excluded from scoring and listed with
+  its reason in the run output and the JSON summary.
 
 ### Changed
 
