@@ -373,12 +373,13 @@ jobs:
                 f"{data.get('stations')}")
           excluded = data.get("excluded_stations") or []
           if excluded:
-              print("\n### Excluded from scoring (intersection not well conditioned)\n")
-              print("| station | role | accepted | reason |")
-              print("|---|---|---:|---|")
+              print("\n### Excluded from scoring\n")
+              print("| station | role | accepted | kind | reason |")
+              print("|---|---|---:|---|---|")
               for record in excluded:
                   print(f"| {record['label']} | {record['role']} | "
-                        f"{record['views_accepted']} | {record['reason']} |")
+                        f"{record['views_accepted']} | {record.get('kind') or '-'} | "
+                        f"{record['reason']} |")
           print("\n| station | role | projected | accepted | mean detect shift px |")
           print("|---|---|---:|---:|---:|")
           for point in data.get("points", []):

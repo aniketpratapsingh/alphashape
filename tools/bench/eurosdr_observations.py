@@ -218,6 +218,54 @@ UNDISTORT_ITERATIONS = 8
 # times: the inlier set is stable after one or two passes, and the bound keeps a
 # pathological station from looping.
 CONSENSUS_REFIT_PASSES = 3
+# A wrong-target cluster is a minority of views that detected a DIFFERENT
+# physical object as the station's target. The within-station consensus
+# (consensus_triangulation) rejects a SMALL wrong subset, but when the wrong
+# subset is large enough to pull the consensus position between the two
+# clusters, both clusters reproject within the residual limit and nothing is
+# flagged — the S2 regression: 24 accepted views, mean residual 1.72 px against
+# their own consensus, yet a 52 px maximum detection shift and a 170 px
+# reprojection RMS in the benchmark adjustment. Two safeguards below catch it,
+# both derived from the block's OWN distribution in-run (robustly, median +
+# k*MAD over all stations), never from the offending station:
+#
+# (a) DETECTION-SHIFT BOUND. The detection shift is the distance from the
+#     hand-computed projection to the pixel DetectMarkers found. Across a
+#     correctly georeferenced block it is tight: on this flight the per-station
+#     maximum is median 6.9 px, MAD 0.8 px, every good station <= 9.6 px, while
+#     S2's wrong-target views reach 52 px. A station whose maximum detection
+#     shift exceeds median + SHIFT_MAD_MULTIPLIER * MAD is a wrong-target
+#     cluster and is excluded. 5 MAD is ~14x the robust spread: it admits every
+#     good station (<= 9.6 px, i.e. ~3.4 MAD) with margin and rejects S2 (52 px,
+#     ~58 MAD) by a wide gap. Because the bound is computed from the stations
+#     themselves, a run where the whole block degrades raises the bound rather
+#     than mass-rejecting.
+SHIFT_MAD_MULTIPLIER = 5.0
+# A floor on the shift bound, in pixels, so a block with an implausibly tight
+# shift distribution (a handful of stations, or a synthetic test) does not
+# reject a normal detection. The RTK-only georeference is ~16 px at 1.5 cm GSD
+# (0.24 m), so a bound below ~10 px would be tighter than the georeference
+# itself; 10 px is the observed ceiling of the good stations on this flight.
+MIN_SHIFT_BOUND_PX = 10.0
+# (b) CONSENSUS-VS-SURVEY DISTANCE BOUND. The survey is independent of the
+#     measurement, so a station whose consensus position lies far from its
+#     surveyed position is a wrong-target or blunder signal that the
+#     within-station consensus cannot see. The block's own georeference error is
+#     the distribution of |consensus - survey| over the stations; a station
+#     beyond median + DISTANCE_MAD_MULTIPLIER * MAD of that distribution is
+#     excluded. 6 MAD is a deliberately loose bound: the georeference error is
+#     itself the thing being measured, so the gate must not reject a station
+#     merely because the block is a few cm off — it targets the metre-scale
+#     error a wrong-target cluster produces (S2: 3.3 m horizontal, ~200x the
+#     block's ~1.6 cm median). A GCP that fails this bound fails the RUN loudly
+#     (a control point that cannot be trusted invalidates the block); a check
+#     point is excluded with its reason, exactly like intersection_exclusion.
+DISTANCE_MAD_MULTIPLIER = 6.0
+# A floor on the distance bound, in metres, for the same reason as the shift
+# floor: a block whose stations all agree to a millimetre must not reject a
+# station that is a centimetre off. 0.25 m is ~17x the block's ~1.5 cm median
+# georeference error and well under the metre-scale error a wrong target makes.
+MIN_DISTANCE_BOUND_M = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -881,6 +929,108 @@ def intersection_exclusion(accepted_images, centres, point):
     return None
 
 
+def median(values):
+    """The median of a non-empty sequence of floats.
+
+    Kept here rather than importing ``statistics`` so the pure helpers stay on
+    the stdlib the unit tests already use, and so the robust statistics below
+    read as one small, auditable block. Raises ``ValueError`` on an empty
+    sequence: a bound derived from no data is a programming error, not a
+    silently permissive default.
+    """
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        raise ValueError("median of an empty sequence")
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return 0.5 * (ordered[middle - 1] + ordered[middle])
+
+
+def median_absolute_deviation(values):
+    """The median absolute deviation (MAD) of a non-empty sequence.
+
+    ``MAD = median(|x - median(x)|)``. It is the robust spread the shift and
+    distance bounds are built from: unlike a standard deviation it is not
+    inflated by the very outlier the bound is meant to catch, so a single
+    wrong-target station cannot widen the bound enough to admit itself. Raises
+    ``ValueError`` on an empty sequence.
+    """
+    values = [float(value) for value in values]
+    if not values:
+        raise ValueError("median absolute deviation of an empty sequence")
+    centre = median(values)
+    return median([abs(value - centre) for value in values])
+
+
+def robust_upper_bound(values, mad_multiplier, floor):
+    """``max(floor, median + mad_multiplier * MAD)`` over ``values``.
+
+    The pre-declared, in-run threshold both safeguards use: the block's own
+    distribution sets the bound, robustly, so the bound is not fit to any one
+    station. ``floor`` keeps a pathologically tight distribution (few stations,
+    or a synthetic test) from producing a bound tighter than the georeference
+    itself. Returns ``None`` when ``values`` is empty (no distribution to bound
+    against), so the caller can skip the gate rather than reject everything.
+    """
+    values = [float(value) for value in values]
+    if not values:
+        return None
+    return max(float(floor),
+               median(values) + float(mad_multiplier) * median_absolute_deviation(values))
+
+
+def shift_exclusion(max_shift_px, shift_bound_px):
+    """Why a station's detection shift marks it a wrong-target cluster, or ``None``.
+
+    The detection shift is the distance from the hand-computed projection to the
+    pixel DetectMarkers found. A correctly georeferenced block has a tight
+    distribution of per-station maximum shifts (see :data:`SHIFT_MAD_MULTIPLIER`);
+    a station whose maximum shift is far beyond it detected a different physical
+    object in some views. ``shift_bound_px`` is the in-run bound
+    (:func:`robust_upper_bound` over every station's maximum shift); ``None``
+    disables the gate (no distribution to bound against). A non-finite shift is
+    itself a rejection. Pure: no engine, no numpy.
+    """
+    if max_shift_px is None:
+        return None
+    if not math.isfinite(max_shift_px):
+        return "detection shift is not finite"
+    if shift_bound_px is None:
+        return None
+    if max_shift_px > shift_bound_px:
+        return (f"max detection shift {max_shift_px:.1f} px > "
+                f"{shift_bound_px:.1f} px (block median + "
+                f"{SHIFT_MAD_MULTIPLIER:g} MAD); a wrong-target cluster")
+    return None
+
+
+def distance_exclusion(offset_m, distance_bound_m):
+    """Why a station's consensus-vs-survey distance marks it a blunder, or ``None``.
+
+    The survey is independent of the measurement, so a station whose consensus
+    position lies far from its surveyed position is a wrong-target or blunder
+    signal the within-station consensus cannot see (see
+    :data:`DISTANCE_MAD_MULTIPLIER`). ``offset_m`` is the horizontal distance
+    between the consensus position and the surveyed position; ``distance_bound_m``
+    is the in-run bound (:func:`robust_upper_bound` over every station's offset);
+    ``None`` disables the gate. A non-finite offset is itself a rejection. Pure:
+    no engine, no numpy.
+    """
+    if offset_m is None:
+        return None
+    if not math.isfinite(offset_m):
+        return "consensus-to-survey distance is not finite"
+    if distance_bound_m is None:
+        return None
+    if offset_m > distance_bound_m:
+        return (f"consensus position {offset_m:.2f} m from the survey > "
+                f"{distance_bound_m:.2f} m (block median + "
+                f"{DISTANCE_MAD_MULTIPLIER:g} MAD); a wrong-target cluster or "
+                f"blunder")
+    return None
+
+
 def write_gcp_names(path, stations):
     """Write the survey CSV the ground-control protocol matches labels against.
 
@@ -929,7 +1079,8 @@ def write_gcp_list(path, stations, observations):
     return len(lines) - 1
 
 
-def summarise(stations, observations, per_point, centres=None, local=None):
+def summarise(stations, observations, per_point, centres=None, local=None,
+              consensus=None):
     """Build the JSON summary: per point, views, detection shift and residual.
 
     ``per_point`` maps a station label to a list of per-view records, each with
@@ -941,17 +1092,34 @@ def summarise(stations, observations, per_point, centres=None, local=None):
     inlier count, and the role. A station with no views is listed with zero
     counts so a point that was never seen is visible rather than absent.
 
-    ``centres`` maps an image label to its camera centre and ``local`` maps a
-    station label to its chunk-local position. When both are supplied, each
-    station is tested against the intersection-conditioning rule
-    (:func:`intersection_exclusion`): a station whose accepted observations
-    cannot give a well-conditioned intersection is marked ``scored: false`` with
-    its ``exclusion_reason``, so the downstream protocol can drop it from
-    scoring and the run output can list it. Without the geometry every station
-    is reported as scored (the rule needs the camera centres to measure the
-    baseline).
+    ``centres`` maps an image label to its camera centre, ``local`` maps a
+    station label to its surveyed chunk-local position, and ``consensus`` maps a
+    station label to its consensus (triangulated) chunk-local position. When
+    they are supplied, each station is tested against three pre-declared rules,
+    in this order, and the first that fails sets its ``exclusion_reason`` and
+    ``exclusion_kind``:
+
+    * :func:`shift_exclusion` — a wrong-target cluster, from the detection shift
+      against the block's own shift distribution (needs ``per_point`` only);
+    * :func:`distance_exclusion` — a wrong-target cluster or blunder, from the
+      consensus-vs-survey distance against the block's own georeference error
+      (needs ``consensus`` and ``local``);
+    * :func:`intersection_exclusion` — a poorly conditioned intersection, from
+      the accepted views' geometry (needs ``centres`` and ``local``).
+
+    The shift and distance bounds are computed here, in-run, from the block's
+    own distribution (:func:`robust_upper_bound`), never from any one station.
+    A station that fails a rule is marked ``scored: false`` with its reason, so
+    the downstream protocol can drop it and the run output can list it. Without
+    the geometry every station is reported as scored (the rules need the camera
+    centres and the consensus positions to measure).
     """
-    points = []
+    # First pass: the raw per-station numbers the bounds are derived from. The
+    # shift bound is over every station's maximum accepted detection shift; the
+    # distance bound is over every station's consensus-vs-survey horizontal
+    # offset. Both are robust (median + k*MAD), so the offending station cannot
+    # widen its own bound.
+    raw = []
     for station in stations:
         label = station["label"]
         views = per_point.get(label) or []
@@ -962,29 +1130,77 @@ def summarise(stations, observations, per_point, centres=None, local=None):
                      if view.get("residual_px") is not None
                      and math.isfinite(view["residual_px"])]
         images = sorted(view["image"] for view in accepted)
-        # The consensus inlier count is the number of detected views that
-        # reproject onto the triangulated position within the residual limit;
-        # it is the same for every record of a station, so the first is read.
         consensus_inliers = next(
             (view["consensus_inliers"] for view in views
              if "consensus_inliers" in view), 0)
+        max_shift = max(shifts) if shifts else None
+        offset_m = None
+        if consensus is not None and local is not None:
+            position = consensus.get(label)
+            surveyed = local.get(label)
+            if position is not None and surveyed is not None:
+                offset_m = math.hypot(position[0] - surveyed[0],
+                                      position[1] - surveyed[1])
+        raw.append({
+            "station": station,
+            "label": label,
+            "views": views,
+            "accepted": accepted,
+            "shifts": shifts,
+            "residuals": residuals,
+            "images": images,
+            "consensus_inliers": consensus_inliers,
+            "max_shift_px": max_shift,
+            "offset_m": offset_m,
+        })
+    shift_bound = robust_upper_bound(
+        [record["max_shift_px"] for record in raw
+         if record["max_shift_px"] is not None],
+        SHIFT_MAD_MULTIPLIER, MIN_SHIFT_BOUND_PX)
+    distance_bound = robust_upper_bound(
+        [record["offset_m"] for record in raw
+         if record["offset_m"] is not None],
+        DISTANCE_MAD_MULTIPLIER, MIN_DISTANCE_BOUND_M)
+
+    points = []
+    for record in raw:
+        label = record["label"]
+        station = record["station"]
         reason = None
-        if centres is not None and local is not None and label in local:
+        kind = None
+        # Wrong-target gates first: a station that detected a different object
+        # should say so, not be reported as a geometry problem.
+        reason = shift_exclusion(record["max_shift_px"], shift_bound)
+        if reason is not None:
+            kind = "shift"
+        if reason is None:
+            reason = distance_exclusion(record["offset_m"], distance_bound)
+            if reason is not None:
+                kind = "distance"
+        if reason is None and centres is not None and local is not None \
+                and label in local:
             reason = intersection_exclusion(
-                images, [centres[image] for image in images if image in centres],
+                record["images"],
+                [centres[image] for image in record["images"] if image in centres],
                 local[label])
+            if reason is not None:
+                kind = "intersection"
         points.append({
             "label": label,
             "role": station["role"],
-            "views_projected": len(views),
-            "views_accepted": len(accepted),
-            "consensus_inliers": consensus_inliers,
-            "mean_shift_px": (sum(shifts) / len(shifts)) if shifts else None,
-            "max_shift_px": max(shifts) if shifts else None,
-            "mean_residual_px": (sum(residuals) / len(residuals)) if residuals else None,
-            "max_residual_px": max(residuals) if residuals else None,
-            "images": images,
+            "views_projected": len(record["views"]),
+            "views_accepted": len(record["accepted"]),
+            "consensus_inliers": record["consensus_inliers"],
+            "mean_shift_px": (sum(record["shifts"]) / len(record["shifts"]))
+                             if record["shifts"] else None,
+            "max_shift_px": record["max_shift_px"],
+            "mean_residual_px": (sum(record["residuals"]) / len(record["residuals"]))
+                                if record["residuals"] else None,
+            "max_residual_px": max(record["residuals"]) if record["residuals"] else None,
+            "consensus_offset_m": record["offset_m"],
+            "images": record["images"],
             "scored": reason is None,
+            "exclusion_kind": kind,
             "exclusion_reason": reason,
         })
     total_views = sum(point["views_projected"] for point in points)
@@ -1002,9 +1218,12 @@ def summarise(stations, observations, per_point, centres=None, local=None):
         "gcps_with_min_views": sum(
             1 for point in gcps if point["views_accepted"] >= MIN_VIEWS_PER_POINT),
         "scored_stations": len(points) - len(excluded),
+        "shift_bound_px": shift_bound,
+        "distance_bound_m": distance_bound,
         "excluded_stations": [
             {"label": point["label"], "role": point["role"],
              "views_accepted": point["views_accepted"],
+             "kind": point["exclusion_kind"],
              "reason": point["exclusion_reason"]}
             for point in excluded],
         "points": points,
@@ -1403,9 +1622,12 @@ def refine_and_collect(chunk, stations, detected, per_point, refine_options,
     ``calibrations`` and ``poses`` map a camera label to its calibration dict
     and 4x4 pose, so the residual of each detected projection against the
     consensus position is computed here without another engine call.
-    Returns ``(observations, per_point, refine_meta)`` where ``observations``
-    maps a station label to the accepted ``{"image", "px", "py"}`` rows and
-    ``refine_meta`` is the engine's own ``refine_markers.*`` diagnostics.
+    Returns ``(observations, per_point, refine_meta, consensus)`` where
+    ``observations`` maps a station label to the accepted ``{"image", "px",
+    "py"}`` rows, ``refine_meta`` is the engine's own ``refine_markers.*``
+    diagnostics, and ``consensus`` maps a station label to its consensus
+    (triangulated) chunk-local position, so the summary can test each station's
+    consensus-vs-survey distance without another engine call.
     """
     refine_views = select_refine_views(detected, max_views, centres)
     before = {}
@@ -1533,7 +1755,7 @@ def refine_and_collect(chunk, stations, detected, per_point, refine_options,
     # its items directly; `.items` on the dict would be the method object.
     refine_meta = {key: value for key, value in chunk.meta.items()
                    if key.startswith("refine_markers.")}
-    return observations, per_point, refine_meta
+    return observations, per_point, refine_meta, consensus
 
 
 def log(message):
@@ -1653,12 +1875,12 @@ def run(args):
     }
     log(f"[eurosdr] refining the detected targets "
         f"(up to {args.max_views} views per marker)")
-    observations, per_point, refine_meta = refine_and_collect(
+    observations, per_point, refine_meta, consensus = refine_and_collect(
         chunk, stations, detected, per_point, refine_options,
         calibrations, poses, args.max_views, args.search_radius_px,
         centres=centres)
     summary = summarise(stations, observations, per_point,
-                        centres=centres, local=local)
+                        centres=centres, local=local, consensus=consensus)
     summary["images"] = len(images)
     summary["images_available"] = len(available)
     summary["image_stride"] = stride
@@ -1682,6 +1904,24 @@ def run(args):
     summary["max_shift_target_radii"] = MAX_SHIFT_TARGET_RADII
     summary["min_intersection_images"] = MIN_INTERSECTION_IMAGES
     summary["min_baseline_height_ratio"] = MIN_BASELINE_HEIGHT_RATIO
+    summary["shift_mad_multiplier"] = SHIFT_MAD_MULTIPLIER
+    summary["min_shift_bound_px"] = MIN_SHIFT_BOUND_PX
+    summary["distance_mad_multiplier"] = DISTANCE_MAD_MULTIPLIER
+    summary["min_distance_bound_m"] = MIN_DISTANCE_BOUND_M
+
+    # A GCP that fails a wrong-target gate (shift or distance) is a control
+    # point that cannot be trusted, and a block georeferenced by an untrustworthy
+    # control point is invalid. Fail the run loudly rather than write a
+    # gcp_list whose control is silently wrong. A check point that fails is
+    # excluded from scoring with its reason, exactly like the intersection rule.
+    bad_gcps = [record for record in summary["excluded_stations"]
+                if record["role"] == "gcp" and record["kind"] in ("shift", "distance")]
+    if bad_gcps:
+        details = "; ".join(
+            f"{record['label']}: {record['reason']}" for record in bad_gcps)
+        raise SystemExit(
+            f"[eurosdr] {len(bad_gcps)} GCP(s) failed a wrong-target gate and "
+            f"cannot be trusted as control: {details}")
 
     # The full list is what the control/check measure scores, so a check point
     # the intersection rule excludes is left out of it here, where the rule is
@@ -1712,16 +1952,26 @@ def run(args):
         f"({(summary['acceptance_rate'] or 0.0) * 100:.1f}%), "
         f"{summary['gcps_with_min_views']}/{summary['gcps']} GCPs with "
         f">= {MIN_VIEWS_PER_POINT} views")
-    # The intersection-conditioning rule is fixed before any result is seen (see
-    # MIN_INTERSECTION_IMAGES / MIN_BASELINE_HEIGHT_RATIO). A station that fails
-    # it is excluded from scoring and listed here with its reason, so the run
-    # output says which points the downstream protocol must drop and why.
+    # The exclusion rules are fixed before any result is seen (see
+    # MIN_INTERSECTION_IMAGES / MIN_BASELINE_HEIGHT_RATIO and the shift/distance
+    # bounds). A station that fails one is excluded from scoring and listed here
+    # with its reason, so the run output says which points the downstream
+    # protocol must drop and why.
     excluded = summary["excluded_stations"]
+    shift_bound = summary["shift_bound_px"]
+    distance_bound = summary["distance_bound_m"]
+    shift_text = (f"{shift_bound:.1f} px" if shift_bound is not None
+                  else "disabled (no shifts)")
+    distance_text = (f"{distance_bound:.2f} m" if distance_bound is not None
+                     else "disabled (no consensus)")
+    log(f"[eurosdr] wrong-target bounds: shift <= {shift_text}, "
+        f"consensus-to-survey <= {distance_text} (block median + k*MAD)")
     log(f"[eurosdr] {summary['scored_stations']}/{summary['stations']} stations "
         f"well conditioned; {len(excluded)} excluded from scoring")
     for record in excluded:
         log(f"[eurosdr]   excluded {record['label']} ({record['role']}, "
-            f"{record['views_accepted']} accepted): {record['reason']}")
+            f"{record['views_accepted']} accepted, {record['kind']}): "
+            f"{record['reason']}")
     return 0
 
 

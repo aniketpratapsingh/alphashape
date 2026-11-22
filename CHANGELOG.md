@@ -899,6 +899,13 @@ All notable changes to alphashape are recorded here. The format follows
 - **A pre-release build reported a plain version number.** The app now reports
   its full release tag (for example `0.3.0-rc.2`), so the update check offers
   the final release to a pre-release user.
+- **A wrong-target cluster could be committed as EuroSDR observations.** The
+  EuroSDR measurement now excludes a station whose maximum detection shift or
+  consensus-vs-survey distance exceeds a bound derived in-run from the block's
+  own distribution (median + k·MAD), so a station that detected a different
+  physical object in some views (the S2 regression: 52 px shift, 3.3 m check
+  error) is dropped instead of poisoning the check-point RMS; a GCP that fails
+  either gate fails the run loudly.
 
 ### Upgrading
 

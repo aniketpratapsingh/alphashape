@@ -1186,7 +1186,7 @@ class RefineAndCollectTest(unittest.TestCase):
     def test_a_detected_view_beyond_the_refined_limit_is_still_accepted(self):
         # 20 detections, only 16 refined: all 20 are valid observations.
         detections = [(f"cam{index}", 100.0, 100.0) for index in range(20)]
-        observations, _per_point, _meta = self.run_collect(detections)
+        observations, _per_point, _meta, _consensus = self.run_collect(detections)
         self.assertEqual(len(observations["A1"]), 20)
 
     def test_a_wrong_target_detection_is_rejected_by_the_residual(self):
@@ -1194,7 +1194,7 @@ class RefineAndCollectTest(unittest.TestCase):
         # position reprojects to (100, 100), so its residual is large.
         detections = [(f"cam{index}", 100.0, 100.0) for index in range(19)]
         detections.append(("cam19", 500.0, 500.0))
-        observations, per_point, _meta = self.run_collect(detections)
+        observations, per_point, _meta, _consensus = self.run_collect(detections)
         accepted = [row["image"] for row in observations["A1"]]
         self.assertNotIn("cam19", accepted)
         self.assertEqual(len(accepted), 19)
@@ -1231,7 +1231,7 @@ class RefineAndCollectTest(unittest.TestCase):
                  for camera, _px, _py in detections}
         centres = {camera: (float(index), 0.0, 0.0)
                    for index, (camera, _px, _py) in enumerate(detections)}
-        observations, _per_point, _meta = eo.refine_and_collect(
+        observations, _per_point, _meta, _consensus = eo.refine_and_collect(
             chunk, stations, detected, per_point, {}, calibrations, poses,
             16, 60.0, centres=centres)
         accepted = [row["image"] for row in observations["A1"]]
@@ -1267,7 +1267,7 @@ class RefineAndCollectTest(unittest.TestCase):
                              "accepted": False,
                              "detected_px": (view["px"], view["py"])}
                             for view in views]}
-        observations, per_point, _meta = eo.refine_and_collect(
+        observations, per_point, _meta, _consensus = eo.refine_and_collect(
             chunk, stations, detected, per_point, {},
             block.calibrations(len(cameras)), block.poses(cameras),
             16, 60.0, centres={view["camera"]: (0.0, 0.0, 0.0) for view in views})
@@ -1410,6 +1410,209 @@ class XlsxReaderTest(unittest.TestCase):
             workbook.save(path)
             with self.assertRaises(ValueError):
                 eo.read_stations(path)
+
+
+class RobustStatisticsTest(unittest.TestCase):
+    """The in-run bounds are built from robust statistics, not a mean."""
+
+    def test_median_of_an_odd_sequence(self):
+        self.assertAlmostEqual(eo.median([3.0, 1.0, 2.0]), 2.0, places=9)
+
+    def test_median_of_an_even_sequence_averages_the_middle(self):
+        self.assertAlmostEqual(eo.median([4.0, 1.0, 3.0, 2.0]), 2.5, places=9)
+
+    def test_median_of_an_empty_sequence_raises(self):
+        with self.assertRaises(ValueError):
+            eo.median([])
+
+    def test_mad_is_the_median_absolute_deviation(self):
+        # median is 3; deviations are 2, 1, 0, 1, 2; their median is 1.
+        self.assertAlmostEqual(
+            eo.median_absolute_deviation([1.0, 2.0, 3.0, 4.0, 5.0]), 1.0, places=9)
+
+    def test_mad_of_an_empty_sequence_raises(self):
+        with self.assertRaises(ValueError):
+            eo.median_absolute_deviation([])
+
+    def test_a_single_outlier_does_not_inflate_the_mad(self):
+        # The whole point of the robust bound: one wrong-target station must not
+        # widen the bound enough to admit itself. A tight cluster plus one 52 px
+        # outlier keeps the MAD near the cluster's spread.
+        values = [6.0, 6.5, 7.0, 7.5, 8.0, 52.0]
+        self.assertLess(eo.median_absolute_deviation(values), 1.0)
+
+    def test_robust_upper_bound_is_median_plus_k_mad(self):
+        values = [1.0, 2.0, 3.0, 4.0, 5.0]
+        # median 3, MAD 1, k=5 -> 8; the floor is below it.
+        self.assertAlmostEqual(
+            eo.robust_upper_bound(values, 5.0, 0.0), 8.0, places=9)
+
+    def test_robust_upper_bound_respects_the_floor(self):
+        # A pathologically tight distribution must not produce a bound tighter
+        # than the floor.
+        values = [10.0, 10.0, 10.0]
+        self.assertAlmostEqual(
+            eo.robust_upper_bound(values, 5.0, 10.0), 10.0, places=9)
+
+    def test_robust_upper_bound_of_an_empty_sequence_is_none(self):
+        self.assertIsNone(eo.robust_upper_bound([], 5.0, 10.0))
+
+
+class ShiftExclusionTest(unittest.TestCase):
+    """A wrong-target cluster is caught by its detection shift."""
+
+    def test_a_shift_within_the_bound_is_kept(self):
+        self.assertIsNone(eo.shift_exclusion(9.0, 10.9))
+
+    def test_a_shift_beyond_the_bound_is_excluded(self):
+        reason = eo.shift_exclusion(52.4, 10.9)
+        self.assertIsNotNone(reason)
+        self.assertIn("detection shift", reason)
+        self.assertIn("wrong-target", reason)
+
+    def test_a_shift_exactly_at_the_bound_is_kept(self):
+        # The bound is inclusive: a station at the bound is not beyond it.
+        self.assertIsNone(eo.shift_exclusion(10.9, 10.9))
+
+    def test_a_non_finite_shift_is_excluded(self):
+        self.assertIsNotNone(eo.shift_exclusion(float("nan"), 10.9))
+        self.assertIsNotNone(eo.shift_exclusion(float("inf"), 10.9))
+
+    def test_no_shift_is_not_excluded(self):
+        self.assertIsNone(eo.shift_exclusion(None, 10.9))
+
+    def test_no_bound_disables_the_gate(self):
+        # Without a distribution to bound against, the gate is skipped rather
+        # than rejecting everything.
+        self.assertIsNone(eo.shift_exclusion(52.4, None))
+
+
+class DistanceExclusionTest(unittest.TestCase):
+    """A wrong-target cluster or blunder is caught by consensus-vs-survey."""
+
+    def test_a_distance_within_the_bound_is_kept(self):
+        self.assertIsNone(eo.distance_exclusion(0.05, 0.25))
+
+    def test_a_distance_beyond_the_bound_is_excluded(self):
+        reason = eo.distance_exclusion(3.3, 0.25)
+        self.assertIsNotNone(reason)
+        self.assertIn("consensus position", reason)
+        self.assertIn("survey", reason)
+
+    def test_a_distance_exactly_at_the_bound_is_kept(self):
+        self.assertIsNone(eo.distance_exclusion(0.25, 0.25))
+
+    def test_a_non_finite_distance_is_excluded(self):
+        self.assertIsNotNone(eo.distance_exclusion(float("nan"), 0.25))
+
+    def test_no_distance_is_not_excluded(self):
+        self.assertIsNone(eo.distance_exclusion(None, 0.25))
+
+    def test_no_bound_disables_the_gate(self):
+        self.assertIsNone(eo.distance_exclusion(3.3, None))
+
+
+class WrongTargetSummaryTest(unittest.TestCase):
+    """The summary applies the wrong-target gates with in-run bounds.
+
+    This is the S2 regression in miniature: a block of well-behaved stations
+    plus one station whose detection shift and consensus-vs-survey distance are
+    far outside the block's distribution. The bounds are derived from the block
+    itself, so the offending station is excluded without any S2-specific
+    constant, and the good stations are untouched.
+    """
+
+    def stations(self):
+        return [
+            {"label": "GA1", "lat": 0.0, "lon": 0.0, "height": 0.0, "role": "gcp"},
+            {"label": "A2", "lat": 0.0, "lon": 0.0, "height": 0.0, "role": "check_point"},
+            {"label": "A3", "lat": 0.0, "lon": 0.0, "height": 0.0, "role": "check_point"},
+            {"label": "S2", "lat": 0.0, "lon": 0.0, "height": 0.0, "role": "check_point"},
+        ]
+
+    def per_point(self, shifts):
+        # Three accepted views per station, all with a small residual, so the
+        # intersection rule passes; the shift is what varies.
+        return {
+            label: [{"image": f"{label}{index}", "shift_px": shift,
+                     "residual_px": 1.0, "accepted": True}
+                    for index in range(3)]
+            for label, shift in shifts.items()
+        }
+
+    def test_a_wrong_target_station_is_excluded_by_its_shift(self):
+        # Three good stations at ~7 px, one at 52 px. The bound is median + 5
+        # MAD of the block, so the 52 px station is excluded and the rest kept.
+        per_point = self.per_point({"GA1": 7.0, "A2": 6.5, "A3": 7.5, "S2": 52.0})
+        summary = eo.summarise(self.stations(), {}, per_point)
+        s2 = next(point for point in summary["points"] if point["label"] == "S2")
+        self.assertFalse(s2["scored"])
+        self.assertEqual(s2["exclusion_kind"], "shift")
+        self.assertIn("detection shift", s2["exclusion_reason"])
+        for label in ("GA1", "A2", "A3"):
+            point = next(p for p in summary["points"] if p["label"] == label)
+            self.assertTrue(point["scored"], label)
+        self.assertIsNotNone(summary["shift_bound_px"])
+
+    def test_a_wrong_target_station_is_excluded_by_its_distance(self):
+        # The shift is normal for every station, but S2's consensus position is
+        # 3.3 m from its survey while the block agrees to a few cm. The distance
+        # gate catches what the shift gate cannot.
+        per_point = self.per_point({"GA1": 7.0, "A2": 7.0, "A3": 7.0, "S2": 7.0})
+        local = {"GA1": (0.0, 0.0, 0.0), "A2": (10.0, 0.0, 0.0),
+                 "A3": (0.0, 10.0, 0.0), "S2": (5.0, 5.0, 0.0)}
+        consensus = {"GA1": (0.01, 0.0, 0.0), "A2": (10.02, 0.0, 0.0),
+                     "A3": (0.0, 10.01, 0.0), "S2": (8.3, 5.0, 0.0)}
+        summary = eo.summarise(self.stations(), {}, per_point,
+                               local=local, consensus=consensus)
+        s2 = next(point for point in summary["points"] if point["label"] == "S2")
+        self.assertFalse(s2["scored"])
+        self.assertEqual(s2["exclusion_kind"], "distance")
+        self.assertIn("survey", s2["exclusion_reason"])
+        self.assertAlmostEqual(s2["consensus_offset_m"], 3.3, places=6)
+        for label in ("GA1", "A2", "A3"):
+            point = next(p for p in summary["points"] if p["label"] == label)
+            self.assertTrue(point["scored"], label)
+        self.assertIsNotNone(summary["distance_bound_m"])
+
+    def test_the_shift_gate_takes_precedence_over_the_distance_gate(self):
+        # A station that fails both is reported as a shift problem, because the
+        # shift is the direct wrong-target signal.
+        per_point = self.per_point({"GA1": 7.0, "A2": 7.0, "A3": 7.0, "S2": 52.0})
+        local = {"GA1": (0.0, 0.0, 0.0), "A2": (10.0, 0.0, 0.0),
+                 "A3": (0.0, 10.0, 0.0), "S2": (5.0, 5.0, 0.0)}
+        consensus = {"GA1": (0.0, 0.0, 0.0), "A2": (10.0, 0.0, 0.0),
+                     "A3": (0.0, 10.0, 0.0), "S2": (8.3, 5.0, 0.0)}
+        summary = eo.summarise(self.stations(), {}, per_point,
+                               local=local, consensus=consensus)
+        s2 = next(point for point in summary["points"] if point["label"] == "S2")
+        self.assertEqual(s2["exclusion_kind"], "shift")
+
+    def test_a_well_behaved_block_excludes_nothing(self):
+        per_point = self.per_point({"GA1": 7.0, "A2": 6.5, "A3": 7.5, "S2": 7.2})
+        local = {"GA1": (0.0, 0.0, 0.0), "A2": (10.0, 0.0, 0.0),
+                 "A3": (0.0, 10.0, 0.0), "S2": (5.0, 5.0, 0.0)}
+        consensus = {"GA1": (0.01, 0.0, 0.0), "A2": (10.01, 0.0, 0.0),
+                     "A3": (0.0, 10.02, 0.0), "S2": (5.01, 5.0, 0.0)}
+        summary = eo.summarise(self.stations(), {}, per_point,
+                               local=local, consensus=consensus)
+        self.assertTrue(all(point["scored"] for point in summary["points"]))
+        self.assertEqual(summary["excluded_stations"], [])
+
+    def test_the_bounds_are_reported_in_the_summary(self):
+        per_point = self.per_point({"GA1": 7.0, "A2": 6.5, "A3": 7.5, "S2": 52.0})
+        summary = eo.summarise(self.stations(), {}, per_point)
+        self.assertIn("shift_bound_px", summary)
+        self.assertIn("distance_bound_m", summary)
+        # The shift bound is the block's median + 5 MAD, floored at 10 px.
+        self.assertGreaterEqual(summary["shift_bound_px"], eo.MIN_SHIFT_BOUND_PX)
+
+    def test_the_excluded_record_carries_its_kind(self):
+        per_point = self.per_point({"GA1": 7.0, "A2": 6.5, "A3": 7.5, "S2": 52.0})
+        summary = eo.summarise(self.stations(), {}, per_point)
+        excluded = {record["label"]: record for record in summary["excluded_stations"]}
+        self.assertIn("S2", excluded)
+        self.assertEqual(excluded["S2"]["kind"], "shift")
 
 
 if __name__ == "__main__":

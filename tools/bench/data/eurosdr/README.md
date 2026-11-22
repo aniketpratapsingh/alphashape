@@ -99,6 +99,45 @@ reason in the run output and the JSON summary (`excluded_stations`). The two
 consecutive D3 frames are the canonical case: a few metres of baseline at ~55 m
 range is a ratio of ~0.05, which is why D3's height was undetermined.
 
+## Wrong-target safeguards
+
+The within-station consensus (step 6) rejects a *small* wrong subset, but when a
+wrong-target cluster is large enough to pull the consensus position between the
+two clusters, both clusters reproject within the residual limit and nothing is
+flagged. This is the **S2 regression**: 24 accepted views with a mean residual of
+1.72 px against their own consensus, yet a 52 px maximum detection shift and a
+170 px reprojection RMS in the benchmark adjustment, which alone pushed the
+49-point check RMS from 0.055 m to 0.477 m. Two pre-declared safeguards catch it,
+both derived from the block's **own** distribution in-run (robustly, median +
+k·MAD over all stations), never from the offending station:
+
+- **Detection-shift bound.** The detection shift is the distance from the
+  hand-computed projection to the pixel `DetectMarkers` found. Across a correctly
+  georeferenced block it is tight: on this flight the per-station maximum is
+  median 6.9 px, MAD 0.8 px, every good station ≤ 9.6 px, while S2's wrong-target
+  views reach 52 px. A station whose maximum detection shift exceeds
+  `median + 5·MAD` (≈ 10.8 px here, floored at 10 px) is a wrong-target cluster
+  and is excluded. 5 MAD is ~14× the robust spread: it admits every good station
+  (~3.4 MAD) with margin and rejects S2 (~58 MAD) by a wide gap. Because the
+  bound is computed from the stations themselves, a run where the whole block
+  degrades raises the bound rather than mass-rejecting.
+- **Consensus-vs-survey distance bound.** The survey is independent of the
+  measurement, so a station whose consensus position lies far from its surveyed
+  position is a wrong-target or blunder signal the within-station consensus
+  cannot see. The block's own georeference error is the distribution of
+  `|consensus − survey|` over the stations; a station beyond `median + 6·MAD`
+  (floored at 0.25 m) is excluded. 6 MAD is deliberately loose — the
+  georeference error is itself what is being measured, so the gate must not
+  reject a station merely because the block is a few cm off; it targets the
+  metre-scale error a wrong-target cluster produces (S2: 3.3 m horizontal,
+  ~200× the block's ~1.5 cm median).
+
+A **GCP** that fails either wrong-target gate fails the run loudly (a control
+point that cannot be trusted invalidates the block); a **check point** that fails
+is excluded from scoring with its reason, exactly like the intersection rule.
+Both bounds are reported in the JSON summary (`shift_bound_px`,
+`distance_bound_m`) and the run output.
+
 ## Regenerating
 
 The files are committed so the weekly bench never re-measures. To regenerate them
