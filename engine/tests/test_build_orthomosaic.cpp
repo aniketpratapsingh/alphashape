@@ -2362,112 +2362,6 @@ TEST(BuildOrthomosaic, BlockWiseDefaultMosaicHasNoBlockGrid) {
         << "the disagreement is concentrated at the block borders: the grid is visible";
 }
 
-namespace {
-
-/// Mean per-channel colour step across a vertical (or horizontal) line of the
-/// mosaic, measured the way the eye sees a block boundary: the difference of the
-/// mean colour of the `kHalf` columns just left of the line and just right of it,
-/// summed over the three channels, averaged over the rows where both sides are
-/// opaque. A straight block-shaped step shows up here as a large value on the
-/// exact boundary line while ordinary neighbouring lines stay small.
-///
-/// `vertical` selects a column line (x = line) or a row line (y = line).
-double mean_colour_step(const Orthomosaic& ortho, int line, bool vertical, int kHalf = 3) {
-    const RasterGrid& grid = ortho.raster.grid;
-    const int w = grid.width;
-    const int h = grid.height;
-    const auto rgb = [&ortho, w](int col, int row, int c) {
-        const std::size_t i = (static_cast<std::size_t>(row) * static_cast<std::size_t>(w) +
-                               static_cast<std::size_t>(col)) * 4U;
-        return static_cast<double>(ortho.raster.data[i + static_cast<std::size_t>(c)]);
-    };
-    const auto opaque = [&ortho, w](int col, int row) {
-        const std::size_t i = (static_cast<std::size_t>(row) * static_cast<std::size_t>(w) +
-                               static_cast<std::size_t>(col)) * 4U;
-        return ortho.raster.data[i + 3U] != 0;
-    };
-    double sum = 0.0;
-    int count = 0;
-    if (vertical) {
-        if (line - kHalf < 0 || line + kHalf > w) {
-            return 0.0;
-        }
-        for (int row = 0; row < h; ++row) {
-            bool ok = true;
-            double left[3] = {0.0, 0.0, 0.0};
-            double right[3] = {0.0, 0.0, 0.0};
-            for (int d = 1; d <= kHalf && ok; ++d) {
-                if (!opaque(line - d, row) || !opaque(line + d - 1, row)) {
-                    ok = false;
-                    break;
-                }
-                for (int c = 0; c < 3; ++c) {
-                    left[c] += rgb(line - d, row, c) / static_cast<double>(kHalf);
-                    right[c] += rgb(line + d - 1, row, c) / static_cast<double>(kHalf);
-                }
-            }
-            if (!ok) {
-                continue;
-            }
-            for (int c = 0; c < 3; ++c) {
-                sum += std::abs(right[c] - left[c]);
-            }
-            ++count;
-        }
-    } else {
-        if (line - kHalf < 0 || line + kHalf > h) {
-            return 0.0;
-        }
-        for (int col = 0; col < w; ++col) {
-            bool ok = true;
-            double top[3] = {0.0, 0.0, 0.0};
-            double bottom[3] = {0.0, 0.0, 0.0};
-            for (int d = 1; d <= kHalf && ok; ++d) {
-                if (!opaque(col, line - d) || !opaque(col, line + d - 1)) {
-                    ok = false;
-                    break;
-                }
-                for (int c = 0; c < 3; ++c) {
-                    top[c] += rgb(col, line - d, c) / static_cast<double>(kHalf);
-                    bottom[c] += rgb(col, line + d - 1, c) / static_cast<double>(kHalf);
-                }
-            }
-            if (!ok) {
-                continue;
-            }
-            for (int c = 0; c < 3; ++c) {
-                sum += std::abs(bottom[c] - top[c]);
-            }
-            ++count;
-        }
-    }
-    return count > 0 ? sum / static_cast<double>(count) : 0.0;
-}
-
-/// The median of `mean_colour_step` over a set of ordinary lines near `line`
-/// (skipping the boundary itself), so a test can compare the boundary step with
-/// what neighbouring ground looks like.
-double median_neighbour_step(const Orthomosaic& ortho, int line, bool vertical, int block,
-                             int kHalf = 3) {
-    std::vector<double> steps;
-    for (int offset = -24; offset <= 24; ++offset) {
-        if (offset == 0) {
-            continue;
-        }
-        const int at = line + offset;
-        if (at % block == 0) {
-            continue;  // another block boundary is not an "ordinary" line
-        }
-        steps.push_back(mean_colour_step(ortho, at, vertical, kHalf));
-    }
-    if (steps.empty()) {
-        return 0.0;
-    }
-    std::sort(steps.begin(), steps.end());
-    return steps[steps.size() / 2];
-}
-
-}  // namespace
 
 // -- per-camera gain compensation, end to end --------------------------------
 //
@@ -2564,68 +2458,41 @@ TEST(BuildOrthomosaic, BlockedMosaicHasNoColourStepAtBlockBoundaries) {
     // colour steps at exact multiples of the block side, whole blocks carrying a
     // uniform tint. The cause is the seam labeller: a block decides its own
     // right/bottom margin labels but does not persist them, so the next block
-    // re-optimises that overlap and can switch camera right at the boundary. The
-    // multiband blend then cuts the transition at the interior copy, and where
-    // the two cameras differ in exposure the boundary is a straight step.
+    // re-optimises that overlap and can place the camera transition at a
+    // different place, which the interior copy then CUTS at the block boundary.
+    // Where the two cameras differ in colour the boundary is a straight step.
     //
-    // The flight is given a strong per-camera exposure/colour cast (alternate
-    // photographs dimmed and tinted) so a camera switch at a boundary is a large,
-    // unmistakable step. The default parameters are used (mosaic blending, seam
-    // refinement on, affine colour correction on) because that is what the owner
-    // ran; only `block_size` is forced small so the grid is split into several
-    // blocks.
+    // Two things make this test actually exercise the blocked path, and both are
+    // essential (an earlier version of this test passed on the broken code
+    // without them):
     //
-    // Two assertions:
-    //   (a) the mean colour step ACROSS each interior block boundary is not
-    //       larger than the step between ordinary neighbouring lines (no
-    //       block-shaped step), and
-    //   (b) the blocked mosaic agrees with the whole-grid mosaic within a stated
-    //       tolerance on essentially every pixel.
+    //   1. A per-camera brightness difference the seam labeller can SEE, so a
+    //      camera switch is a large step. Colour correction is off (the codebase
+    //      convention for isolating a seam defect) and the odd photographs are
+    //      dimmed to 0.6x, so an A->B transition is ~100 levels and unmistakable.
+    //      A uniform dim would be removed by the default affine correction, which
+    //      is why it is off here.
+    //   2. A grid big enough that the blocks see DIFFERENT windows. At the
+    //      fixture's 0.125 m the grid is 950x722 and the margin is 320, so
+    //      block + 2*margin = 1152 exceeds the grid in both directions and every
+    //      "block" window is the whole grid (blocking is a no-op). At 0.075 m the
+    //      grid is ~1600x1200, bigger than 1152 in both directions, so the blocks
+    //      really do see different windows and the seam can move at a border.
+    //
+    // Assertions:
+    //   (a) per border crossing, the colour step the BLOCKED run adds over the
+    //       WHOLE-GRID run at the same pair is small (texture and natural seams
+    //       cancel; only the step the partition added remains), and
+    //   (b) the blocked mosaic agrees with the whole-grid mosaic on most pixels.
     OrthoSetup& s = setup();
     Chunk& chunk = *s.document.active_chunk();
-    DimmedFlight flight(chunk, 1.0);  // private copies, no uniform dimming
-
-    // A UNIFORM per-camera dim or tint is exactly what the default affine colour
-    // correction removes, so it would not reproduce the owner's step. What the
-    // affine model cannot remove is a SPATIALLY VARYING per-camera difference: a
-    // strong radial falloff (vignetting) whose strength differs per camera. Two
-    // cameras that share ground then record different colours over the shared
-    // cells, and a camera switch at a block boundary is a real step even after
-    // correction. This is the same shape the gain bench uses, and it is what makes
-    // the seam decision matter.
-    for (const auto& frame : chunk.frames()) {
-        if (frame->camera_id() < 0) {
-            continue;
-        }
-        Image image = read_image(frame->path());
-        ASSERT_FALSE(image.empty());
-        const int w = image.width();
-        const int h = image.height();
-        const double k = 0.30 + 0.05 * static_cast<double>(frame->camera_id());
-        for (int row = 0; row < h; ++row) {
-            for (int col = 0; col < w; ++col) {
-                const double u = (static_cast<double>(col) + 0.5) / static_cast<double>(w);
-                const double v = (static_cast<double>(row) + 0.5) / static_cast<double>(h);
-                const double r2 = ((u - 0.5) * (u - 0.5) + (v - 0.5) * (v - 0.5)) / 0.5;
-                const double factor = 1.0 - k * r2;
-                std::uint8_t* px = image.data() +
-                                   (static_cast<std::size_t>(row) * static_cast<std::size_t>(w) +
-                                    static_cast<std::size_t>(col)) *
-                                       3U;
-                for (int channel = 0; channel < 3; ++channel) {
-                    const double value = static_cast<double>(px[channel]) * factor;
-                    px[channel] =
-                        static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0, 255.0)));
-                }
-            }
-        }
-        write_png(frame->path(), image);
-    }
+    DimmedFlight flight(chunk, 0.60);  // odd photographs 0.60x, even 1.0x
 
     constexpr std::int64_t kBlock = 512;
-    // Defaults: mosaic blending, refine_seamlines on, affine colour correction.
+    constexpr double kResolution = 0.075;
     Params whole_params = make_params(builtin_registry().require("BuildOrthomosaic"));
-    whole_params.set("resolution", ParamValue{0.125});
+    whole_params.set("resolution", ParamValue{kResolution});
+    whole_params.set("color_correction", ParamValue{std::string("none")});
     whole_params.set("block_size", ParamValue{std::int64_t{0}});
     Params blocked_params = whole_params;
     blocked_params.set("block_size", ParamValue{kBlock});
@@ -2638,45 +2505,95 @@ TEST(BuildOrthomosaic, BlockedMosaicHasNoColourStepAtBlockBoundaries) {
 
     const int w = blocked.raster.grid.width;
     const int h = blocked.raster.grid.height;
+    // The whole point of the test is that the blocks see DIFFERENT windows. A
+    // grid at or below one window (block + 2*margin, ~1152 at this depth) would
+    // make every block the whole grid and silently stop testing anything.
+    ASSERT_GT(w, 1200) << "grid too narrow: block windows would be the whole grid";
+    ASSERT_GT(h, 1200) << "grid too short: block windows would be the whole grid";
 
-    // (a) No block-shaped step. For every interior vertical and horizontal block
-    // boundary, compare the step ON the boundary with the median step of the
-    // ordinary lines around it. A block-shaped step makes the boundary an
-    // outlier; a continuous mosaic keeps it in the same range.
-    double worst_ratio = 0.0;
+    // (a) No block-shaped step, measured PER BORDER CROSSING. A mean over a whole
+    // boundary line is diluted: the seam runs along only part of the line, so a
+    // cut transition shows on a minority of the crossings and averages away. For
+    // every pair of cells that straddles an interior block boundary, compare the
+    // colour step in the BLOCKED run with the step in the WHOLE-GRID run at the
+    // SAME pair. Ordinary ground texture and natural seams are identical in both
+    // and cancel; what remains is the step the block partition ADDED. A seam cut
+    // at the boundary adds a large step on the crossings it runs along; a
+    // continuous seam adds essentially none.
+    const auto rgb = [](const Orthomosaic& o, int col, int row, int c) {
+        const std::size_t i =
+            (static_cast<std::size_t>(row) * static_cast<std::size_t>(o.raster.grid.width) +
+             static_cast<std::size_t>(col)) * 4U;
+        return static_cast<int>(o.raster.data[i + static_cast<std::size_t>(c)]);
+    };
+    const auto opaque = [](const Orthomosaic& o, int col, int row) {
+        const std::size_t i =
+            (static_cast<std::size_t>(row) * static_cast<std::size_t>(o.raster.grid.width) +
+             static_cast<std::size_t>(col)) * 4U;
+        return o.raster.data[i + 3U] != 0;
+    };
+    // Summed |ΔRGB| across the pair in one run, or -1 when either side is not
+    // opaque in both runs.
+    const auto pair_step = [&](const Orthomosaic& o, int a_col, int a_row, int b_col, int b_row) {
+        if (!opaque(o, a_col, a_row) || !opaque(o, b_col, b_row)) {
+            return -1;
+        }
+        int step = 0;
+        for (int c = 0; c < 3; ++c) {
+            step += std::abs(rgb(o, b_col, b_row, c) - rgb(o, a_col, a_row, c));
+        }
+        return step;
+    };
+
+    // A step the block partition ADDED, in summed RGB levels. 30 is well above
+    // ordinary seam-move noise (a few levels) and well below the ~100-level step a
+    // 0.6x camera switch produces on this flight.
+    constexpr int kAddedStep = 30;
+    std::size_t crossings = 0;
+    std::size_t added = 0;
+    int worst_added = 0;
     int boundaries = 0;
+    const auto consider = [&](int a_col, int a_row, int b_col, int b_row) {
+        const int blocked_step = pair_step(blocked, a_col, a_row, b_col, b_row);
+        const int whole_step = pair_step(whole, a_col, a_row, b_col, b_row);
+        if (blocked_step < 0 || whole_step < 0) {
+            return;
+        }
+        ++crossings;
+        const int delta = blocked_step - whole_step;
+        worst_added = std::max(worst_added, delta);
+        added += delta > kAddedStep ? 1U : 0U;
+    };
     for (int x = static_cast<int>(kBlock); x < w; x += static_cast<int>(kBlock)) {
-        const double on = mean_colour_step(blocked, x, true);
-        const double near = median_neighbour_step(blocked, x, true, static_cast<int>(kBlock));
-        const double ratio = on / std::max(near, 1.0);
-        worst_ratio = std::max(worst_ratio, ratio);
         ++boundaries;
-        std::printf("[BuildOrthomosaic.BlockedNoStep] x=%d on=%.2f near=%.2f ratio=%.2f\n", x,
-                    on, near, ratio);
+        for (int row = 0; row < h; ++row) {
+            consider(x - 1, row, x, row);
+        }
     }
     for (int y = static_cast<int>(kBlock); y < h; y += static_cast<int>(kBlock)) {
-        const double on = mean_colour_step(blocked, y, false);
-        const double near = median_neighbour_step(blocked, y, false, static_cast<int>(kBlock));
-        const double ratio = on / std::max(near, 1.0);
-        worst_ratio = std::max(worst_ratio, ratio);
         ++boundaries;
-        std::printf("[BuildOrthomosaic.BlockedNoStep] y=%d on=%.2f near=%.2f ratio=%.2f\n", y,
-                    on, near, ratio);
+        for (int col = 0; col < w; ++col) {
+            consider(col, y - 1, col, y);
+        }
     }
-    ASSERT_GT(boundaries, 0) << "the test grid must have interior block boundaries";
-    // A boundary step no larger than ~2x an ordinary neighbouring step is not a
-    // visible block edge; a camera switch at the boundary is many times that.
-    EXPECT_LE(worst_ratio, 2.0)
-        << "a block boundary shows a colour step far larger than ordinary ground: "
+    ASSERT_GE(boundaries, 2) << "the test grid must have interior block boundaries";
+    ASSERT_GT(crossings, 1000U);
+    std::printf("[BuildOrthomosaic.BlockedNoStep] boundaries=%d crossings=%zu added>%d=%zu "
+                "(%.3f%%) worst_added=%d\n",
+                boundaries, crossings, kAddedStep, added,
+                100.0 * static_cast<double>(added) / static_cast<double>(crossings), worst_added);
+    // A continuous seam adds essentially no step at the border. Allow a small
+    // fraction for the handful of crossings where the optimiser legitimately
+    // places a seam slightly differently; a cut camera transition adds a large
+    // step on many more.
+    EXPECT_LE(added * 1000, crossings)
+        << "the block partition added a visible colour step on too many border crossings: "
            "the seam restarted at the block edge";
 
-    // (b) Blocked == whole grid within a stated tolerance. The seam optimiser is
-    // not separable, so a handful of pixels may legitimately differ where a seam
-    // lands differently; what must not happen is a systematic disagreement. The
-    // bound is the one the existing refine-on default test uses (96% of pixels
-    // within one grey level) plus no gross disagreement.
+    // (b) Blocked == whole grid on essentially every pixel. A handful may differ
+    // where a seam lands differently; a systematic disagreement is the defect.
     std::size_t pixels = 0;
-    std::size_t within_one = 0;
+    std::size_t within_eight = 0;
     int worst = 0;
     for (std::size_t i = 0; i + 3 < whole.raster.data.size(); i += 4) {
         if (whole.raster.data[i + 3] == 0 || blocked.raster.data[i + 3] == 0) {
@@ -2691,15 +2608,15 @@ TEST(BuildOrthomosaic, BlockedMosaicHasNoColourStepAtBlockBoundaries) {
                          static_cast<int>(blocked.raster.data[i + static_cast<std::size_t>(c)])));
         }
         worst = std::max(worst, diff);
-        within_one += diff <= 1 ? 1U : 0U;
+        within_eight += diff <= 8 ? 1U : 0U;
     }
     ASSERT_GT(pixels, 1000U);
-    std::printf("[BuildOrthomosaic.BlockedNoStep] within1=%zu/%zu (%.2f%%) worst=%d\n",
-                within_one, pixels,
-                100.0 * static_cast<double>(within_one) / static_cast<double>(pixels), worst);
-    EXPECT_GE(within_one * 100, pixels * 96U)
+    std::printf("[BuildOrthomosaic.BlockedNoStep] within8=%zu/%zu (%.2f%%) worst=%d\n",
+                within_eight, pixels,
+                100.0 * static_cast<double>(within_eight) / static_cast<double>(pixels), worst);
+    EXPECT_GE(within_eight * 100, pixels * 99U)
         << "the blocked mosaic differs from the whole grid on too many pixels";
-    EXPECT_LE(worst, 8) << "the blocked mosaic differs grossly from the whole grid";
+    EXPECT_LE(worst, 30) << "the blocked mosaic differs grossly from the whole grid";
 }
 
 TEST(OrthoGain, CorrectionShrinksSeamStepByAtLeastEightyPercent) {
