@@ -2008,7 +2008,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     // The DEM's support mask, kept on the SAME grid as `surface`: it starts on
     // the DEM's grid and is reprojected alongside the surface when the run
     // builds in a different CRS (below). Empty means "every valid cell
-    // measured".
+    // supported".
     std::vector<std::uint8_t> surface_support = dem.support;
     // The DTO naming the surface's CRS, so a model-surface DSM is rasterised
     // into the same plane the frame uses.
@@ -2268,11 +2268,13 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     const HeightRange heights = surface_height_range(surface, surface_nodata);
 
     // -- the DEM's support mask ----------------------------------------------
-    // The ortho is not produced over surface the DEM interpolated or
-    // extrapolated rather than measured: at the block edge that filled surface
-    // is a near-flat extrapolation, and rectifying a photograph onto it is what
-    // produces the wavy, unsupported border. The mask is the DEM's own
-    // measured-vs-filled record. It is honoured unless the DEM was built with
+    // The ortho is not produced over surface the DEM extrapolated beyond the
+    // measured area: at the block edge that filled surface is a near-flat
+    // extrapolation, and rectifying a photograph onto it is what produces the
+    // wavy, unsupported border. A hole interpolated INSIDE the measured area (a
+    // roof, water, a shadow) is supported and rectified onto normally. The mask
+    // is the DEM's own record of measured-or-interpolated-inside vs
+    // extrapolated-beyond. It is honoured unless the DEM was built with
     // interpolation "extrapolated", where the user explicitly asked for the
     // surface to extend past the last measurement. A "model" surface is a DSM
     // rasterised from the mesh (every cell is real geometry), so it is fully

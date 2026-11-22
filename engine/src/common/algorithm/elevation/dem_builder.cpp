@@ -741,6 +741,35 @@ std::vector<Eigen::Vector2d> convex_hull(std::vector<Eigen::Vector2d> points) {
     return hull;
 }
 
+/// True when `p` lies inside (or on the boundary of) the convex polygon `hull`,
+/// whose vertices may be in either orientation. A degenerate hull (fewer than
+/// three vertices) contains nothing. The test is the sign of the cross product
+/// of every edge with the point: inside means every edge puts the point on the
+/// same side (zero counts as inside, so a boundary point is supported).
+bool point_in_convex_polygon(const std::vector<Eigen::Vector2d>& hull,
+                             const Eigen::Vector2d& p) {
+    if (hull.size() < 3) {
+        return false;
+    }
+    bool any_positive = false;
+    bool any_negative = false;
+    for (std::size_t i = 0; i < hull.size(); ++i) {
+        const Eigen::Vector2d& a = hull[i];
+        const Eigen::Vector2d& b = hull[(i + 1) % hull.size()];
+        const double cross =
+            (b.x() - a.x()) * (p.y() - a.y()) - (b.y() - a.y()) * (p.x() - a.x());
+        if (cross > 0.0) {
+            any_positive = true;
+        } else if (cross < 0.0) {
+            any_negative = true;
+        }
+        if (any_positive && any_negative) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// The fill region of `interpolation = "enabled"`: every grid cell whose centre
 /// lies inside at least one enabled camera's ground footprint. Each footprint is
 /// traced by intersecting the camera's border rays with the observed surface
@@ -1255,24 +1284,73 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
     elevation.raster.grid = grid;
     elevation.raster.channels = 1;
     elevation.raster.data = std::move(final_values);
-    // The support mask: 1 where the cell was MEASURED (a real dense sample), 0
-    // where the hole fill interpolated or extrapolated it. `observed` is exactly
-    // that measured mask (captured before the fill). It is written only when the
-    // DEM actually has filled cells, so a fully measured DEM (or one built with
-    // interpolation disabled) keeps an empty mask -- "every valid cell measured"
-    // -- and its bytes are unchanged. The orthomosaic reads this to avoid
-    // rectifying photographs onto invented surface at the block edge.
-    bool any_filled = false;
-    for (std::size_t i = 0; i < count; ++i) {
-        if (final_valid[i] != 0U && observed[i] == 0U) {
-            any_filled = true;
-            break;
+    // The support mask: 1 where the cell is MEASURED (a real dense sample) or
+    // was interpolated INSIDE the measured area, 0 where the surface was
+    // EXTRAPOLATED beyond it. `observed` is the measured mask (captured before
+    // the fill). A filled cell is supported when its centre lies inside the 2D
+    // convex hull of the measured cells' centres: interpolating a hole the
+    // measured surface surrounds (a roof, water, a shadow) is normal and the
+    // ortho must rectify onto it, while the surface carried past the last
+    // measurement at the block edge is what produced the wavy, stretched border
+    // and must stay unsupported. The hull is built from each row's leftmost and
+    // rightmost measured cell centres, which have the same hull as every
+    // measured centre but cost O(rows) points instead of O(cells).
+    //
+    // The mask is written only when some valid cell is unsupported, so a DEM
+    // whose fill is entirely inside the measured area (or one built with
+    // interpolation disabled) keeps an empty mask -- "every valid cell
+    // supported" -- and its bytes are unchanged. The orthomosaic reads this to
+    // avoid rectifying photographs onto invented surface at the block edge.
+    std::vector<Eigen::Vector2d> measured_extremes;
+    measured_extremes.reserve(static_cast<std::size_t>(grid.height) * 2U);
+    for (int row = 0; row < grid.height; ++row) {
+        const std::size_t base =
+            static_cast<std::size_t>(row) * static_cast<std::size_t>(grid.width);
+        int first = -1;
+        int last = -1;
+        for (int col = 0; col < grid.width; ++col) {
+            if (observed[base + static_cast<std::size_t>(col)] != 0U) {
+                if (first < 0) {
+                    first = col;
+                }
+                last = col;
+            }
+        }
+        if (first >= 0) {
+            measured_extremes.push_back(grid.pixel_center(first, row));
+            if (last != first) {
+                measured_extremes.push_back(grid.pixel_center(last, row));
+            }
         }
     }
-    if (any_filled) {
+    const std::vector<Eigen::Vector2d> measured_hull = convex_hull(measured_extremes);
+    bool any_unsupported = false;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (final_valid[i] != 0U && observed[i] == 0U) {
+            const int col = static_cast<int>(i % static_cast<std::size_t>(grid.width));
+            const int row = static_cast<int>(i / static_cast<std::size_t>(grid.width));
+            if (!point_in_convex_polygon(measured_hull, grid.pixel_center(col, row))) {
+                any_unsupported = true;
+                break;
+            }
+        }
+    }
+    if (any_unsupported) {
         elevation.support.assign(count, 0U);
         for (std::size_t i = 0; i < count; ++i) {
-            elevation.support[i] = observed[i] != 0U ? std::uint8_t{1} : std::uint8_t{0};
+            if (observed[i] != 0U) {
+                elevation.support[i] = std::uint8_t{1};
+                continue;
+            }
+            if (final_valid[i] == 0U) {
+                continue;  // nodata: unsupported
+            }
+            const int col = static_cast<int>(i % static_cast<std::size_t>(grid.width));
+            const int row = static_cast<int>(i / static_cast<std::size_t>(grid.width));
+            elevation.support[i] =
+                point_in_convex_polygon(measured_hull, grid.pixel_center(col, row))
+                    ? std::uint8_t{1}
+                    : std::uint8_t{0};
         }
     }
     elevation.set_epsg(frame.epsg());

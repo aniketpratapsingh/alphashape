@@ -131,12 +131,13 @@ Eigen::Vector3d surface_normal(const GeoRaster<float>& dem, float nodata, double
 }
 
 /// True when the DEM cell at plane-frame (x, y) is SUPPORTED: measured, or
-/// interpolated in a DEM the user asked to extrapolate. `support` is the DEM's
-/// per-cell mask (1 = measured, 0 = filled); an empty mask means every valid cell
-/// is measured (an old project, or a source with no fill), so the cell is
-/// supported. `allow_unsupported` is set when the DEM was built with
-/// interpolation "extrapolated", where the user explicitly asked for the surface
-/// to be carried past the last measurement.
+/// interpolated inside the measured area, or interpolated in a DEM the user
+/// asked to extrapolate. `support` is the DEM's per-cell mask (1 = measured or
+/// interpolated inside the measured area, 0 = extrapolated beyond it); an empty
+/// mask means every valid cell is supported (an old project, or a source with no
+/// fill), so the cell is supported. `allow_unsupported` is set when the DEM was
+/// built with interpolation "extrapolated", where the user explicitly asked for
+/// the surface to be carried past the last measurement.
 bool cell_supported(const std::vector<std::uint8_t>& support, const RasterGrid& grid, double x,
                     double y, bool allow_unsupported) {
     if (allow_unsupported || support.empty()) {
@@ -155,7 +156,7 @@ bool cell_supported(const std::vector<std::uint8_t>& support, const RasterGrid& 
 }
 
 /// A shared empty support mask, so a caller that passes an OrthoSupport with no
-/// mask (or no OrthoSupport at all) reads "every valid cell measured".
+/// mask (or no OrthoSupport at all) reads "every valid cell supported".
 const std::vector<std::uint8_t> kEmptySupport;
 
 /// Bilinear colour sample of an 8-bit 1- or 3-channel image at continuous pixel
@@ -679,10 +680,12 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
             if (z == static_cast<double>(dem_nodata)) {
                 continue;  // no ground here
             }
-            // Support gate: a cell the DEM interpolated or extrapolated is not a
-            // measurement, so it is not rectified onto (unless the DEM was built
-            // with extrapolation enabled). This is what keeps the ortho off the
-            // invented marginal surface at the block edge.
+            // Support gate: a cell the DEM extrapolated beyond the measured area
+            // is not a measurement, so it is not rectified onto (unless the DEM
+            // was built with extrapolation enabled). A hole interpolated inside
+            // the measured area is supported and rectified onto normally. This
+            // is what keeps the ortho off the invented marginal surface at the
+            // block edge.
             if (support != nullptr &&
                 !cell_supported(support->mask != nullptr ? *support->mask : kEmptySupport,
                                 dem.grid, x, y, support->allow_unsupported)) {

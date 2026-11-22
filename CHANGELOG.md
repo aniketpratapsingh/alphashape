@@ -858,11 +858,14 @@ All notable changes to alphashape are recorded here. The format follows
   footprint is stretched by more than 4x (incidence cosine below 0.25, about
   75.5 degrees) is not used for that cell, and the cell is left nodata when no
   better view exists. The orthomosaic is also no longer produced over DEM cells
-  that were interpolated or extrapolated rather than measured: the DEM now
-  records a per-cell support mask (measured vs filled), and the ortho leaves an
-  unsupported cell nodata unless the DEM itself was built with extrapolation
-  enabled. The orthomosaic's hole fill still completes every interior hole the
-  survey enclosed (`fill_holes=true` means the whole interior, not a size-gated
+  that were extrapolated beyond the measured area: the DEM now records a
+  per-cell support mask (measured or interpolated inside the measured area vs
+  extrapolated beyond it), and the ortho leaves an unsupported cell nodata
+  unless the DEM itself was built with extrapolation enabled. A hole the
+  measured surface surrounds (a roof, water, a shadow) is interpolated inside
+  the measured area and stays supported, so the ortho still rectifies onto it.
+  The orthomosaic's hole fill still completes every interior hole the survey
+  enclosed (`fill_holes=true` means the whole interior, not a size-gated
   subset).
 - **Marker and camera references in a projected CRS (MGA, UTM, a national grid)
   were read as degrees or refused.** `OptimizeCameras`, `UpdateTransform`,

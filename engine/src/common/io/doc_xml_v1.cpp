@@ -317,7 +317,7 @@ void read_assets(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
         dem.nodata = static_cast<float>(parse_double(require_attr(*elevation, "nodata")));
         dem.interpolation = attr_or(*elevation, "interpolation", std::string());
         // The support mask is optional (see doc_xml_v2): absent means every
-        // valid cell was measured.
+        // valid cell was supported.
         if (const std::string* support_path = find_attr(*elevation, "support_path")) {
             dem.support = sidecar::decode_elevation_support(
                 require_entry(archive, *support_path), g.width, g.height);

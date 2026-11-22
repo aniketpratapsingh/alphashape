@@ -106,10 +106,11 @@ constexpr char kPointCloudMagic[4] = {'A', 'P', 'C', '1'};
 constexpr char kMeshMagic[4] = {'A', 'M', 'S', '1'};   // legacy, read-only
 constexpr char kMeshMagic2[4] = {'A', 'M', 'S', '2'};  // current
 constexpr char kOrthoLabelsMagic[4] = {'A', 'O', 'L', '1'};
-/// The DEM's per-cell support mask (measured vs filled), a companion to the
-/// elevation GeoTIFF: u32 count, i32 width, i32 height, then count u8 flags.
-/// Absent means "every valid cell measured" (an old project, or a DEM with no
-/// fill), so it needs no migration.
+/// The DEM's per-cell support mask (measured or interpolated inside the
+/// measured area vs extrapolated beyond it), a companion to the elevation
+/// GeoTIFF: u32 count, i32 width, i32 height, then count u8 flags. Absent means
+/// "every valid cell supported" (an old project, or a DEM with no fill), so it
+/// needs no migration.
 constexpr char kElevationSupportMagic[4] = {'A', 'E', 'S', '1'};
 constexpr char kMasksMagic[4] = {'A', 'M', 'K', '1'};
 constexpr char kShapesMagic[4] = {'A', 'S', 'H', '1'};

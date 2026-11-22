@@ -1064,7 +1064,8 @@ TEST(ExportOrthomosaic, ProductsSurviveSaveAndLoad) {
     EXPECT_EQ(got.elevation().epsg(), chunk.elevation().epsg());
     EXPECT_EQ(got.elevation().source, "depth_maps");
     // The DEM's support mask and interpolation mode survive the round trip, so
-    // a reloaded project's ortho can still gate on measured-vs-filled surface.
+    // a reloaded project's ortho can still gate on extrapolated-vs-supported
+    // surface.
     EXPECT_EQ(got.elevation().interpolation, chunk.elevation().interpolation);
     EXPECT_EQ(got.elevation().support, chunk.elevation().support);
     EXPECT_EQ(got.orthomosaic().epsg(), chunk.orthomosaic().epsg());

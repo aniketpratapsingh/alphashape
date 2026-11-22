@@ -796,9 +796,10 @@ void write_elevations(const Chunk& chunk, XmlNode& node, ZipArchive& archive,
         if (!elevation.interpolation.empty()) {
             set_attr(e, "interpolation", elevation.interpolation);
         }
-        // The support mask is written only when the DEM has filled cells, so a
-        // fully measured DEM keeps the pre-support bytes (and an old project
-        // reads back as "every valid cell measured").
+        // The support mask is written only when the DEM has extrapolated cells,
+        // so a DEM whose fill is entirely inside the measured area keeps the
+        // pre-support bytes (and an old project reads back as "every valid cell
+        // supported").
         if (!elevation.support.empty()) {
             const std::string support_entry = elevation_support_entry(chunk, asset.id);
             archive.add(support_entry,
@@ -1779,7 +1780,7 @@ void read_elevations(const XmlNode& node, Chunk& chunk, const ZipArchive& archiv
                 static_cast<float>(parse_double(require_attr(e, "nodataValue")));
             dem.interpolation = attr_or(e, "interpolation", std::string());
             // The support mask is optional: an absent entry means every valid
-            // cell was measured (an old project, or a DEM with no fill).
+            // cell was supported (an old project, or a DEM with no fill).
             if (const std::string* support_path = find_attr(e, "support_path")) {
                 dem.support = sidecar::decode_elevation_support(
                     require_entry(archive, *support_path), g.width, g.height);

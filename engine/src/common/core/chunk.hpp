@@ -253,11 +253,11 @@ struct Elevation {
     /// measured cells (see ortho::OrthoSupport).
     std::string interpolation;
     /// Per-cell SUPPORT mask, width*height cells: 1 = measured (a real dense
-    /// sample), 0 = interpolated/extrapolated by the hole fill. Empty means
-    /// "every valid cell measured" (an old project, or a source with no fill),
-    /// so it needs no migration. The orthomosaic reads it to avoid rectifying
-    /// photographs onto invented surface at the block edge (see
-    /// ortho::OrthoSupport).
+    /// sample) or interpolated inside the measured area, 0 = extrapolated
+    /// beyond it by the hole fill. Empty means "every valid cell supported" (an
+    /// old project, or a source with no fill), so it needs no migration. The
+    /// orthomosaic reads it to avoid rectifying photographs onto invented
+    /// surface at the block edge (see ortho::OrthoSupport).
     std::vector<std::uint8_t> support;
 
     /// EPSG code of `crs` (0 for the local frame or a custom CRS).
