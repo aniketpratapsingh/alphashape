@@ -53,6 +53,13 @@ using Vec3 = Eigen::Vector3d;
 
 struct SceneTarget {
     bool cross = false;
+    /// True for a plain printed disc (a white disk, optionally with a black
+    /// centre dot) rather than a coded ring. This is the EuroSDR target: a
+    /// 300 mm white disk with a 100 mm black centre dot.
+    bool disc = false;
+    /// Centre-dot radius as a fraction of the disk radius for a `disc` target.
+    /// Zero prints a plain bright disk with no dot.
+    double disc_dot_ratio = 0.33;
     bool painted = true;
     Vec3 centre = Vec3::Zero();  ///< on the ground plane, y = 0
     double radius = 0.07;        ///< physical outer radius, metres
@@ -85,6 +92,12 @@ struct SceneSpec {
     std::vector<BlankBox> blank_boxes;
     /// Target index printed with parity bit 0 (white centre), or -1 for none.
     int even_code_target = -1;
+    /// Target index printed as a plain disc (white disk + black centre dot)
+    /// instead of a coded ring, or -1 for none. This is the EuroSDR target.
+    int disc_target = -1;
+    /// Centre-dot radius as a fraction of the disk radius for `disc_target`.
+    /// Zero prints a plain bright disk with no dot.
+    double disc_dot_ratio = 0.33;
     /// Physical outer radius of every printed target, metres.
     double target_radius = 0.075;
     /// Target index that receives an extra small dark speck near its centre,
@@ -161,6 +174,14 @@ std::optional<float> target_shade(const SceneTarget& target, double x, double z)
     const double rho = std::sqrt(u * u + v * v) / target.radius;
     if (rho > 1.0) {
         return std::nullopt;
+    }
+    if (target.disc) {
+        // A plain printed disc: a bright disk with an optional dark centre
+        // dot. The dot is the printed fiducial at the disk centre.
+        if (target.disc_dot_ratio > 0.0 && rho <= target.disc_dot_ratio) {
+            return 0.05F;
+        }
+        return 0.95F;
     }
     test::CircularTruth truth;
     truth.bits = 12;
@@ -323,6 +344,8 @@ RefineScene make_scene(SceneSpec spec, std::uint32_t seed) {
         target.rotation = 0.17 * static_cast<double>(i);
         target.word = 0b101101001011U ^ (static_cast<std::uint32_t>(i) << 2);
         target.parity = i == spec.even_code_target ? 0 : 1;
+        target.disc = i == spec.disc_target;
+        target.disc_dot_ratio = spec.disc_dot_ratio;
         target.cross_low = spec.cross_low;
         target.cross_high = spec.cross_high;
         scene.targets.push_back(target);
@@ -424,9 +447,11 @@ std::int32_t add_scene_marker(RefineScene& scene, std::size_t target_index,
     // can tell a coded circular target from a cross. A marker imported or
     // clicked by hand carries no kind, which is the real-block case.
     if (record_target_type) {
-        marker.meta.set("target_type", scene.targets[target_index].cross
-                                           ? "Cross"
-                                           : "Circular12");
+        marker.meta.set("target_type",
+                        scene.targets[target_index].cross
+                            ? "Cross"
+                            : (scene.targets[target_index].disc ? "Circular"
+                                                                : "Circular12"));
     }
     for (std::size_t ci = 0; ci < scene.chunk->cameras().size(); ++ci) {
         if (!only.empty() &&
@@ -1431,6 +1456,142 @@ TEST(Markers, RefineKeepsUnconfidentProjection) {
     EXPECT_TRUE(flat_projection_found);
     // The confident views are still refined.
     EXPECT_GT(stats.moved_projections, 0U);
+}
+
+/// A plain printed disc (white disk + black centre dot), the EuroSDR target.
+/// The measured projections are offset 3-6 px from the true centre in several
+/// views, which is the real block's failure: the refiner used to leave them
+/// unchanged because the only seed was the small dark dot, whose blob centroid
+/// is dragged by the surrounding bright ring. The disk's outer border is the
+/// unbiased fiducial, so every projection must snap onto the true centre.
+TEST(Markers, RefineDiscWithDotSnapsToCentre) {
+    SceneSpec spec;
+    spec.marker_count = 1;
+    spec.disc_target = 0;
+    spec.disc_dot_ratio = 0.33;
+    // A ~12 px disk with a ~4 px dot at the test's focal/height (f = 700 px,
+    // ~1.8 m range), matching the real block's ~10 px disk / ~3.3 px dot.
+    spec.target_radius = 0.03;
+    RefineScene scene = make_scene(spec, 907U);
+    ASSERT_TRUE(scene.targets[0].disc);
+    std::mt19937 engine(41U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 6.0, engine);
+    ASSERT_FALSE(ids.empty());
+    Marker* marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    const std::size_t before = marker->projections.size();
+    ASSERT_GE(before, 4U);
+    const double before_rms = rms_to_truth(scene, *marker, 0);
+    // The perturbation really is several pixels, so a no-op cannot pass.
+    EXPECT_GT(before_rms, 1.5);
+
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    const double after_rms = rms_to_truth(scene, *marker, 0);
+    std::printf("[refine disc+dot] projections %zu, moved %zu kept %zu "
+                "failed %zu, RMS %.4f -> %.4f px\n",
+                marker->projections.size(), stats.moved_projections,
+                stats.kept_unrefined, stats.failed, before_rms, after_rms);
+    EXPECT_EQ(marker->projections.size(), before);
+    EXPECT_EQ(stats.failed, 0U);
+    EXPECT_GT(stats.moved_projections, 0U);
+    for (const MarkerProjection& projection : marker->projections) {
+        const auto truth =
+            scene.truth(0, camera_index(scene, projection.camera_id));
+        ASSERT_TRUE(truth.has_value());
+        EXPECT_LE((projection.pixel - *truth).norm(), 0.3)
+            << "camera " << projection.camera_id;
+    }
+    EXPECT_LE(after_rms, 0.3);
+}
+
+/// The same disc printed WITHOUT a centre dot: a plain bright disk. Its outer
+/// border is the only fiducial, and it must still snap a several-pixel offset
+/// onto the true centre.
+TEST(Markers, RefinePlainBrightDiscSnapsToCentre) {
+    SceneSpec spec;
+    spec.marker_count = 1;
+    spec.disc_target = 0;
+    spec.disc_dot_ratio = 0.0;  // no centre dot
+    spec.target_radius = 0.03;
+    RefineScene scene = make_scene(spec, 911U);
+    ASSERT_TRUE(scene.targets[0].disc);
+    std::mt19937 engine(43U);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 6.0, engine);
+    ASSERT_FALSE(ids.empty());
+    Marker* marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    const std::size_t before = marker->projections.size();
+    ASSERT_GE(before, 4U);
+    const double before_rms = rms_to_truth(scene, *marker, 0);
+    EXPECT_GT(before_rms, 1.5);
+
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    const double after_rms = rms_to_truth(scene, *marker, 0);
+    std::printf("[refine plain disc] projections %zu, moved %zu kept %zu "
+                "failed %zu, RMS %.4f -> %.4f px\n",
+                marker->projections.size(), stats.moved_projections,
+                stats.kept_unrefined, stats.failed, before_rms, after_rms);
+    EXPECT_EQ(marker->projections.size(), before);
+    EXPECT_EQ(stats.failed, 0U);
+    EXPECT_GT(stats.moved_projections, 0U);
+    for (const MarkerProjection& projection : marker->projections) {
+        const auto truth =
+            scene.truth(0, camera_index(scene, projection.camera_id));
+        ASSERT_TRUE(truth.has_value());
+        EXPECT_LE((projection.pixel - *truth).norm(), 0.3)
+            << "camera " << projection.camera_id;
+    }
+    EXPECT_LE(after_rms, 0.3);
+}
+
+/// An already-accurate disc click must not be moved: the disc is a printed
+/// fiducial, but a projection that already sits on its centre is the truth and
+/// the refiner must leave it there. This is the safeguard the real block's
+/// accurate survey clicks depend on.
+TEST(Markers, RefineDiscLeavesAccurateClick) {
+    SceneSpec spec;
+    spec.marker_count = 1;
+    spec.disc_target = 0;
+    spec.disc_dot_ratio = 0.33;
+    spec.target_radius = 0.03;
+    RefineScene scene = make_scene(spec, 919U);
+    ASSERT_TRUE(scene.targets[0].disc);
+    std::mt19937 engine(47U);
+    const std::vector<std::int32_t> ids =
+        add_all_markers(scene, /*perturbation=*/0.0, engine);
+    ASSERT_FALSE(ids.empty());
+    Marker* marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    const std::size_t before = marker->projections.size();
+    ASSERT_GE(before, 4U);
+    const double before_rms = rms_to_truth(scene, *marker, 0);
+    EXPECT_LE(before_rms, 1e-9);
+
+    RefineMarkersOptions options;
+    const RefineMarkersStats stats = run_refine(scene, options);
+    marker = find_marker(*scene.chunk, ids[0]);
+    ASSERT_NE(marker, nullptr);
+    const double after_rms = rms_to_truth(scene, *marker, 0);
+    std::printf("[refine accurate disc] projections %zu, moved %zu kept %zu "
+                "failed %zu, RMS %.4f -> %.4f px\n",
+                marker->projections.size(), stats.moved_projections,
+                stats.kept_unrefined, stats.failed, before_rms, after_rms);
+    EXPECT_EQ(marker->projections.size(), before);
+    EXPECT_EQ(stats.failed, 0U);
+    for (const MarkerProjection& projection : marker->projections) {
+        const auto truth =
+            scene.truth(0, camera_index(scene, projection.camera_id));
+        ASSERT_TRUE(truth.has_value());
+        EXPECT_LE((projection.pixel - *truth).norm(), 0.3)
+            << "camera " << projection.camera_id;
+    }
+    EXPECT_LE(after_rms, 0.3);
 }
 
 }  // namespace
