@@ -2493,25 +2493,41 @@ TEST(BuildOrthomosaic, BlockedMosaicHasNoColourStepAtBlockBoundaries) {
     //       tolerance on essentially every pixel.
     OrthoSetup& s = setup();
     Chunk& chunk = *s.document.active_chunk();
-    DimmedFlight flight(chunk, 0.72, 1.0);  // odd cameras 0.72x, even 1.0x
+    DimmedFlight flight(chunk, 1.0);  // private copies, no uniform dimming
 
-    // Tint the odd cameras toward red as well, so a camera switch is a colour
-    // step and not only a brightness one (the owner saw pinkish vs pale green).
+    // A UNIFORM per-camera dim or tint is exactly what the default affine colour
+    // correction removes, so it would not reproduce the owner's step. What the
+    // affine model cannot remove is a SPATIALLY VARYING per-camera difference: a
+    // strong radial falloff (vignetting) whose strength differs per camera. Two
+    // cameras that share ground then record different colours over the shared
+    // cells, and a camera switch at a block boundary is a real step even after
+    // correction. This is the same shape the gain bench uses, and it is what makes
+    // the seam decision matter.
     for (const auto& frame : chunk.frames()) {
         if (frame->camera_id() < 0) {
             continue;
         }
-        const bool odd = (frame->camera_id() % 2) == 1;
-        if (!odd) {
-            continue;
-        }
         Image image = read_image(frame->path());
         ASSERT_FALSE(image.empty());
-        for (std::size_t i = 0; i + 2 < image.size_bytes(); i += 3) {
-            image.data()[i] = static_cast<std::uint8_t>(
-                std::lround(std::clamp(static_cast<double>(image.data()[i]) * 1.12, 0.0, 255.0)));
-            image.data()[i + 2] = static_cast<std::uint8_t>(
-                std::lround(std::clamp(static_cast<double>(image.data()[i + 2]) * 0.88, 0.0, 255.0)));
+        const int w = image.width();
+        const int h = image.height();
+        const double k = 0.30 + 0.05 * static_cast<double>(frame->camera_id());
+        for (int row = 0; row < h; ++row) {
+            for (int col = 0; col < w; ++col) {
+                const double u = (static_cast<double>(col) + 0.5) / static_cast<double>(w);
+                const double v = (static_cast<double>(row) + 0.5) / static_cast<double>(h);
+                const double r2 = ((u - 0.5) * (u - 0.5) + (v - 0.5) * (v - 0.5)) / 0.5;
+                const double factor = 1.0 - k * r2;
+                std::uint8_t* px = image.data() +
+                                   (static_cast<std::size_t>(row) * static_cast<std::size_t>(w) +
+                                    static_cast<std::size_t>(col)) *
+                                       3U;
+                for (int channel = 0; channel < 3; ++channel) {
+                    const double value = static_cast<double>(px[channel]) * factor;
+                    px[channel] =
+                        static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0, 255.0)));
+                }
+            }
         }
         write_png(frame->path(), image);
     }
