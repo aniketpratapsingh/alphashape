@@ -545,6 +545,97 @@ TEST(Ortho, OcclusionCostDoesNotFollowTheOutputGrid) {
     EXPECT_LT(fine_per_cell, 4096.0);
 }
 
+// -- 2b. grazing views are not colour measurements ---------------------------
+
+TEST(Ortho, GrazingViewIsNotColoured) {
+    // The "stretched roof with moire" at a block edge: the only camera that
+    // reaches a marginal cell is the most oblique one, and the mosaic blend
+    // (which ignores score) would colour the cell from it. A view more oblique
+    // than ~80 degrees is not a measurement of the surface colour -- its
+    // footprint is stretched by 1/cos(incidence) and it samples the image's own
+    // border -- so the rectifier must leave the cell invalid.
+    //
+    // cos(view) is the angle between the vertical and the ray from the ground
+    // point to the optical centre, so it depends on the cell's HORIZONTAL offset
+    // from the camera, not on the camera's tilt. A cell far to the side of a low
+    // camera is seen at a grazing angle; the camera is tilted only so that cell
+    // lands inside the image.
+    constexpr int kSize = 64;
+    constexpr double kCell = 0.5;  // grid half-width 16 m
+    RasterGrid grid;
+    grid.origin_x = -static_cast<double>(kSize) * kCell * 0.5;
+    grid.origin_y = static_cast<double>(kSize) * kCell * 0.5;
+    grid.pixel_size_x = kCell;
+    grid.pixel_size_y = kCell;
+    grid.width = kSize;
+    grid.height = kSize;
+    GeoRaster<float> dem;
+    dem.grid = grid;
+    dem.channels = 1;
+    dem.data.assign(static_cast<std::size_t>(kSize) * kSize, 0.0F);
+    const float nodata = -9999.0F;
+
+    // A uniform bright image so any coloured cell is unambiguous.
+    Image image(480, 360, 3);
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            for (int c = 0; c < 3; ++c) {
+                image.at(x, y, c) = 200;
+            }
+        }
+    }
+
+    // A camera at (0, 0, h) whose optical axis points at the ground point
+    // (aim_x, 0, 0). The pose is X_cam = R X_world + t, camera looking along
+    // +z_cam. R's rows are the camera axes in world coordinates.
+    const auto make_camera = [&](double h, double aim_x) {
+        OrthoCamera camera;
+        camera.calibration =
+            Calibration::initial(CameraType::Frame, image.width(), image.height(), 500.0);
+        camera.image = &image;
+        const Eigen::Vector3d centre(0.0, 0.0, h);
+        // Look direction (world) = (aim_x, 0, -h) normalised.
+        const Eigen::Vector3d look = Eigen::Vector3d(aim_x, 0.0, -h).normalized();
+        // z_cam = look; x_cam in the xz plane perpendicular to it; y_cam = -y.
+        const Eigen::Vector3d x_cam = Eigen::Vector3d(-look.z(), 0.0, look.x()).normalized();
+        const Eigen::Vector3d y_cam(0.0, -1.0, 0.0);
+        Eigen::Matrix3d R;
+        R.row(0) = x_cam;
+        R.row(1) = y_cam;
+        R.row(2) = look;
+        camera.R = R;
+        camera.t = -R * centre;
+        return camera;
+    };
+
+    // Nadir camera high above the centre: the centre cell is seen straight down.
+    // crop=false so the tile covers the whole grid and the cell check reflects
+    // the rectifier's verdict, not the footprint crop.
+    const OrthoTile nadir =
+        orthorectify(dem, nodata, grid, make_camera(60.0, 0.0), 0, 0.1, /*crop=*/false);
+    const int mid = kSize / 2;
+    const std::size_t mid_cell =
+        static_cast<std::size_t>(mid) * static_cast<std::size_t>(kSize) +
+        static_cast<std::size_t>(mid);
+    EXPECT_NE(nadir.valid[mid_cell], 0) << "a nadir camera must colour the cell below it";
+
+    // Low camera aimed at the far +x edge cell (x ~ 15.75): cos(view) =
+    // 2 / sqrt(15.75^2 + 2^2) ~ 0.126, below the 0.17 floor. The cell is inside
+    // the image (the camera is aimed at it) but the view is grazing, so it must
+    // be left invalid.
+    const int far_col = kSize - 1;
+    const OrthoTile grazing =
+        orthorectify(dem, nodata, grid, make_camera(2.0, 15.75), 0, 0.1, /*crop=*/false);
+    const std::size_t far_cell =
+        static_cast<std::size_t>(mid) * static_cast<std::size_t>(kSize) +
+        static_cast<std::size_t>(far_col);
+    std::printf("[Ortho.GrazingViewIsNotColoured] nadir_centre=%d grazing_far=%d\n",
+                nadir.valid[mid_cell] != 0 ? 1 : 0, grazing.valid[far_cell] != 0 ? 1 : 0);
+    EXPECT_EQ(grazing.valid[far_cell], 0)
+        << "a view ~83 degrees from nadir must not colour the cell: it is a grazing "
+           "look whose footprint is stretched by 1/cos(incidence)";
+}
+
 // -- 3. seamlines ------------------------------------------------------------
 
 /// Rectify every camera onto the grid (the expensive shared step).
@@ -1200,8 +1291,116 @@ TEST(Seam, PinnedLabelThatTheTileSetDoesNotCoverIsIgnored) {
     }
 }
 
-// -- 7. pinned blend pyramid depth -------------------------------------------
+// -- 6b. no darkening at a validity boundary --------------------------------
 
+TEST(Blend, NoDarkeningAtAValidityBoundary) {
+    // The reported "dark blurry smudge": a tile whose valid region ends inside
+    // the grid, blended with mosaic. The multiband masks partition only the
+    // COVERED cells, so near the boundary of the covered region
+    // sum_t G_k(mask_t) = G_k(coverage) < 1, and the classic spline's collapse
+    // (which divides by nothing) scales the low frequencies down by that deficit
+    // -- a soft darkening that reaches INWARD from the boundary by the pyramid's
+    // own support. The fix normalises each level by the coverage pyramid.
+    //
+    // Synthetic scene: two bright (200) tiles cover only a centred square of a
+    // 256x256 grid, leaving an invalid margin on every side, and they overlap in
+    // a band at the centre. Both are the SAME bright colour, so a correct blend
+    // is a uniform 200 everywhere it is valid. The covered square's edges are
+    // deliberately NOT aligned to the pyramid's block sizes (40 and 216 are not
+    // multiples of 32), so a coarse-level block straddles each edge and the old
+    // code darkened the valid cells just inside it by tens of grey levels.
+    constexpr int kSize = 256;
+    constexpr int kLo = 40;    // covered columns/rows are [kLo, kHi)
+    constexpr int kHi = 216;
+    constexpr int kOverlap = 32;  // overlap between the two tiles
+    constexpr std::uint8_t kBright = 200;
+    const std::size_t cells = static_cast<std::size_t>(kSize) * kSize;
+    const int split = kSize / 2;
+
+    std::vector<OrthoTile> tiles(2);
+    for (OrthoTile& tile : tiles) {
+        tile.x0 = 0;
+        tile.y0 = 0;
+        tile.width = kSize;
+        tile.height = kSize;
+        tile.rgb.assign(cells * 3, 0);
+        tile.valid.assign(cells, 0);
+        tile.score.assign(cells, 0.0F);
+    }
+    // Tile 0: columns [kLo, split + kOverlap). Tile 1: [split - kOverlap, kHi).
+    // Both cover the full covered row band [kLo, kHi).
+    for (int row = kLo; row < kHi; ++row) {
+        for (int col = kLo; col < kHi; ++col) {
+            const std::size_t cell =
+                static_cast<std::size_t>(row) * static_cast<std::size_t>(kSize) +
+                static_cast<std::size_t>(col);
+            const bool in0 = col < split + kOverlap;
+            const bool in1 = col >= split - kOverlap;
+            if (in0) {
+                tiles[0].valid[cell] = 1;
+                tiles[0].score[cell] = 1.0F;
+            }
+            if (in1) {
+                tiles[1].valid[cell] = 1;
+                tiles[1].score[cell] = 1.0F;
+            }
+            for (int c = 0; c < 3; ++c) {
+                tiles[0].rgb[cell * 3 + static_cast<std::size_t>(c)] = kBright;
+                tiles[1].rgb[cell * 3 + static_cast<std::size_t>(c)] = kBright;
+            }
+        }
+    }
+    // Labels: left half to tile 0, right half to tile 1 (a straight seam).
+    std::vector<std::int32_t> labels(cells, -1);
+    for (int row = kLo; row < kHi; ++row) {
+        for (int col = kLo; col < kHi; ++col) {
+            labels[static_cast<std::size_t>(row) * static_cast<std::size_t>(kSize) +
+                   static_cast<std::size_t>(col)] = col < split ? 0 : 1;
+        }
+    }
+
+    const ortho::OrthoMosaic mosaic =
+        ortho::blend(kSize, kSize, tiles, labels, Blending::Mosaic);
+
+    // Every valid cell must be the bright value. The old code darkened a band
+    // several tens of cells wide just inside the coverage boundary; the worst
+    // valid cell is the sharpest statement of the bug.
+    int worst = 255;
+    int worst_col = -1;
+    int worst_row = -1;
+    std::size_t valid_cells = 0;
+    for (int row = 0; row < kSize; ++row) {
+        for (int col = 0; col < kSize; ++col) {
+            const std::size_t cell =
+                static_cast<std::size_t>(row) * static_cast<std::size_t>(kSize) +
+                static_cast<std::size_t>(col);
+            if (mosaic.valid[cell] == 0) {
+                continue;
+            }
+            ++valid_cells;
+            const int value = mosaic.rgb[cell * 3];
+            if (value < worst) {
+                worst = value;
+                worst_col = col;
+                worst_row = row;
+            }
+        }
+    }
+    std::printf("[Blend.NoDarkeningAtAValidityBoundary] valid=%zu worst=%d at (%d,%d)\n",
+                valid_cells, worst, worst_col, worst_row);
+    ASSERT_GT(valid_cells, 0U);
+    // A uniform bright scene must come out essentially uniform. The old code
+    // darkened the valid cells just inside the coverage boundary to ~150 (the
+    // coarse-level coverage deficit); the fix reconstructs them to ~200. A few
+    // grey levels of slack absorb the Laplacian's own rounding near the fill
+    // drop, far below the ~50-level darkening the old code produced.
+    EXPECT_GE(worst, static_cast<int>(kBright) - 10)
+        << "the blend darkened a valid cell to " << worst << " (expected ~"
+        << static_cast<int>(kBright) << ") at (" << worst_col << "," << worst_row
+        << "): the multiband masks do not sum to 1 at a validity boundary";
+}
+
+// -- 7. pinned blend pyramid depth -------------------------------------------
 TEST(Ortho, PinnedPyramidDepthEqualsTheWholeGridBlend) {
     // A block plan pins the mosaic pyramid depth to the whole grid's. Pinning it
     // explicitly must reproduce the default blend exactly, and the accessor must

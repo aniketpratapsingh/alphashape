@@ -837,6 +837,27 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Fixed
 
+- **Dark blurry smudges in the orthomosaic.** The multiband (mosaic) blend's
+  per-camera masks partition only the cells a camera actually covers, so near the
+  edge of a camera's footprint, a hole or the block border the masks summed to
+  less than one, and the pyramid collapse scaled the low frequencies down by that
+  deficit. The result was a soft darkening up to the pyramid's own reach (about
+  3 m at 2.33 cm), which read as a dark blob with blurred texture inside. Each
+  pyramid level is now normalised by a coverage pyramid, so a partly covered
+  neighbourhood is reconstructed from the covered fraction instead of being
+  darkened; a fully covered interior is unchanged. The pre-pyramid extension of a
+  camera's colour into its invalid cells also copies the nearest valid colour
+  instead of averaging neighbours, so it no longer synthesises a low-frequency
+  value of its own.
+- **Stretched, streaked edges beyond the reconstructed surface.** A cell seen
+  only at a grazing angle (more than about 80 degrees from nadir) is no longer
+  coloured: its footprint is stretched by 1/cos(incidence) and it samples the
+  photograph's own border, which is the "stretched roof with moire" artefact at
+  the edge of a block. Such a cell is left nodata, so the mosaic blend can no
+  longer be forced to use the most oblique view when it is the only one. The
+  orthomosaic's hole fill also completes only genuinely small interior holes
+  (within 1 m of valid data) and leaves larger gaps nodata, instead of smearing a
+  smooth interpolation across a place the survey did not reconstruct.
 - **Marker and camera references in a projected CRS (MGA, UTM, a national grid)
   were read as degrees or refused.** `OptimizeCameras`, `UpdateTransform`,
   `AlignFromReference` and the alignment georeference now convert a projected

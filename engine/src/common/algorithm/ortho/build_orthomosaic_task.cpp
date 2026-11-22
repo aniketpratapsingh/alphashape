@@ -598,9 +598,10 @@ constexpr double kBytesPerCellSeamField = 8.0 + 1.0 + 4.0 + 8.0;
 ///     a float plane, i.e. 3 * 4 / (1 - 1/4)                      = 16
 ///   * one tile's Gaussian/Laplacian/mask planes at the same
 ///     geometric series, about 3 planes at ~1.33 * 4 B            = 16
+///   * the coverage pyramid (one more float plane series)         = 5.33
 ///   * the collapse's resize/up sources, another ~2 planes        = 11
 ///   * `scratch_mask` u8                                          = 1
-constexpr double kBytesPerCellBlend = 3.0 + 1.0 + 4.0 + 16.0 + 16.0 + 11.0 + 1.0;
+constexpr double kBytesPerCellBlend = 3.0 + 1.0 + 4.0 + 16.0 + 16.0 + 5.33 + 11.0 + 1.0;
 
 /// Finalize stage, full-grid part. The old code built `result.raster` (RGBA
 /// u8 = 4 B/cell) while the blend mosaic (rgb+valid+labels = 8 B/cell) was
@@ -2970,6 +2971,20 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         elevation::HoleFillOptions fill;
         fill.method = elevation::HoleFill::NaturalNeighbour;
         fill.interior_only = true;
+        // Only genuinely SMALL interior holes are completed. A hole's EDT
+        // distance to the nearest valid cell is half its width, so capping the
+        // distance at kMaxHoleFillMetres fills holes up to ~2x that across and
+        // leaves larger gaps nodata. This is the "hole-filling depth" rule: a
+        // big gap is not a hole to be invented, it is a place the survey did not
+        // reconstruct, and filling it with a smooth interpolation of the
+        // surroundings is exactly the soft, textureless patch that reads as a
+        // smudge. The cap is in metres, converted to cells with the output cell
+        // size (the fill runs on the output grid).
+        constexpr double kMaxHoleFillMetres = 1.0;
+        const double cell_metres = std::max(grid.pixel_size_x, grid.pixel_size_y);
+        if (cell_metres > 0.0 && std::isfinite(cell_metres)) {
+            fill.max_distance = kMaxHoleFillMetres / cell_metres;
+        }
         // Smooth always runs: for "texture" it is both the initial image the
         // exemplar completion starts from and the fallback for a hole it
         // cannot source. Record which cells it is about to change so the

@@ -126,6 +126,19 @@ bool blocked(const GeoRaster<float>& dem, float nodata, double tol, double x, do
 /// only what turns "this ray never got above the terrain" into a finite loop.
 constexpr std::size_t kMaxOcclusionSamplesPerRay = 1000000;
 
+/// The smallest cosine of the view angle against vertical a cell may be coloured
+/// from. A view more oblique than this (about 80 degrees from nadir) is a grazing
+/// look at the surface: its ground footprint is stretched by 1/cos(incidence), so
+/// one image pixel covers many ground cells and the rectified colour is a smear
+/// of the image's own border pixels -- the "stretched roof with moire" artefact at
+/// the edge of a block, where the only camera that reaches a marginal cell is the
+/// most oblique one. Such a view is not a measurement of the surface colour, so
+/// the cell is left invalid rather than coloured from it. The seam labeller and
+/// the average blend already prefer a higher score; this makes the preference a
+/// hard floor so the MOSAIC blend (which ignores score) cannot be forced to use a
+/// grazing view when it is the only one. cos(80 deg) = 0.174.
+constexpr double kMinViewCosine = 0.17;
+
 /// DEM samples taken by the occlusion march since the last reset. Test-only:
 /// the cost contract (samples per output cell must not follow the output grid)
 /// is otherwise unobservable from a tile's contents.
@@ -236,6 +249,11 @@ bool project_surface_point(const GeoRaster<float>& dem, float dem_nodata,
     const double edge = std::min(std::min(u, iw - u), std::min(v, ih - v));
     const double taper = std::clamp(edge / taper_span, 0.0, 1.0);
     const double cos_view = std::clamp(dir.z(), 0.0, 1.0);
+    // The same grazing-view rejection orthorectify() applies: a view this oblique
+    // is not a colour measurement, so the point is not "seen" for sampling.
+    if (cos_view < kMinViewCosine) {
+        return false;
+    }
     out.u = u;
     out.v = v;
     out.score = std::max(1e-6, cos_view * taper);
@@ -624,6 +642,15 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
 
             // -- score: cos(view vs vertical) * border taper ----------------
             const double cos_view = std::clamp(dir.z(), 0.0, 1.0);  // plane-frame vertical
+            // A grazing view is not a measurement of the surface colour: its
+            // footprint is stretched by 1/cos(incidence) and it samples the
+            // image's own border. Leave the cell invalid rather than colour it
+            // from such a view (see kMinViewCosine). This is what stops a block
+            // edge -- where the only camera reaching a marginal cell is the most
+            // oblique one -- from being stretched into streaks.
+            if (cos_view < kMinViewCosine) {
+                continue;
+            }
             const double edge = std::min(std::min(u, iw - u), std::min(v, ih - v));
             const double taper = std::clamp(edge / taper_span, 0.0, 1.0);
             const double score = std::max(epsilon, cos_view * taper);

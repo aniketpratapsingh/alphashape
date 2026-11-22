@@ -228,12 +228,22 @@ void replicate_edges(Plane& p, int w, int h) {
 }
 
 /// Grow valid colour outward into the invalid cells of `p`, one ring per pass,
-/// averaging whatever valid 8-neighbours exist. The Gaussian pyramid of a plane
-/// that is zero outside the tile's footprint would drag the coarse levels toward
-/// zero near every validity edge, leaving a dark halo along the seam. Extending
-/// the real colour outward keeps the multiscale decomposition free of that
-/// artificial step. Deterministic: each pass only reads the previous pass's
-/// state, and cells are visited in scan order.
+/// COPYING the nearest valid colour (a distance-ordered flood) rather than
+/// averaging neighbours. The Gaussian pyramid of a plane that is zero outside the
+/// tile's footprint would drag the coarse levels toward zero near every validity
+/// edge, leaving a dark halo along the seam. Extending the real colour outward
+/// keeps the multiscale decomposition free of that artificial step.
+///
+/// The growth COPIES rather than averages on purpose. Averaging neighbours makes
+/// every ring a box-filter of the previous ring, i.e. a low-pass filter: the
+/// filled region becomes a progressively smoother, darker (or brighter) average
+/// of the boundary colour, and the coarse Laplacian levels then carry that
+/// synthesised low-frequency field into the mosaic as a soft multi-metre blob
+/// with blurred texture inside. Copying the nearest valid colour introduces no
+/// new value at all -- the extension is a piecewise-constant continuation of the
+/// real colour, so the coarse levels see the real boundary value and nothing
+/// invented. Deterministic: each pass only reads the previous pass's state, and
+/// cells are visited in scan order.
 ///
 /// `max_passes` bounds how far the growth may travel (< 0 = unbounded). The blend
 /// passes the pyramid's own reach, which is what makes the operator local; see
@@ -261,10 +271,13 @@ void fill_invalid(Plane& p, const std::vector<std::uint8_t>& valid, int max_pass
                 if (known[cell] != 0) {
                     continue;
                 }
-                double sum = 0.0;
-                int count = 0;
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
+                // Copy the first known 8-neighbour in a fixed scan order. A
+                // deterministic tie-break (not an average) is what keeps the
+                // extension from synthesising a new low-frequency value.
+                bool found = false;
+                float value = 0.0F;
+                for (int dy = -1; dy <= 1 && !found; ++dy) {
+                    for (int dx = -1; dx <= 1 && !found; ++dx) {
                         if (dx == 0 && dy == 0) {
                             continue;
                         }
@@ -277,13 +290,13 @@ void fill_invalid(Plane& p, const std::vector<std::uint8_t>& valid, int max_pass
                             static_cast<std::size_t>(ny) * static_cast<std::size_t>(w) +
                             static_cast<std::size_t>(nx);
                         if (known[nc] != 0) {
-                            sum += static_cast<double>(p.v[nc]);
-                            ++count;
+                            value = p.v[nc];
+                            found = true;
                         }
                     }
                 }
-                if (count > 0) {
-                    p.v[cell] = static_cast<float>(sum / static_cast<double>(count));
+                if (found) {
+                    p.v[cell] = value;
                     next[cell] = 1;
                     --remaining;
                     progressed = true;
@@ -435,12 +448,23 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
     const int pad_w = std::max(width, kLevelMinCells << levels);
     const int pad_h = std::max(height, kLevelMinCells << levels);
 
-    // Per-channel fused Laplacian pyramid. The masks partition the covered cells
-    // (each covered cell has exactly one label), and the Gaussian operator keeps
-    // that partition: sum_t G_k(mask_t) = G_k(1) = 1 at every level. That is the
-    // reason the classic Burt & Adelson spline needs no per-level normalisation;
-    // dividing by a summed denominator here would make the collapse nonlinear and
-    // reintroduce the steps it is meant to remove.
+    // Per-channel fused Laplacian pyramid. The masks partition the COVERED cells
+    // (each covered cell has exactly one label), so sum_t G_k(mask_t) = G_k(1) = 1
+    // only where the whole neighbourhood is covered. Near a validity boundary --
+    // the edge of a camera's footprint, a hole, the block border -- the summed
+    // mask is G_k(coverage) < 1, and the classic spline's collapse (which divides
+    // by nothing) then attenuates the low frequencies by exactly that deficit.
+    // That is a soft darkening of the coarse bands, up to the pyramid's own reach
+    // (126 cells at the 6-level cap, ~3 m at 2.33 cm), which reads as a dark
+    // blurry blob with the fine detail still present -- the reported smudge.
+    //
+    // The fix is to normalise each level by the coverage pyramid: the fused
+    // Laplacian is divided by G_k(coverage) before the collapse, so a cell whose
+    // neighbourhood is only partly covered is reconstructed from the covered
+    // fraction instead of being scaled down by it. This is the standard
+    // normalised-convolution correction for a multiband spline over a masked
+    // domain; it is exact (identity) wherever coverage is 1, so a fully covered
+    // interior is byte-identical to the unnormalised spline.
     std::vector<std::vector<Plane>> num(3);
     for (int c = 0; c < 3; ++c) {
         num[static_cast<std::size_t>(c)].reserve(static_cast<std::size_t>(levels) + 1);
@@ -450,7 +474,6 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
             num[static_cast<std::size_t>(c)].push_back(make_plane(lw, lh));
         }
     }
-
     // How far the colour may be grown into a tile's invalid cells: exactly the
     // blend's own reach at this depth, so the operator stays LOCAL -- a cell
     // farther than this is never read by any pyramid level. Unbounded growth is
@@ -484,6 +507,27 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
         replicate_edges(padded, real.w, real.h);
         return padded;
     };
+
+    // The coverage pyramid: the SAME operator the per-tile label masks use
+    // (weight_pyramid), applied to sum_t mask_t. Because blur5 and reduce are
+    // linear and the label masks partition the labelled cells, this equals
+    // sum_t mask_t^k exactly at every level, so it is the exact per-level
+    // denominator the collapse needs. A cell is covered here iff its label names
+    // a tile that is valid there -- the same test the per-tile mask uses.
+    Plane coverage = make_plane(width, height);
+    for (std::size_t cell = 0; cell < cells; ++cell) {
+        const std::int32_t label = out.labels[cell];
+        if (label < 0 || label >= static_cast<std::int32_t>(tiles.size())) {
+            continue;
+        }
+        const int col = static_cast<int>(cell % static_cast<std::size_t>(width));
+        const int row = static_cast<int>(cell / static_cast<std::size_t>(width));
+        if (tile_valid(tiles[static_cast<std::size_t>(label)], col, row)) {
+            coverage.v[cell] = 1.0F;
+        }
+    }
+    const std::vector<Plane> coverage_pyr =
+        weight_pyramid(pad_plane(std::move(coverage)), levels);
 
     // Reused across tiles, so the blend never holds one validity copy per camera.
     std::vector<std::uint8_t> scratch_mask(cells, 0);
@@ -557,6 +601,28 @@ OrthoMosaic blend(int width, int height, const std::vector<OrthoTile>& tiles,
                                             static_cast<std::size_t>(tile.x0));
             std::fill_n(tile_mask.begin() + start, static_cast<std::ptrdiff_t>(tile.width),
                         std::uint8_t{0});
+        }
+    }
+
+    // Normalise each fused level by the coverage pyramid. The masks partition
+    // only the covered cells, so the fused level is coverage_k * L_k(C) rather
+    // than L_k(C); dividing by coverage_k recovers the true low-frequency content
+    // and removes the boundary darkening. Where coverage is 1 (any fully covered
+    // neighbourhood) the divisor is exactly 1, so the interior is byte-identical
+    // to the unnormalised spline. The floor bounds the amplification at a cell
+    // whose neighbourhood is almost entirely uncovered (a thin sliver, which the
+    // output validity drops anyway) so round-off there cannot blow up; it is far
+    // below the 0.3-0.5 coverage a real hole produces, so the smudge is fully
+    // corrected.
+    constexpr float kMinCoverage = 0.1F;
+    for (int c = 0; c < 3; ++c) {
+        for (int k = 0; k <= levels; ++k) {
+            Plane& acc = num[static_cast<std::size_t>(c)][static_cast<std::size_t>(k)];
+            const Plane& cov = coverage_pyr[static_cast<std::size_t>(k)];
+            for (std::size_t i = 0; i < acc.v.size(); ++i) {
+                const float divisor = std::max(cov.v[i], kMinCoverage);
+                acc.v[i] /= divisor;
+            }
         }
     }
 
