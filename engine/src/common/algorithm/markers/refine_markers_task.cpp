@@ -401,15 +401,30 @@ struct BlobSeed {
     /// that is neither a dot nor a light interior is only a dark-blob guess,
     /// which a coded circular target retries in a wider window.
     bool centre_dot = false;
+    /// True when a plain printed disc's outer border was fitted AND, when the
+    /// target also prints a centre dot, the dot was fitted and found
+    /// concentric with that border. Both are the same printed fiducial, so
+    /// their agreement is what makes the disc centre trustworthy; a lone
+    /// border fit could be a neighbouring outline.
+    bool verified_circle = false;
 };
 
 /// Locate the circular target around `pixel` in the (possibly reduced) image.
 /// The blob's scale supplies the physical radius; the ellipse refit supplies a
 /// seed for the 2-D fallback. A cross has no blob, so this returns nullopt and
 /// the caller falls back to patch_size / 4.
+///
+/// `plain_disc` is true for a target that is a printed disc (a white disk with
+/// or without a black centre dot) rather than a coded ring. Such a target has
+/// no sector word, so the light-on-dark pass is run for it too: the bright
+/// disk is the printed fiducial and its outer border is the unbiased centre,
+/// exactly as for a parity-0 coded target. Without this the only seed is the
+/// small dark centre dot, whose blob centroid is dragged a few pixels by the
+/// surrounding bright ring.
 std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                                              const Eigen::Vector2d& pixel,
                                              int half, bool coded_circular,
+                                             bool plain_disc,
                                              double border_multiple) {
     const Eigen::Vector2d index = view.index_of(pixel);
     if (!index.allFinite()) {
@@ -458,11 +473,13 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
     // it, a parity-0 interior is centred on it, while sector wedges (dark or
     // light) are half a radius away and must not be seeded.
     params.dark_on_light = false;
-    // Only a coded circular target has the bright enclosed interior this
-    // pass responds to. Crosses and other kinds keep the dark-blob path.
+    // A coded circular target has the bright enclosed interior this pass
+    // responds to, and so does a plain printed disc: its bright disk is the
+    // fiducial and its outer border is the unbiased centre. Crosses and other
+    // kinds keep the dark-blob path.
     const std::vector<MarkerCandidate> light_blobs =
-        coded_circular ? detect_blobs(crop, params)
-                       : std::vector<MarkerCandidate>{};
+        (coded_circular || plain_disc) ? detect_blobs(crop, params)
+                                       : std::vector<MarkerCandidate>{};
     const Eigen::Vector2d seed(index.x() - static_cast<double>(x0) + 0.5,
                                index.y() - static_cast<double>(y0) + 0.5);
     const double anchor_gate = std::max(4.0, 0.15 * static_cast<double>(half));
@@ -558,7 +575,164 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
     BlobSeed out;
     Eigen::Vector2d centre = seed;
     double radius = 0.0;
-    if (dot != nullptr) {
+    if (plain_disc) {
+        // A printed disc (white disk, optionally with a black centre dot) has
+        // no sector word, so its fiducial is the DISK. Fit the disk's outer
+        // border from the expected pixel: it is a complete concentric outline
+        // and its centre is the printed centre. The dark centre dot, when
+        // present, is fitted separately and must agree with the border; two
+        // independent fits of the same printed centre are what makes the
+        // result trustworthy, and a dot that does not agree is a speck or a
+        // neighbouring blob, not this target's fiducial.
+        const MarkerCandidate* light = nullptr;
+        for (const MarkerCandidate& blob : light_blobs) {
+            if ((blob.center - seed).norm() > anchor_gate) {
+                continue;
+            }
+            if (light == nullptr || blob.radius_px > light->radius_px) {
+                light = &blob;
+            }
+        }
+        // The dot, if any, is the smallest dark blob on the expected pixel.
+        const MarkerCandidate* disc_dot = nullptr;
+        for (const MarkerCandidate& blob : dark_blobs) {
+            if ((blob.center - seed).norm() > anchor_gate ||
+                !looks_like_dot(blob)) {
+                continue;
+            }
+            if (disc_dot == nullptr || blob.radius_px < disc_dot->radius_px) {
+                disc_dot = &blob;
+            }
+        }
+        std::optional<Eigen::Vector2d> dot_centre;
+        double dot_radius = 0.0;
+        if (disc_dot != nullptr) {
+            dot_centre = disc_dot->center;
+            dot_radius = disc_dot->radius_px;
+            if (const auto fitted = refine_ellipse_center(crop, *disc_dot)) {
+                dot_centre = *fitted;
+            }
+        }
+        // The disk's outer border. The light-on-dark blob fit stops at the
+        // first bright edge, which for a disc-with-dot is the dot's bright
+        // ring, so the border search starts from a radius that reaches past
+        // the dot (the dot is at most ~0.4 R by design). The fitted radius is
+        // the target scale the caller uses. The search is seeded from the dot
+        // centre when there is one (a sharp, symmetric fiducial close to the
+        // true centre) and from the disk blob centre otherwise, so the radial
+        // rays are already near-radial to the printed centre and the fit
+        // converges tightly even when the click is several pixels off.
+        //
+        // The border fit does NOT require a light blob: a disc-with-dot's
+        // bright region is an annulus, which the blob detector may not report
+        // as a single blob. The dot radius alone supplies a hint that reaches
+        // the disk border (the disk is ~3x the dot by design), so the fit runs
+        // whenever there is a dot or a light blob.
+        std::optional<Eigen::Vector2d> border_centre;
+        double border_radius = 0.0;
+        const bool have_scale = light != nullptr || dot_centre.has_value();
+        if (have_scale) {
+            const Eigen::Vector2d border_seed =
+                dot_centre ? *dot_centre
+                           : (light != nullptr ? light->center : seed);
+            const double hint =
+                std::max({light != nullptr ? light->radius_px : 0.0,
+                          2.5 * dot_radius, 4.0});
+            double fitted_radius = hint;
+            const auto fitted =
+                refine_border_center(crop, border_seed, hint, &fitted_radius);
+            const double window_limit = static_cast<double>(half) - 2.0;
+            // The fitted border must be larger than the dot (it is the disk,
+            // not the dot's bright ring) and, when a light blob exists, at
+            // least most of that blob's radius. It must also not have grown
+            // much past the hint, which would mean it locked onto a background
+            // edge beyond the disk. The movement bound is a fraction of the
+            // fitted radius, not a fixed few pixels, so a legitimate mis-click
+            // is still accepted while a fit that jumped to a neighbouring
+            // outline is not.
+            const double minimum_radius =
+                std::max(1.5 * dot_radius,
+                         light != nullptr ? 0.8 * light->radius_px : 0.0);
+            if (fitted && fitted_radius <= window_limit &&
+                fitted_radius <= 2.0 * hint &&
+                fitted_radius >= minimum_radius &&
+                (*fitted - border_seed).norm() <=
+                    std::max(4.0, 0.5 * fitted_radius)) {
+                border_centre = *fitted;
+                border_radius = fitted_radius;
+            }
+        }
+        // The printed centre is the disk's outer border when it fitted and
+        // agrees with the centre dot: the border is a complete outline with
+        // many edge samples, so it is the most robust estimate, and the dot
+        // confirms it is this target's outline and not a neighbouring one.
+        // When the two disagree the border is suspect (a neighbouring outline,
+        // nearby text or uneven illumination), so the sharp dot is trusted
+        // instead and the tight half-radius guard is kept.
+        if (border_centre && dot_centre) {
+            // Concentricity: a printed dot sits on the disk centre to a
+            // fraction of a pixel; a speck or a neighbouring blob does not.
+            // The tolerance is a fraction of the DOT radius, so it tightens as
+            // the dot shrinks and never admits a dot a whole dot-width away.
+            const double tolerance = std::max(0.75, 0.75 * dot_radius);
+            if ((*dot_centre - *border_centre).norm() <= tolerance) {
+                centre = *border_centre;
+                radius = border_radius;
+                out.light_centre = true;
+                out.border_fitted = true;
+                out.centre_dot = true;
+                out.verified_circle = true;
+            } else {
+                centre = *dot_centre;
+                radius = dot_radius;
+                out.centre_dot = true;
+            }
+        } else if (border_centre) {
+            // A plain bright disk with no printed dot: the border fit is the
+            // only fiducial, and it is a complete outline, so it is verified
+            // on its own.
+            centre = *border_centre;
+            radius = border_radius;
+            out.light_centre = true;
+            out.border_fitted = true;
+            out.verified_circle = true;
+        } else if (dot_centre) {
+            // No usable border fit: the dot is the only printed fiducial, at
+            // the dot's own scale, which keeps the tight half-radius guard.
+            centre = *dot_centre;
+            radius = dot_radius;
+            out.centre_dot = true;
+        } else if (light != nullptr) {
+            // No dot and no border fit: the disk blob centre is the best
+            // available seed, but it is not verified.
+            centre = light->center;
+            radius = light->radius_px;
+            out.light_centre = true;
+        } else {
+            // Neither a disk nor a dot anchored on the click: fall back to the
+            // nearest blob of either polarity, exactly as the coded path does.
+            const MarkerCandidate* nearest = nullptr;
+            double best_distance = static_cast<double>(half) * 0.75;
+            for (const std::vector<MarkerCandidate>* list :
+                 {&dark_blobs, &light_blobs}) {
+                for (const MarkerCandidate& blob : *list) {
+                    const double distance = (blob.center - seed).norm();
+                    if (distance <= best_distance) {
+                        best_distance = distance;
+                        nearest = &blob;
+                    }
+                }
+            }
+            if (nearest == nullptr) {
+                return std::nullopt;
+            }
+            centre = nearest->center;
+            radius = nearest->radius_px;
+            if (const auto fitted = refine_ellipse_center(crop, *nearest)) {
+                centre = *fitted;
+            }
+        }
+    } else if (dot != nullptr) {
         // Parity 1: the centre dot is the printed fiducial and supplies the
         // patch scale, unchanged from the dark-only path.
         centre = dot->center;
@@ -688,7 +862,7 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
 std::optional<BlobSeed> circular_seed(const CameraView& view,
                                       const Eigen::Vector2d& pixel,
                                       int patch_size, double expected_radius,
-                                      bool coded_circular,
+                                      bool coded_circular, bool plain_disc,
                                       bool retry_when_missing) {
     const double ds = static_cast<double>(std::max(1, view.downscale));
     const double expected_px =
@@ -709,7 +883,8 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
                                            std::ceil(1.3 * expected_px)) + 8));
     }
     half = std::min(half, max_half);
-    auto seed = circular_seed_window(view, pixel, half, coded_circular, 2.0);
+    auto seed =
+        circular_seed_window(view, pixel, half, coded_circular, plain_disc, 2.0);
     // A border fit that needed more room than the window offered means the
     // outline was clipped, so the accepted radius and centre are unreliable; a
     // coded target whose interior also fell outside the window has no light
@@ -720,14 +895,15 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
     // otherwise the first window already held the target and its own seed is
     // the better one.
     const bool clipped = seed && seed->border_clipped;
-    const bool guessed =
-        coded_circular && seed && !seed->light_centre && !seed->centre_dot;
+    const bool guessed = (coded_circular || plain_disc) && seed &&
+                         !seed->light_centre && !seed->centre_dot;
     const bool missing = retry_when_missing && !seed;
-    if (coded_circular && (clipped || guessed || missing) &&
+    if ((coded_circular || plain_disc) && (clipped || guessed || missing) &&
         half < max_half) {
         const int wider = std::min(2 * half, max_half);
-        if (auto retried =
-                circular_seed_window(view, pixel, wider, coded_circular, 2.4)) {
+        if (auto retried = circular_seed_window(view, pixel, wider,
+                                                coded_circular, plain_disc,
+                                                2.4)) {
             const bool larger =
                 retried->border_fitted &&
                 retried->radius > static_cast<double>(half) - 2.0;
@@ -1403,12 +1579,24 @@ struct BlendView {
     /// True when the scale is a blob radius. A cross-extent scale is real but
     /// carries no blob, so the refiners keep the tighter movement guard.
     bool blob_scale = false;
+    /// True when this view verified the printed circular centre: the outer
+    /// disc boundary and (when a printed dot exists) the concentric centre dot
+    /// were both fitted and agree, so `apparent` is the DISC radius and the
+    /// measured pixel is known to lie on that disc. Only then is a correction
+    /// up to one target radius a legitimate "snap the click onto its centre";
+    /// a plain blob guess still keeps the tighter half-radius guard.
+    bool verified_circle = false;
     /// True when the scale came from the checker-cross detector's target
     /// half-size, so the patch is already in printed-target units.
     bool cross_scale = false;
     /// True when the marker is a coded circular target, the only kind whose
     /// even parity has an enclosed bright interior to seed from.
     bool coded_circular = true;
+    /// True when the marker is a plain printed disc (a white disk, with or
+    /// without a black centre dot) rather than a coded ring. Its fiducial is
+    /// the disk's outer border, so the seed search runs the light-on-dark pass
+    /// and fits that border instead of the small dark centre dot.
+    bool plain_disc = false;
     /// True when a target kind was recorded for this marker. Without one the
     /// seed search keeps its previous window and only coded kinds widen it.
     bool target_kind_known = false;
@@ -1432,8 +1620,19 @@ struct BlendView {
 /// apparent radius; a cross-extent (or currently unscaled) view is capped at
 /// three full-resolution pixels. The cap is a correction bound, not a target
 /// radius: the physical patch scale no longer widens it.
+///
+/// A VERIFIED disc is the one case where the bound is the target radius
+/// itself: the outer border and the concentric centre dot were both fitted, so
+/// the measured pixel is known to lie on this printed disc and a click up to
+/// one radius off its centre is a legitimate mis-click to correct. This is
+/// still a correction bound, not an accuracy budget: it is derived from the
+/// fitted disc radius, never a constant, and the multi-view corroboration
+/// below still has to agree before any move is applied.
 double refinement_limit(const BlendView& blend) {
     const double ds = static_cast<double>(std::max(1, blend.view->downscale));
+    if (blend.verified_circle) {
+        return std::max(2.0, blend.apparent);
+    }
     const double scale = blend.blob_scale ? blend.apparent : 6.0 * ds;
     return std::max(2.0, 0.5 * scale);
 }
@@ -1446,8 +1645,15 @@ double refinement_limit(const BlendView& blend) {
 /// for a mis-click to be pulled onto the centre and far too little to wander
 /// onto unrelated texture. A refinement that would exceed it is discarded and
 /// the measurement is kept unchanged.
+///
+/// A verified disc widens the cap to one fitted disc radius, for the same
+/// reason as `refinement_limit`: the disc is a printed fiducial and a click
+/// anywhere on it is a mis-click onto the same target, not a different one.
 double maximum_shift(const BlendView& blend) {
     const double ds = static_cast<double>(std::max(1, blend.view->downscale));
+    if (blend.verified_circle) {
+        return std::max(6.0 * ds, blend.apparent);
+    }
     const double scale = blend.has_scale ? blend.apparent : 6.0 * ds;
     return std::max(6.0 * ds, 0.5 * scale);
 }
@@ -1731,10 +1937,16 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
                                  : tight;
         // The blob seed is the ellipse refiner's second opinion and its only
         // anchor for a circular target; it is computed even when the saddle
-        // supplied the scale, so both refiners stay available.
+        // supplied the scale, so both refiners stay available. A plain disc is
+        // seeded from the MEASURED pixel: the surveyor's click is on the disc
+        // by construction, while the consensus candidate can be several pixels
+        // away after its depth step, and the border fit must start on the
+        // target it is meant to centre.
+        const Eigen::Vector2d seed_pixel =
+            blend.plain_disc ? blend.pixel : *projected;
         const auto seed = circular_seed(
-            *blend.view, *projected, options.patch_size, blend.apparent,
-            blend.coded_circular, blend.target_kind_known);
+            *blend.view, seed_pixel, options.patch_size, blend.apparent,
+            blend.coded_circular, blend.plain_disc, blend.target_kind_known);
         // A recorded circular target uses the boundary fit. For any other
         // kind the ellipse is trusted only when the seed is a printed centre
         // dot; a plain bright blob on a checker is one quadrant, and fitting
@@ -1742,6 +1954,23 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
         const bool allow_ellipse =
             blend.model == TargetModel::Circular ||
             (seed && seed->centre_dot);
+        // A verified disc (outer border and, when present, the concentric
+        // centre dot) is a printed fiducial in its own right, so its fitted
+        // centre is the answer and the generic first-edge ellipse refit is
+        // skipped: that refit would lock onto the small centre dot and undo
+        // the border fit.
+        if (seed && seed->verified_circle) {
+            refined_ok[index] = true;
+            anchored[index] = seed->pixel;
+            const auto point = intersect_plane(*blend.view, anchored[index],
+                                               winner.point, normal);
+            if (point) {
+                anchored_patches[index] = sample_patch(
+                    *blend.view, *point, u, v, half_width, options.patch_size);
+                usable[index] = anchored_patches[index].valid;
+            }
+            continue;
+        }
         // The saddle is validated as a printed checker unless the marker's
         // pattern is already known: a recorded cross, or an untyped marker
         // that validated in another view. A circular target still requires
@@ -1854,7 +2083,12 @@ std::optional<MarkerEdit> apply_winner(const std::vector<BlendView>& blends,
         }
         Eigen::Vector2d refined = anchored[i];
         const double limit = refinement_limit(blend);
-        if (mean_count > 0 && usable[i]) {
+        // A verified disc's centre is the printed fiducial, fitted from the
+        // disk's complete outer border (and confirmed by the concentric dot).
+        // The Lucas-Kanade step aligns the patch to the mean template, which
+        // for a small disc is dominated by the surrounding ground; it can only
+        // add noise to an already sub-pixel centre, so it is skipped.
+        if (!blend.verified_circle && mean_count > 0 && usable[i]) {
             const auto shift =
                 lk_shift(*blend.view, anchored_patches[i], mean,
                          options.max_iterations, options.tolerance_px);
@@ -1935,9 +2169,13 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
         // target-like feature is a centre dot.
         if (blend.model == TargetModel::Circular || !checker_evidence) {
             blend.seed = circular_seed(*blend.view, blend.pixel, patch_size, 0.0,
-                                       blend.coded_circular,
+                                       blend.coded_circular, blend.plain_disc,
                                        blend.target_kind_known);
         }
+        // A verified disc (outer border plus, when present, the concentric
+        // centre dot) is a printed fiducial, so its fitted centre is the
+        // measurement and its radius is the target scale.
+        blend.verified_circle = blend.seed && blend.seed->verified_circle;
         const double blob_radius =
             blend.seed && std::isfinite(blend.seed->radius) &&
                     blend.seed->radius > 0.0
@@ -1977,7 +2215,7 @@ void fill_scales(std::vector<BlendView>& blends, int patch_size) {
         const bool circular_declared = blend.model == TargetModel::Circular;
         const bool blob_specific =
             blob_radius > 0.0 && blend.seed &&
-            (blend.seed->centre_dot ||
+            (blend.seed->centre_dot || blend.seed->verified_circle ||
              (circular_declared &&
               (blend.seed->border_fitted || blend.seed->light_centre)));
         blend.scale_specific = checker_evidence || blob_specific;
@@ -2003,6 +2241,18 @@ MarkerEdit refine_2d_marker(std::vector<BlendView>& blends,
         // A single view has no consensus to supply a candidate, so the click
         // is the anchor and only a small correction is trusted.
         const double limit = refinement_limit(blend);
+        // A verified disc's fitted centre is the printed fiducial; the generic
+        // first-edge ellipse refit would lock onto the small centre dot and
+        // undo the border fit, so it is used directly.
+        if (blend.verified_circle && blend.seed) {
+            success = true;
+            const double shift = (blend.seed->pixel - blend.pixel).norm();
+            if (shift > 1e-9 && shift <= maximum_shift(blend)) {
+                edit.moves.push_back({blend.view->camera->id, blend.seed->pixel});
+                edit.touched = true;
+            }
+            continue;
+        }
         const bool allow_ellipse =
             blend.model == TargetModel::Circular ||
             (blend.seed && blend.seed->centre_dot);
@@ -2719,6 +2969,13 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
         // closest-to-the-click answer, never a deletion.
         const bool coded_circular =
             !target_kind_known || is_circular_coded_target_type(*target_kind);
+        // A recorded non-coded circular target ("Circular"/"CircularTarget")
+        // is a plain printed disc: its fiducial is the disk's outer border,
+        // not a sector ring. An untyped marker is NOT assumed to be a disc
+        // (it may be a checker), so it keeps the coded seed path.
+        const bool plain_disc =
+            target_kind_known && is_circular_target_type(*target_kind) &&
+            !is_circular_coded_target_type(*target_kind);
         std::vector<std::shared_ptr<CameraView>> held;
         std::vector<BlendView> blends;
         blends.reserve(marker.projections.size());
@@ -2740,6 +2997,7 @@ RefineMarkersPlan plan_refine_markers(const Document& document,
             blend.view = held.back().get();
             blend.pixel = projection.pixel;
             blend.coded_circular = coded_circular;
+            blend.plain_disc = plain_disc;
             blend.target_kind_known = target_kind_known;
             blend.model = model;
             blends.push_back(blend);
