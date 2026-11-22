@@ -853,7 +853,7 @@ TEST_F(ProjectV2, AttributeVocabulary) {
 
     expect_same_vocabulary(attributes, expected_attributes(),
                            "doc.xml attribute vocabulary");
-    EXPECT_EQ(expected_attributes().size(), 232U);
+    EXPECT_EQ(expected_attributes().size(), 234U);
     expect_reader_understands(document, archive);
 }
 
@@ -1197,7 +1197,7 @@ TEST_F(ProjectV2, SidecarMagicsAreDistinct) {
     // magic-tagged sidecar whose four-byte magic is one of the documented ones.
     // A mislabelled entry (a decoder reading a different layout) cannot pass.
     const std::set<std::string> known = {"AKP1", "AMT1", "ATR2", "ADM1", "ADM2", "ADM3",
-                                         "APC1", "AMS2", "AOL1", "AMK1", "ASH1",
+                                         "APC1", "AMS2", "AOL1", "AES1", "AMK1", "ASH1",
                                          "ATJ1", "AFR1", "ATM1"};
     std::set<std::string> seen;
     std::size_t sidecars = 0;
