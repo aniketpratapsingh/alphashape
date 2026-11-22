@@ -2759,12 +2759,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             // the output (only this block's own region is copied out).
             std::vector<std::int32_t> seed;
             std::vector<std::uint8_t> frozen;
-            // `result.labels` is allocated at the first block's interior copy,
-            // which runs AFTER this pin loop, so on the very first block it is
-            // still empty. There is nothing to inherit then (no earlier block has
-            // run), so the pin pass is skipped entirely rather than reading an
-            // empty vector.
-            if (plan.block_cells > 0 && !result.labels.empty()) {
+            if (plan.block_cells > 0) {
                 const std::size_t window_cells =
                     static_cast<std::size_t>(window.width) * static_cast<std::size_t>(window.height);
                 seed.assign(window_cells, -1);
@@ -2773,56 +2768,27 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                 // the margin the seam optimiser itself operates over, so its own
                 // multi-scale pass still has free cells to work in.
                 const int pin_band = std::max(1, ortho::pyramid_support_cells(plan.levels));
-                // The band of this block's own region that the previous block's
-                // margin decided. It must cover the blend's read reach on BOTH
-                // sides of the border: the blend at this block's first cell reads
-                // `pin_band` cells to its right, and the previous block's blend at
-                // its last cell read `pin_band` cells to its left, so the shared
-                // band is one support plus a small slack.
-                const int shared_band = pin_band + 2;
                 for (int row = 0; row < window.height; ++row) {
                     for (int col = 0; col < window.width; ++col) {
                         const int gx = wx0 + col;
                         const int gy = wy0 + row;
-                        // A cell is decided already when it lies in an earlier
-                        // block's own region (within the band the optimiser reads
-                        // across the border), OR in the band of an earlier block's
-                        // margin that this block now shares. The second case is
-                        // what keeps a seam continuous: the earlier block decided
-                        // that band with full context and recorded it provisionally
-                        // (see the copy-out below), so this block must honour it
-                        // rather than re-optimise the overlap and cut the camera
-                        // transition at the border.
-                        //
-                        // The shared band is L-shaped: the first `pin_band` columns
-                        // of this block's own region (gx < bx0 + pin_band) and its
-                        // first `pin_band` rows (gy < by0 + pin_band). Those are
-                        // exactly the cells the previous block's right/bottom margin
-                        // decided and this block's own region borders. The rest of
-                        // the margin is at the WINDOW edge, where a cell sees only
-                        // half its neighbourhood, so anything decided there is a
-                        // boundary artefact; leaving it free keeps the optimiser's
-                        // context intact, and those cells are never written to the
-                        // output.
+                        // Decided already iff the cell's own block precedes this
+                        // one in raster order. The right and bottom margin
+                        // belongs to later blocks and stays free.
                         const int cell_block_col = gx / side;
                         const int cell_block_row = gy / side;
                         const int cell_index = cell_block_row * columns + cell_block_col;
-                        const bool earlier_block = cell_index < block_index;
-                        const bool own_region = cell_index == block_index;
-                        // Distance to this block's own region, in cells. An earlier
-                        // block's cells are pinned only within the band nearest it;
-                        // beyond that the optimiser is free again so it can carry a
-                        // seam across the border rather than inherit wherever the
-                        // previous window's edge happened to put one.
+                        if (cell_index >= block_index) {
+                            continue;
+                        }
+                        // Distance to this block's own region, in cells. Only the
+                        // band nearest it is pinned; beyond that the optimiser is
+                        // free again so it can carry a seam across the border
+                        // rather than inherit wherever the previous window's edge
+                        // happened to put one.
                         const int dx = std::max(0, std::max(bx0 - gx, gx - (bx1 - 1)));
                         const int dy = std::max(0, std::max(by0 - gy, gy - (by1 - 1)));
-                        bool pin_here = false;
-                        if (earlier_block) {
-                            pin_here = std::max(dx, dy) <= pin_band;
-                        } else if (own_region) {
-                            pin_here = gx < bx0 + shared_band || gy < by0 + shared_band;
-                        }
-                        if (!pin_here) {
+                        if (std::max(dx, dy) > pin_band) {
                             continue;
                         }
                         const std::size_t wc = static_cast<std::size_t>(row) *
@@ -2832,17 +2798,6 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                             result.labels[static_cast<std::size_t>(gy) *
                                               static_cast<std::size_t>(grid.width) +
                                           static_cast<std::size_t>(gx)];
-                        // Only a cell an earlier block actually decided is a pin.
-                        // An earlier block's own region is always decided (>= -1);
-                        // a shared-band cell of this block's own region is decided
-                        // only where an earlier block recorded a provisional camera
-                        // (>= 0). The untouched sentinel is not a pin, so this block
-                        // optimises those cells normally.
-                        const bool decided =
-                            earlier_block ? camera_id >= -1 : camera_id >= 0;
-                        if (!decided) {
-                            continue;
-                        }
                         std::int32_t tile_index = -1;
                         if (camera_id >= 0) {
                             const auto it = camera_slot.find(camera_id);
@@ -2988,51 +2943,6 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                     result.raster.data[oc * 4 + 1] = mosaic.rgb[wc * 3 + 1];
                     result.raster.data[oc * 4 + 2] = mosaic.rgb[wc * 3 + 2];
                     result.raster.data[oc * 4 + 3] = mosaic.valid[wc] != 0 ? 255 : 0;
-                }
-            }
-
-            // Record this block's seam decision in the margin it decided but does
-            // not own: the right margin (the columns the next block to the right
-            // will pin) and the bottom margin (the rows the block below will pin).
-            // These cells belong to later blocks, which overwrite them when they
-            // run, so the final labels and colours are unchanged; the record only
-            // lets the next block pin the seam across the shared border instead of
-            // re-optimising the overlap and cutting the camera transition there.
-            // Only the band the next block pins is recorded, and only where this
-            // block actually decided a camera (a cell no camera covers is left at
-            // the sentinel, so the next block optimises it normally).
-            if (plan.block_cells > 0) {
-                // Record at least as far as the next block will pin (its shared
-                // band), so the record always covers the cells that block reads.
-                const int record_band =
-                    std::max(1, ortho::pyramid_support_cells(plan.levels)) + 2;
-                const auto record = [&](int gx, int gy) {
-                    if (gx < 0 || gy < 0 || gx >= grid.width || gy >= grid.height) {
-                        return;
-                    }
-                    const std::size_t wc =
-                        static_cast<std::size_t>(gy - wy0) *
-                            static_cast<std::size_t>(window.width) +
-                        static_cast<std::size_t>(gx - wx0);
-                    const std::int32_t label = mosaic.labels[wc];
-                    if (label < 0) {
-                        return;  // nothing decided here; leave the sentinel
-                    }
-                    const std::size_t oc =
-                        static_cast<std::size_t>(gy) * static_cast<std::size_t>(grid.width) +
-                        static_cast<std::size_t>(gx);
-                    result.labels[oc] =
-                        cameras[block_cameras[static_cast<std::size_t>(label)]].camera_id;
-                };
-                for (int row = by0; row < by1; ++row) {
-                    for (int col = bx1; col < std::min(grid.width, bx1 + record_band); ++col) {
-                        record(col, row);
-                    }
-                }
-                for (int row = by1; row < std::min(grid.height, by1 + record_band); ++row) {
-                    for (int col = bx0; col < bx1; ++col) {
-                        record(col, row);
-                    }
                 }
             }
         }
