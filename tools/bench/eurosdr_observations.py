@@ -202,6 +202,22 @@ UNNAMED_STATION_LABEL = "UNNAMED"
 # reason in the summary and the run output, and never silently kept.
 MIN_INTERSECTION_IMAGES = 3
 MIN_BASELINE_HEIGHT_RATIO = 0.1
+# A pair of views only seeds a candidate triangulation when its rays cross at a
+# usable angle. Two consecutive frames of a nadir strip (~2 m apart at ~55 m
+# range) subtend ~2 deg and leave the depth almost undetermined: a position
+# fitted from such a pair collapses onto it, and the residual gate then rejects
+# the well-spread views that disagree (the A3 regression). 5 deg is just under
+# the atan(0.1) ~ 5.7 deg the exclusion rule calls well conditioned, so it drops
+# the degenerate pairs while keeping every cross-strip pair.
+MIN_PARALLAX_DEG = 5.0
+# The distortion inversion is a fixed-point iteration on the Brown-Conrady map.
+# At the P4 RTK coefficients it converges to well under 0.01 px in a handful of
+# steps, so the loop is bounded rather than run to a tolerance.
+UNDISTORT_ITERATIONS = 8
+# Re-fitting a consensus position on its inliers is repeated a small number of
+# times: the inlier set is stable after one or two passes, and the bound keeps a
+# pathological station from looping.
+CONSENSUS_REFIT_PASSES = 3
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +464,314 @@ def apparent_target_radius_px(calibration, depth_m):
 
 
 # ---------------------------------------------------------------------------
+# Multi-view triangulation by consensus (pure; no engine, no numpy)
+# ---------------------------------------------------------------------------
+#
+# The engine triangulates a marker from the views it refined, and the script
+# used to trust that single position. When the refined subset happens to hold a
+# degenerate pair (two consecutive frames) or a consistent wrong detection, the
+# position collapses onto that subset and the residual gate then rejects the
+# correct majority that disagrees with it (the A3 regression: 7 accepted views
+# fell to 2, the survivors a consecutive pair at 0.26 px). The helpers below
+# instead triangulate from ALL detected views by consensus: candidate positions
+# from pairs and from the all-ray least-squares fit, each scored by how many
+# detected views reproject within the residual limit, the best candidate re-fit
+# on its inliers. The majority wins; the degenerate pair and the wrong
+# detections become the outliers.
+
+
+def _mat3_inverse(matrix):
+    """Inverse of a 3x3 nested list, or ``None`` when it is singular."""
+    (a, b, c), (d, e, f), (g, h, i) = matrix
+    cofactor00 = e * i - f * h
+    cofactor01 = f * g - d * i
+    cofactor02 = d * h - e * g
+    determinant = a * cofactor00 + b * cofactor01 + c * cofactor02
+    if determinant == 0.0 or not math.isfinite(determinant):
+        return None
+    inverse = 1.0 / determinant
+    return [
+        [cofactor00 * inverse, (c * h - b * i) * inverse, (b * f - c * e) * inverse],
+        [cofactor01 * inverse, (a * i - c * g) * inverse, (c * d - a * f) * inverse],
+        [cofactor02 * inverse, (b * g - a * h) * inverse, (a * e - b * d) * inverse],
+    ]
+
+
+def _mat3_apply(matrix, vector):
+    """``matrix @ vector`` for a 3x3 nested list and a 3-tuple."""
+    return tuple(matrix[row][0] * vector[0] + matrix[row][1] * vector[1]
+                 + matrix[row][2] * vector[2] for row in range(3))
+
+
+def _mat3_transpose_apply(matrix, vector):
+    """``matrix.T @ vector`` for a 3x3 nested list and a 3-tuple."""
+    return tuple(matrix[0][col] * vector[0] + matrix[1][col] * vector[1]
+                 + matrix[2][col] * vector[2] for col in range(3))
+
+
+def _dot(left, right):
+    return left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+
+
+def _sub(left, right):
+    return (left[0] - right[0], left[1] - right[1], left[2] - right[2])
+
+
+def _norm(vector):
+    return math.sqrt(_dot(vector, vector))
+
+
+def _normalise(vector):
+    length = _norm(vector)
+    if not (length > 0.0):
+        return None
+    return (vector[0] / length, vector[1] / length, vector[2] / length)
+
+
+def _cross(left, right):
+    return (left[1] * right[2] - left[2] * right[1],
+            left[2] * right[0] - left[0] * right[2],
+            left[0] * right[1] - left[1] * right[0])
+
+
+def undistort_pixel(pixel, calibration):
+    """Invert the Brown-Conrady map: a pixel back to a normalised ray.
+
+    ``project_point`` maps a normalised camera ray ``(xs, ys)`` through the
+    distortion polynomial and the intrinsics to a pixel. Triangulation needs the
+    inverse: the undistorted normalised coordinates whose projection is
+    ``pixel``. The distortion is inverted by fixed-point iteration (start from
+    the distorted coordinates, subtract the distortion each step), which
+    converges for the small radial terms a drone lens carries. Returns
+    ``(xs, ys)`` or ``None`` when the calibration has no focal length.
+    """
+    focal = float(calibration.get("f", 0.0))
+    if not (focal > 0.0):
+        return None
+    width = float(calibration.get("width", 0))
+    height = float(calibration.get("height", 0))
+    b1 = float(calibration.get("b1", 0.0))
+    b2 = float(calibration.get("b2", 0.0))
+    # project_point: u = w/2 + cx + xd*(f+b1) + yd*b2, v = h/2 + cy + yd*f.
+    # Solve that 2x2 system for the distorted coordinates (xd, yd).
+    du = pixel[0] - (width * 0.5 + float(calibration.get("cx", 0.0)))
+    dv = pixel[1] - (height * 0.5 + float(calibration.get("cy", 0.0)))
+    yd = dv / focal
+    xd = (du - yd * b2) / (focal + b1)
+    k1 = float(calibration.get("k1", 0.0))
+    k2 = float(calibration.get("k2", 0.0))
+    k3 = float(calibration.get("k3", 0.0))
+    k4 = float(calibration.get("k4", 0.0))
+    p1 = float(calibration.get("p1", 0.0))
+    p2 = float(calibration.get("p2", 0.0))
+    p3 = float(calibration.get("p3", 0.0))
+    p4 = float(calibration.get("p4", 0.0))
+    xs, ys = xd, yd
+    for _ in range(UNDISTORT_ITERATIONS):
+        r2 = xs * xs + ys * ys
+        r4 = r2 * r2
+        radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r4 * r2 + k4 * r4 * r4
+        if p3 != 0.0 or p4 != 0.0:
+            q1 = p1 + p3 * r2
+            q2 = p2 + p4 * r2
+        else:
+            q1, q2 = p1, p2
+        dx = xs * radial + q1 * (r2 + 2.0 * xs * xs) + 2.0 * q2 * xs * ys
+        dy = ys * radial + q2 * (r2 + 2.0 * ys * ys) + 2.0 * q1 * xs * ys
+        xs += xd - dx
+        ys += yd - dy
+    if not (math.isfinite(xs) and math.isfinite(ys)):
+        return None
+    return (xs, ys)
+
+
+def camera_ray(pixel, pose, calibration):
+    """The world-space ray through ``pixel``: ``(origin, direction)`` or ``None``.
+
+    ``pose`` is the world->camera transform ``[A | b]`` (``X_cam = A X_world +
+    b``), the same matrix ``project_point`` reads. The camera centre is
+    ``-A^-1 b``; the ray direction is the camera-frame ray ``(xs, ys, 1)`` mapped
+    back to world space by ``A^-1``. Returns ``None`` when the pose is singular
+    or the pixel cannot be undistorted.
+    """
+    normalised = undistort_pixel(pixel, calibration)
+    if normalised is None:
+        return None
+    rotation = [[float(pose[row][col]) for col in range(3)] for row in range(3)]
+    translation = (float(pose[0][3]), float(pose[1][3]), float(pose[2][3]))
+    inverse = _mat3_inverse(rotation)
+    if inverse is None:
+        return None
+    centre = _mat3_apply(inverse, (-translation[0], -translation[1], -translation[2]))
+    direction = _mat3_apply(inverse, (normalised[0], normalised[1], 1.0))
+    direction = _normalise(direction)
+    if direction is None:
+        return None
+    return (centre, direction)
+
+
+def ray_parallax_deg(ray_a, ray_b):
+    """The angle between two rays' directions, in degrees."""
+    cosine = _dot(ray_a[1], ray_b[1])
+    cosine = max(-1.0, min(1.0, cosine))
+    return math.degrees(math.acos(cosine))
+
+
+def triangulate_rays(rays):
+    """Least-squares point closest to every ray, or ``None``.
+
+    Each ray is ``(origin, direction)`` with a unit direction. The point that
+    minimises the summed squared distance to the rays solves the normal
+    equations ``(sum (I - d d^T)) X = sum (I - d d^T) o``. Returns ``None`` when
+    the system is singular (all rays parallel, i.e. no parallax) or fewer than
+    two rays are supplied.
+    """
+    rays = list(rays)
+    if len(rays) < 2:
+        return None
+    normal = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    rhs = [0.0, 0.0, 0.0]
+    for origin, direction in rays:
+        for row in range(3):
+            for col in range(3):
+                normal[row][col] += (1.0 if row == col else 0.0) \
+                    - direction[row] * direction[col]
+        projected = _mat3_apply(
+            [[(1.0 if row == col else 0.0) - direction[row] * direction[col]
+              for col in range(3)] for row in range(3)], origin)
+        for row in range(3):
+            rhs[row] += projected[row]
+    inverse = _mat3_inverse(normal)
+    if inverse is None:
+        return None
+    point = _mat3_apply(inverse, tuple(rhs))
+    if not all(math.isfinite(value) for value in point):
+        return None
+    return point
+
+
+def reprojection_residual_px(point, pixel, pose, calibration):
+    """Distance in pixels between ``point``'s projection and ``pixel``.
+
+    Returns ``None`` when the point does not project into the camera (behind it
+    or outside the frame), which is itself a rejection signal.
+    """
+    projected = project_point(point, pose, calibration)
+    if projected is None:
+        return None
+    return math.hypot(projected[0] - pixel[0], projected[1] - pixel[1])
+
+
+def residual_limit_px(target_radius_px):
+    """The residual gate: ``max(MIN_RESIDUAL_PX, 0.5 * target_radius_px)``.
+
+    The same limit :func:`accept_observation` applies, exposed so the consensus
+    scores candidates with exactly the gate the acceptance uses.
+    """
+    return max(MIN_RESIDUAL_PX, 0.5 * target_radius_px)
+
+
+def consensus_triangulation(views, calibrations, poses, target_radius_px):
+    """Triangulate a station from all its detected views by consensus.
+
+    ``views`` is a list of ``{"camera", "px", "py"}`` detected observations; a
+    view may also carry its own ``target_radius_px``, which sets that view's
+    residual limit (otherwise ``target_radius_px`` is used for every view).
+    ``calibrations`` and ``poses`` map a camera label to its calibration dict
+    and world->camera pose. A single triangulation from a chosen subset can
+    collapse onto a degenerate pair or a consistent wrong detection, and the
+    residual gate then rejects the correct majority (the A3 regression). This
+    instead:
+
+    1. builds a ray per view (``camera_ray``);
+    2. forms candidate positions from every pair whose rays cross by at least
+       :data:`MIN_PARALLAX_DEG`, plus the all-ray least-squares fit;
+    3. scores each candidate by how many views reproject within
+       :func:`residual_limit_px` (each view's own limit);
+    4. keeps the candidate with the most inliers (ties: the smaller summed
+       residual) and re-fits on its inliers, repeating until the inlier set is
+       stable.
+
+    Returns ``(position, inlier_cameras)`` where ``position`` is the re-fit
+    chunk-local point and ``inlier_cameras`` the set of camera labels that
+    reproject within the limit of it, or ``(None, set())`` when no candidate has
+    at least two inliers (no usable consensus). Pure: no engine, no numpy.
+    """
+    rays = {}
+    view_by_camera = {}
+    for view in views:
+        camera = view["camera"]
+        calibration = calibrations.get(camera)
+        pose = poses.get(camera)
+        if calibration is None or pose is None:
+            continue
+        ray = camera_ray((view["px"], view["py"]), pose, calibration)
+        if ray is not None:
+            rays[camera] = ray
+            view_by_camera[camera] = view
+    if len(rays) < 2:
+        return None, set()
+    cameras = list(rays)
+
+    def score(point):
+        inliers = []
+        total = 0.0
+        for camera in cameras:
+            view = view_by_camera[camera]
+            residual = reprojection_residual_px(
+                point, (view["px"], view["py"]), poses[camera],
+                calibrations[camera])
+            limit = residual_limit_px(
+                view.get("target_radius_px", target_radius_px))
+            if residual is not None and residual <= limit:
+                inliers.append(camera)
+                total += residual
+        return inliers, total
+
+    candidates = []
+    for i in range(len(cameras)):
+        for j in range(i + 1, len(cameras)):
+            ray_a = rays[cameras[i]]
+            ray_b = rays[cameras[j]]
+            if ray_parallax_deg(ray_a, ray_b) < MIN_PARALLAX_DEG:
+                continue
+            point = triangulate_rays([ray_a, ray_b])
+            if point is not None:
+                candidates.append(point)
+    all_rays_point = triangulate_rays(rays.values())
+    if all_rays_point is not None:
+        candidates.append(all_rays_point)
+    if not candidates:
+        return None, set()
+
+    best_point = None
+    best_inliers = []
+    best_total = float("inf")
+    for point in candidates:
+        inliers, total = score(point)
+        if (len(inliers) > len(best_inliers)
+                or (len(inliers) == len(best_inliers) and total < best_total)):
+            best_point, best_inliers, best_total = point, inliers, total
+    if len(best_inliers) < 2:
+        return None, set()
+
+    # Re-fit on the inliers until the set is stable, so the position is the
+    # least-squares fit of the views that actually agree with it.
+    for _ in range(CONSENSUS_REFIT_PASSES):
+        refit = triangulate_rays([rays[camera] for camera in best_inliers])
+        if refit is None:
+            break
+        inliers, total = score(refit)
+        if len(inliers) < 2:
+            break
+        if set(inliers) == set(best_inliers):
+            best_point = refit
+            break
+        best_point, best_inliers, best_total = refit, inliers, total
+    return best_point, set(best_inliers)
+
+
+# ---------------------------------------------------------------------------
 # Acceptance and output
 # ---------------------------------------------------------------------------
 
@@ -613,9 +937,9 @@ def summarise(stations, observations, per_point, centres=None, local=None):
     the pixel DetectMarkers found), ``refine_shift_px`` (the refinement's move
     from that detected pixel), ``target_radius_px`` and ``accepted``. The
     summary reports, per station, the number of views projected, the number
-    accepted, the mean and maximum detection shift and residual, and the role. A
-    station with no views is listed with zero counts so a point that was never
-    seen is visible rather than absent.
+    accepted, the mean and maximum detection shift and residual, the consensus
+    inlier count, and the role. A station with no views is listed with zero
+    counts so a point that was never seen is visible rather than absent.
 
     ``centres`` maps an image label to its camera centre and ``local`` maps a
     station label to its chunk-local position. When both are supplied, each
@@ -638,6 +962,12 @@ def summarise(stations, observations, per_point, centres=None, local=None):
                      if view.get("residual_px") is not None
                      and math.isfinite(view["residual_px"])]
         images = sorted(view["image"] for view in accepted)
+        # The consensus inlier count is the number of detected views that
+        # reproject onto the triangulated position within the residual limit;
+        # it is the same for every record of a station, so the first is read.
+        consensus_inliers = next(
+            (view["consensus_inliers"] for view in views
+             if "consensus_inliers" in view), 0)
         reason = None
         if centres is not None and local is not None and label in local:
             reason = intersection_exclusion(
@@ -648,6 +978,7 @@ def summarise(stations, observations, per_point, centres=None, local=None):
             "role": station["role"],
             "views_projected": len(views),
             "views_accepted": len(accepted),
+            "consensus_inliers": consensus_inliers,
             "mean_shift_px": (sum(shifts) / len(shifts)) if shifts else None,
             "max_shift_px": max(shifts) if shifts else None,
             "mean_residual_px": (sum(residuals) / len(residuals)) if residuals else None,
@@ -1043,23 +1374,35 @@ def refine_and_collect(chunk, stations, detected, per_point, refine_options,
     target was detected in 50 cameras but refined in 16 could never exceed 16
     observations, and the 16 closest observers formed a tight cluster whose
     triangulation was ill-conditioned, so the residual gate then rejected most
-    of even those. Here the triangulated position (from the well-spread refined
-    set) is the reference for ALL detected views: each detected pixel is
-    accepted when it is within the search radius of the projection (the "right
-    target" gate: the neighbouring target is thousands of pixels away) and,
-    when the marker was triangulated, its residual against that position is
-    small. A detection that is a different target is an outlier of the
-    triangulation and its residual is large.
+    of even those. Here the consensus position (see below) is the reference for
+    ALL detected views: each detected pixel is accepted when it is within the
+    search radius of the projection (the "right target" gate: the neighbouring
+    target is thousands of pixels away) and, when the station was triangulated,
+    its residual against that position is small. A detection that is a different
+    target is an outlier of the triangulation and its residual is large.
 
-    A marker the refinement could not triangulate (no consensus, or too few
-    views) keeps its surveyed reference as ``position``; the residual against
-    that reference is the block's own georeference error (~16 px), which is NOT
-    a wrong-target signal, so the residual gate is skipped for it and the
-    detected pixel is written as measured.
+    The reference position is NOT the engine's single triangulation of the
+    refined subset. That triangulation can collapse onto a degenerate pair (two
+    consecutive frames) or a consistent wrong detection, and the residual gate
+    then rejects the correct majority that disagrees with it — the A3
+    regression, where 7 accepted views fell to 2, the survivors a consecutive
+    pair at 0.26 px. Instead the position is triangulated by consensus over ALL
+    detected views (:func:`consensus_triangulation`): the candidate that the
+    most detected views reproject onto within the residual limit wins, and it is
+    re-fit on those inliers. The majority — the correct target seen across many
+    views — sets the position; the degenerate pair and the wrong detections are
+    the outliers the gate then drops. The inlier count is recorded per station.
+
+    A station the consensus cannot triangulate (fewer than two agreeing views)
+    falls back to the engine's position when it triangulated one, and otherwise
+    keeps its surveyed reference; the residual against that reference is the
+    block's own georeference error (~16 px), which is NOT a wrong-target signal,
+    so the residual gate is skipped for it and the detected pixel is written as
+    measured.
 
     ``calibrations`` and ``poses`` map a camera label to its calibration dict
     and 4x4 pose, so the residual of each detected projection against the
-    triangulated marker position is computed here without another engine call.
+    consensus position is computed here without another engine call.
     Returns ``(observations, per_point, refine_meta)`` where ``observations``
     maps a station label to the accepted ``{"image", "px", "py"}`` rows and
     ``refine_meta`` is the engine's own ``refine_markers.*`` diagnostics.
@@ -1115,12 +1458,38 @@ def refine_and_collect(chunk, stations, detected, per_point, refine_options,
         triangulated[marker.label] = (
             new is not None and (old is None or
                                  math.dist(old, new) > 1e-6))
+    # The consensus position per station, from ALL detected views. This is the
+    # reference the residual gate uses, not the engine's single triangulation of
+    # the refined subset (which can collapse onto a degenerate pair — the A3
+    # regression). A station the consensus cannot triangulate falls back to the
+    # engine's position when it triangulated one.
+    consensus = {}
+    consensus_inliers = {}
+    for station in stations:
+        label = station["label"]
+        views = [{"camera": record["image"],
+                  "px": record["detected_px"][0],
+                  "py": record["detected_px"][1],
+                  "target_radius_px": record["target_radius_px"]}
+                 for record in per_point.get(label, [])
+                 if record.get("detected_px") is not None]
+        radius = max((view["target_radius_px"] for view in views), default=0.0)
+        point, inliers = consensus_triangulation(
+            views, calibrations, poses, radius)
+        if point is not None:
+            consensus[label] = point
+            consensus_inliers[label] = inliers
+        elif triangulated.get(label, False):
+            consensus[label] = positions.get(label)
+            consensus_inliers[label] = set()
     observations = {}
     for station in stations:
         label = station["label"]
-        position = positions.get(label)
-        was_triangulated = triangulated.get(label, False)
+        position = consensus.get(label)
+        was_triangulated = label in consensus
+        inlier_count = len(consensus_inliers.get(label, ()))
         for record in per_point.get(label, []):
+            record["consensus_inliers"] = inlier_count
             # Only a view DetectMarkers actually found is a candidate. A view
             # that was projected but never detected has no measured pixel.
             detected_pixel = record.get("detected_px")

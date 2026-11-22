@@ -349,6 +349,35 @@ class SummaryTest(unittest.TestCase):
         # GA1 has two accepted views, which meets MIN_VIEWS_PER_POINT.
         self.assertEqual(summary["gcps_with_min_views"], 1)
 
+    def test_the_consensus_inlier_count_is_reported(self):
+        # The consensus inlier count is the same on every record of a station;
+        # the summary reports it so a station whose position was set by only a
+        # few views is visible.
+        per_point = {
+            "GA1": [
+                {"image": "a", "shift_px": 1.0, "residual_px": 0.5,
+                 "accepted": True, "consensus_inliers": 7},
+                {"image": "b", "shift_px": 1.0, "residual_px": 0.5,
+                 "accepted": True, "consensus_inliers": 7},
+            ],
+        }
+        summary = eo.summarise(self.stations(), {}, per_point)
+        ga1 = next(point for point in summary["points"] if point["label"] == "GA1")
+        self.assertEqual(ga1["consensus_inliers"], 7)
+
+    def test_a_station_without_consensus_reports_zero_inliers(self):
+        # A station whose records carry no consensus count (never triangulated)
+        # reports zero rather than raising.
+        per_point = {
+            "GA1": [
+                {"image": "a", "shift_px": 1.0, "residual_px": None,
+                 "accepted": False},
+            ],
+        }
+        summary = eo.summarise(self.stations(), {}, per_point)
+        ga1 = next(point for point in summary["points"] if point["label"] == "GA1")
+        self.assertEqual(ga1["consensus_inliers"], 0)
+
     def test_a_station_with_no_views_is_listed_with_zero(self):
         summary = eo.summarise(self.stations(), {}, {})
         self.assertEqual(summary["views_projected"], 0)
@@ -790,6 +819,286 @@ class IntersectionExclusionTest(unittest.TestCase):
         self.assertAlmostEqual(eo.MIN_BASELINE_HEIGHT_RATIO, 0.1, places=9)
 
 
+class _NadirBlock:
+    """A synthetic nadir block: cameras on a grid looking straight down.
+
+    The world->camera pose is ``X_cam = A X_world + b`` with ``A = diag(1, 1,
+    -1)`` and ``b = (-cx, -cy, z)``, so a camera at ``(cx, cy, z)`` looking down
+    sees the ground point ``(x, y, 0)`` at camera coordinates ``(x - cx, y - cy,
+    z)`` (depth ``z``, positive). This is the same pose convention
+    ``project_point`` reads, so the helpers under test are exercised through the
+    real projection.
+    """
+
+    def __init__(self, z=55.0, focal=3000.0, width=4000, height=3000):
+        self.z = z
+        self.calibration = {
+            "type": "frame", "width": width, "height": height, "f": focal,
+            "cx": 0.0, "cy": 0.0, "b1": 0.0, "b2": 0.0,
+            "k1": 0.0, "k2": 0.0, "k3": 0.0, "k4": 0.0,
+            "p1": 0.0, "p2": 0.0, "p3": 0.0, "p4": 0.0,
+        }
+
+    def pose(self, cx, cy):
+        return [[1.0, 0.0, 0.0, -cx],
+                [0.0, 1.0, 0.0, -cy],
+                [0.0, 0.0, -1.0, self.z],
+                [0.0, 0.0, 0.0, 1.0]]
+
+    def views(self, cameras, point):
+        """Detected views of ``point`` from each ``(cx, cy)`` camera."""
+        views = []
+        for index, (cx, cy) in enumerate(cameras):
+            pixel = eo.project_point(point, self.pose(cx, cy), self.calibration)
+            views.append({"camera": f"cam{index}", "px": pixel[0], "py": pixel[1]})
+        return views
+
+    def calibrations(self, count):
+        return {f"cam{index}": self.calibration for index in range(count)}
+
+    def poses(self, cameras):
+        return {f"cam{index}": self.pose(cx, cy)
+                for index, (cx, cy) in enumerate(cameras)}
+
+
+class UndistortPixelTest(unittest.TestCase):
+    """The pixel -> ray inverse must undo the forward projection."""
+
+    def test_a_pixel_round_trips_through_the_projection(self):
+        block = _NadirBlock()
+        point = (3.0, -2.0, 0.0)
+        pose = block.pose(0.0, 0.0)
+        pixel = eo.project_point(point, pose, block.calibration)
+        normalised = eo.undistort_pixel(pixel, block.calibration)
+        # The camera-frame ray (xs, ys, 1) scaled by the depth must recover the
+        # point relative to the camera centre.
+        depth = block.z
+        self.assertAlmostEqual(normalised[0] * depth, point[0], places=6)
+        self.assertAlmostEqual(normalised[1] * depth, point[1], places=6)
+
+    def test_a_radial_distortion_round_trips(self):
+        # A non-zero k1 must be inverted, not ignored: the undistorted ray
+        # reprojects to the same pixel.
+        block = _NadirBlock()
+        block.calibration["k1"] = -0.05
+        point = (8.0, 5.0, 0.0)
+        pose = block.pose(0.0, 0.0)
+        pixel = eo.project_point(point, pose, block.calibration)
+        normalised = eo.undistort_pixel(pixel, block.calibration)
+        reprojected = eo.project_point(
+            (normalised[0] * block.z, normalised[1] * block.z, 0.0),
+            pose, block.calibration)
+        self.assertAlmostEqual(reprojected[0], pixel[0], places=4)
+        self.assertAlmostEqual(reprojected[1], pixel[1], places=4)
+
+    def test_a_calibration_without_focal_length_has_no_ray(self):
+        block = _NadirBlock()
+        block.calibration["f"] = 0.0
+        self.assertIsNone(eo.undistort_pixel((100.0, 100.0), block.calibration))
+
+
+class CameraRayTest(unittest.TestCase):
+    """The ray must start at the camera centre and pass through the pixel."""
+
+    def test_the_ray_origin_is_the_camera_centre(self):
+        block = _NadirBlock()
+        pose = block.pose(10.0, -5.0)
+        pixel = eo.project_point((0.0, 0.0, 0.0), pose, block.calibration)
+        origin, _direction = eo.camera_ray(pixel, pose, block.calibration)
+        self.assertAlmostEqual(origin[0], 10.0, places=6)
+        self.assertAlmostEqual(origin[1], -5.0, places=6)
+        self.assertAlmostEqual(origin[2], block.z, places=6)
+
+    def test_the_ray_points_at_the_projected_point(self):
+        block = _NadirBlock()
+        pose = block.pose(0.0, 0.0)
+        point = (4.0, 3.0, 0.0)
+        pixel = eo.project_point(point, pose, block.calibration)
+        origin, direction = eo.camera_ray(pixel, pose, block.calibration)
+        # The point lies on the ray: (point - origin) is parallel to direction.
+        delta = (point[0] - origin[0], point[1] - origin[1], point[2] - origin[2])
+        length = math.sqrt(sum(component * component for component in delta))
+        for got, want in zip(delta, direction):
+            self.assertAlmostEqual(got / length, want, places=6)
+
+    def test_a_singular_pose_has_no_ray(self):
+        block = _NadirBlock()
+        singular = [[0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0]]
+        self.assertIsNone(eo.camera_ray((100.0, 100.0), singular,
+                                        block.calibration))
+
+
+class TriangulateRaysTest(unittest.TestCase):
+    """The least-squares intersection must recover a point from its rays."""
+
+    def test_two_crossing_rays_meet_at_the_point(self):
+        block = _NadirBlock()
+        point = (0.0, 0.0, 0.0)
+        cameras = [(0.0, 0.0), (20.0, 0.0)]
+        poses = block.poses(cameras)
+        rays = []
+        for index, (cx, cy) in enumerate(cameras):
+            pixel = eo.project_point(point, poses[f"cam{index}"], block.calibration)
+            rays.append(eo.camera_ray(pixel, poses[f"cam{index}"], block.calibration))
+        recovered = eo.triangulate_rays(rays)
+        for got, want in zip(recovered, point):
+            self.assertAlmostEqual(got, want, places=6)
+
+    def test_parallel_rays_have_no_intersection(self):
+        # Two cameras at the same place looking the same way: no parallax, so
+        # the normal equations are singular.
+        block = _NadirBlock()
+        pose = block.pose(0.0, 0.0)
+        pixel = eo.project_point((0.0, 0.0, 0.0), pose, block.calibration)
+        ray = eo.camera_ray(pixel, pose, block.calibration)
+        self.assertIsNone(eo.triangulate_rays([ray, ray]))
+
+    def test_fewer_than_two_rays_has_no_intersection(self):
+        block = _NadirBlock()
+        pose = block.pose(0.0, 0.0)
+        pixel = eo.project_point((0.0, 0.0, 0.0), pose, block.calibration)
+        ray = eo.camera_ray(pixel, pose, block.calibration)
+        self.assertIsNone(eo.triangulate_rays([ray]))
+
+
+class ConsensusTriangulationTest(unittest.TestCase):
+    """The consensus must recover the correct target and reject the outliers.
+
+    This is the A3 regression in miniature: a correct target seen in many
+    well-spread views, plus a degenerate consecutive pair and a few
+    wrong-target detections. A single triangulation from the wrong subset
+    collapses onto it; the consensus must instead recover the correct position
+    from the majority and report the outliers as non-inliers.
+    """
+
+    def test_the_correct_target_is_recovered_from_the_majority(self):
+        block = _NadirBlock()
+        target = (0.0, 0.0, 0.0)
+        cameras = [(0.0, 0.0), (12.0, 0.0), (-12.0, 0.0), (0.0, 12.0),
+                   (0.0, -12.0), (9.0, 9.0), (-9.0, -9.0)]
+        views = block.views(cameras, target)
+        point, inliers = eo.consensus_triangulation(
+            views, block.calibrations(len(cameras)), block.poses(cameras), 10.0)
+        self.assertIsNotNone(point)
+        for got, want in zip(point, target):
+            self.assertAlmostEqual(got, want, places=5)
+        self.assertEqual(len(inliers), len(cameras))
+
+    def test_wrong_target_detections_are_rejected(self):
+        block = _NadirBlock()
+        target = (0.0, 0.0, 0.0)
+        wrong = (20.0, 0.0, 0.0)
+        # Seven cameras see the correct target; two more see a different one.
+        correct_cameras = [(0.0, 0.0), (12.0, 0.0), (-12.0, 0.0), (0.0, 12.0),
+                           (0.0, -12.0), (9.0, 9.0), (-9.0, -9.0)]
+        wrong_cameras = [(6.0, 0.0), (-6.0, 0.0)]
+        cameras = correct_cameras + wrong_cameras
+        views = block.views(correct_cameras, target)
+        # The wrong detections are on their own cameras (cam7, cam8).
+        wrong_views = block.views(wrong_cameras, wrong)
+        for index, view in enumerate(wrong_views):
+            view["camera"] = f"cam{len(correct_cameras) + index}"
+        views.extend(wrong_views)
+        point, inliers = eo.consensus_triangulation(
+            views, block.calibrations(len(cameras)), block.poses(cameras), 10.0)
+        for got, want in zip(point, target):
+            self.assertAlmostEqual(got, want, places=5)
+        # The wrong detections are not inliers; the correct views are.
+        self.assertEqual(len(inliers), len(correct_cameras))
+        self.assertNotIn("cam7", inliers)
+        self.assertNotIn("cam8", inliers)
+
+    def test_a_degenerate_pair_does_not_win(self):
+        # Two consecutive frames (a tiny baseline) plus a well-spread set. The
+        # pair's own triangulation is ill-conditioned, but the consensus must
+        # still recover the target from the majority, not collapse onto the pair.
+        block = _NadirBlock()
+        target = (0.0, 0.0, 0.0)
+        cameras = [(0.0, 0.0), (2.0, 0.0), (12.0, 0.0), (-12.0, 0.0),
+                   (0.0, 12.0), (0.0, -12.0)]
+        views = block.views(cameras, target)
+        point, inliers = eo.consensus_triangulation(
+            views, block.calibrations(len(cameras)), block.poses(cameras), 10.0)
+        for got, want in zip(point, target):
+            self.assertAlmostEqual(got, want, places=4)
+        self.assertEqual(len(inliers), len(cameras))
+
+    def test_a_consistent_wrong_subset_does_not_win(self):
+        # A wrong target seen by only two views must lose to the correct target
+        # seen by five. The wrong pair is internally consistent (it triangulates
+        # to a real point), so only the consensus count can reject it.
+        block = _NadirBlock()
+        target = (0.0, 0.0, 0.0)
+        wrong = (30.0, 0.0, 0.0)
+        correct_cameras = [(0.0, 0.0), (12.0, 0.0), (-12.0, 0.0), (0.0, 12.0),
+                           (0.0, -12.0)]
+        wrong_cameras = [(6.0, 0.0), (-6.0, 0.0)]
+        cameras = correct_cameras + wrong_cameras
+        views = block.views(correct_cameras, target)
+        wrong_views = block.views(wrong_cameras, wrong)
+        for index, view in enumerate(wrong_views):
+            view["camera"] = f"cam{len(correct_cameras) + index}"
+        views.extend(wrong_views)
+        point, inliers = eo.consensus_triangulation(
+            views, block.calibrations(len(cameras)), block.poses(cameras), 10.0)
+        for got, want in zip(point, target):
+            self.assertAlmostEqual(got, want, places=4)
+        self.assertEqual(len(inliers), len(correct_cameras))
+
+    def test_fewer_than_two_views_has_no_consensus(self):
+        block = _NadirBlock()
+        views = block.views([(0.0, 0.0)], (0.0, 0.0, 0.0))
+        point, inliers = eo.consensus_triangulation(
+            views, block.calibrations(1), block.poses([(0.0, 0.0)]), 10.0)
+        self.assertIsNone(point)
+        self.assertEqual(inliers, set())
+
+    def test_a_view_without_a_pose_is_ignored(self):
+        block = _NadirBlock()
+        target = (0.0, 0.0, 0.0)
+        cameras = [(0.0, 0.0), (12.0, 0.0), (-12.0, 0.0)]
+        views = block.views(cameras, target)
+        views.append({"camera": "unknown", "px": 100.0, "py": 100.0})
+        point, inliers = eo.consensus_triangulation(
+            views, block.calibrations(len(cameras)), block.poses(cameras), 10.0)
+        self.assertNotIn("unknown", inliers)
+        for got, want in zip(point, target):
+            self.assertAlmostEqual(got, want, places=5)
+
+    def test_a_view_uses_its_own_residual_limit(self):
+        # A view carrying a large target radius gets a larger residual limit
+        # (0.5 * radius), so a detection that is a few px off still counts as an
+        # inlier for that view. The per-view limit is what the acceptance gate
+        # applies, so the consensus must score with it too.
+        block = _NadirBlock()
+        target = (0.0, 0.0, 0.0)
+        cameras = [(0.0, 0.0), (12.0, 0.0), (-12.0, 0.0)]
+        views = block.views(cameras, target)
+        # Nudge one view by 4 px and give it a 20 px radius (limit 10 px), so it
+        # stays an inlier; with the default 10 px radius (limit 5 px) it would
+        # also stay, so use a 6 px nudge and a 20 px radius to make the point.
+        views[0]["px"] += 6.0
+        views[0]["target_radius_px"] = 20.0
+        _point, inliers = eo.consensus_triangulation(
+            views, block.calibrations(len(cameras)), block.poses(cameras), 10.0)
+        self.assertIn("cam0", inliers)
+        self.assertEqual(len(inliers), len(cameras))
+
+
+class ResidualLimitTest(unittest.TestCase):
+    """The consensus scores with exactly the acceptance gate."""
+
+    def test_the_limit_is_the_larger_of_the_floor_and_half_a_radius(self):
+        self.assertAlmostEqual(eo.residual_limit_px(0.0), eo.MIN_RESIDUAL_PX,
+                               places=9)
+        self.assertAlmostEqual(eo.residual_limit_px(4.0), eo.MIN_RESIDUAL_PX,
+                               places=9)
+        self.assertAlmostEqual(eo.residual_limit_px(20.0), 10.0, places=9)
+
+
 class RefineAndCollectTest(unittest.TestCase):
     """Every detected view is a candidate observation, not only the refined ones.
 
@@ -928,6 +1237,44 @@ class RefineAndCollectTest(unittest.TestCase):
         accepted = [row["image"] for row in observations["A1"]]
         self.assertNotIn("cam_undetected", accepted)
         self.assertEqual(len(accepted), 3)
+
+    def test_the_consensus_overrides_a_poisoned_engine_position(self):
+        # The A3 regression end to end: the engine triangulated the marker from
+        # a degenerate pair and wrote a WRONG position, so the residual gate
+        # rejected the correct majority. The consensus over all detected views
+        # must recover the correct position and accept the correct views.
+        block = _NadirBlock()
+        target = (0.0, 0.0, 0.0)
+        cameras = [(0.0, 0.0), (12.0, 0.0), (-12.0, 0.0), (0.0, 12.0),
+                   (0.0, -12.0), (9.0, 9.0), (-9.0, -9.0)]
+        views = block.views(cameras, target)
+        # The engine's poisoned position: 5 m off the target, which is what a
+        # triangulation from a degenerate pair produces.
+        poisoned = (5.0, 0.0, 0.0)
+        chunk = self._Chunk(poisoned)
+        marker = self._Marker("A1", (0.0, 0.0, 0.0))
+        for view in views:
+            marker.projections.append(
+                self._Projection(view["camera"], view["px"], view["py"]))
+        chunk.markers = [marker]
+        stations = [{"label": "A1", "lat": 0.0, "lon": 0.0, "height": 0.0,
+                     "role": "check_point"}]
+        detected = {"A1": [{"camera": view["camera"], "px": view["px"],
+                            "py": view["py"], "target_radius_px": 10.0}
+                           for view in views]}
+        per_point = {"A1": [{"image": view["camera"], "shift_px": 1.0,
+                             "residual_px": None, "target_radius_px": 10.0,
+                             "accepted": False,
+                             "detected_px": (view["px"], view["py"])}
+                            for view in views]}
+        observations, per_point, _meta = eo.refine_and_collect(
+            chunk, stations, detected, per_point, {},
+            block.calibrations(len(cameras)), block.poses(cameras),
+            16, 60.0, centres={view["camera"]: (0.0, 0.0, 0.0) for view in views})
+        # Every correct view is accepted despite the poisoned engine position.
+        self.assertEqual(len(observations["A1"]), len(cameras))
+        # The consensus inlier count is recorded and equals the correct views.
+        self.assertEqual(per_point["A1"][0]["consensus_inliers"], len(cameras))
 
 
 class XlsxReaderTest(unittest.TestCase):

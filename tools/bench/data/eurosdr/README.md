@@ -62,8 +62,16 @@ give eight folds, the same shape as `gcp-rtk`'s five.
    the `max_views` observers that best span the station (farthest-point sampling on
    the camera centres), so the triangulation is well conditioned; **every** detected
    view is then a candidate observation, not only the refined ones.
-6. Keep only detections within the search radius of the projection and, where the
-   refinement triangulated the marker, a small reprojection residual.
+6. Triangulate each station by **consensus over all its detected views**, not from
+   the engine's single triangulation of the refined subset: candidate positions from
+   every pair with adequate parallax plus the all-ray least-squares fit are scored by
+   how many detected views reproject within the residual limit, and the best is
+   re-fit on its inliers. A single triangulation can collapse onto a degenerate pair
+   (two consecutive frames) or a consistent wrong detection, and the residual gate
+   then rejects the correct majority — the A3 regression, where 7 accepted views fell
+   to 2. The consensus keeps the majority and records the inlier count per station.
+7. Keep only detections within the search radius of the projection and, where the
+   consensus triangulated the station, a small reprojection residual.
 
 The measurement run that produced these files is GitHub Actions run
 [44642611873](https://github.com/aniketpratapsingh/alphashape/actions/runs/44642611873)

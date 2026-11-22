@@ -66,6 +66,17 @@ All notable changes to alphashape are recorded here. The format follows
   observations cannot give a well-conditioned intersection (fewer than 3 images,
   or a baseline/height ratio below 0.1) is excluded from scoring and listed with
   its reason in the run output and the JSON summary.
+- **EuroSDR observations: triangulate each station by consensus over all detected
+  views.** The measurement trusted the engine's single triangulation of the refined
+  subset, so when that subset held a degenerate pair (two consecutive frames) or a
+  consistent wrong detection the position collapsed onto it and the residual gate
+  then rejected the correct majority — station A3 fell from 7 accepted views to 2,
+  the survivors a consecutive pair at 0.26 px. The script now triangulates from all
+  detected views: candidate positions from every pair with adequate parallax plus
+  the all-ray least-squares fit are scored by how many views reproject within the
+  residual limit, and the best is re-fit on its inliers. The inlier count is
+  recorded per station. The search radius, residual limit and exclusion rule are
+  unchanged.
 
 ### Changed
 
