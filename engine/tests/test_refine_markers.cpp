@@ -1475,7 +1475,7 @@ TEST(Markers, RefineDiscWithDotSnapsToCentre) {
     RefineScene scene = make_scene(spec, 907U);
     ASSERT_TRUE(scene.targets[0].disc);
     std::mt19937 engine(41U);
-    const std::vector<std::int32_t> ids = add_all_markers(scene, 5.0, engine);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 6.0, engine);
     ASSERT_FALSE(ids.empty());
     Marker* marker = find_marker(*scene.chunk, ids[0]);
     ASSERT_NE(marker, nullptr);
@@ -1519,7 +1519,7 @@ TEST(Markers, RefinePlainBrightDiscSnapsToCentre) {
     RefineScene scene = make_scene(spec, 911U);
     ASSERT_TRUE(scene.targets[0].disc);
     std::mt19937 engine(43U);
-    const std::vector<std::int32_t> ids = add_all_markers(scene, 5.0, engine);
+    const std::vector<std::int32_t> ids = add_all_markers(scene, 6.0, engine);
     ASSERT_FALSE(ids.empty());
     Marker* marker = find_marker(*scene.chunk, ids[0]);
     ASSERT_NE(marker, nullptr);
