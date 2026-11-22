@@ -125,6 +125,29 @@ std::optional<Eigen::Vector2d> refine_border_center(const FloatImage& gray,
                                                     double expected_radius,
                                                     double* fitted_radius = nullptr);
 
+/// A fitted boundary ellipse and the quality of the fit.
+struct BoundaryFit {
+    Ellipse ellipse;
+    /// Median radial residual of the accepted edge samples, in pixels. A real
+    /// printed outline fits to a fraction of a pixel; background texture does
+    /// not, which is what lets a caller tell a disc border from a texture edge.
+    double residual_px = 0.0;
+    /// Number of radial rays that contributed an edge sample.
+    int samples = 0;
+};
+
+/// Fit a circular target's boundary and report the fit quality. This is the
+/// same iterative radial fit as refine_ellipse_center / refine_border_center,
+/// but it returns the full ellipse and its residual so a caller can decide
+/// whether the outline is a real printed border. `outermost` selects the last
+/// significant edge on each ray (a disc's outer border when a centre dot is
+/// present) instead of the first (the disc border when there is no dot).
+/// `expected_radius` is only the radial search extent.
+std::optional<BoundaryFit> fit_boundary_ellipse(const GradientField& gradient,
+                                                const Eigen::Vector2d& centre,
+                                                double expected_radius,
+                                                bool outermost = false);
+
 /// Direct least-squares ellipse fit (Fitzgibbon/Pilu/Fisher, numerically
 /// stable split form). Returns nullopt for fewer than 5 points, degenerate or
 /// non-elliptic conics.
