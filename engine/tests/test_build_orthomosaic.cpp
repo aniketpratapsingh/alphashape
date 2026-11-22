@@ -2970,8 +2970,24 @@ TEST(BuildOrthomosaic, GhostingFilterRemovesATransientObjectFromOnePhoto) {
                 object_cells == 0 ? 0.0 : without_error / static_cast<double>(object_cells),
                 object_cells == 0 ? 0.0 : filtered_error / static_cast<double>(object_cells));
     ASSERT_GT(object_cells, 10U) << "ghosting_filter=false should show the painted object";
-    EXPECT_LT(filtered_error / static_cast<double>(object_cells), 15.0)
-        << "the filtered mosaic must take the other cameras' colour at the object";
+    // The filter's contract is that the transient object is gone: no object cell
+    // may still be sourced from the camera that saw it, and every one must be
+    // re-labelled to another camera. The residual error is then the UNCORRECTED
+    // inter-camera colour difference at the object (this run uses
+    // color_correction="none"), which depends on where the seam lands and is not
+    // the ghost -- so it is asserted as a large RELATIVE drop, not an absolute
+    // grey-level bound that a seam shift can nudge over.
+    EXPECT_EQ(ghost_kept, 0U)
+        << "no object cell may still be sourced from the camera that saw the object";
+    EXPECT_EQ(labels_changed, object_cells)
+        << "every object cell must be re-labelled away from the ghosting camera";
+    const double without_mean =
+        object_cells == 0 ? 0.0 : without_error / static_cast<double>(object_cells);
+    const double filtered_mean =
+        object_cells == 0 ? 0.0 : filtered_error / static_cast<double>(object_cells);
+    EXPECT_LT(filtered_mean, 0.25 * without_mean)
+        << "the filtered mosaic must take the other cameras' colour at the object "
+           "(filtered " << filtered_mean << " vs unfiltered " << without_mean << ")";
 }
 
 // ---------------------------------------------------------------------------
