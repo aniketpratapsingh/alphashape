@@ -2567,8 +2567,8 @@ TEST(BuildOrthomosaic, BlockedMosaicHasNoColourStepAtBlockBoundaries) {
     // (b) Blocked == whole grid within a stated tolerance. The seam optimiser is
     // not separable, so a handful of pixels may legitimately differ where a seam
     // lands differently; what must not happen is a systematic disagreement. The
-    // bound is the same one the refine-off case uses: 98% of pixels within one
-    // grey level and no gross disagreement.
+    // bound is the one the existing refine-on default test uses (96% of pixels
+    // within one grey level) plus no gross disagreement.
     std::size_t pixels = 0;
     std::size_t within_one = 0;
     int worst = 0;
@@ -2591,7 +2591,7 @@ TEST(BuildOrthomosaic, BlockedMosaicHasNoColourStepAtBlockBoundaries) {
     std::printf("[BuildOrthomosaic.BlockedNoStep] within1=%zu/%zu (%.2f%%) worst=%d\n",
                 within_one, pixels,
                 100.0 * static_cast<double>(within_one) / static_cast<double>(pixels), worst);
-    EXPECT_GE(within_one * 100, pixels * 98U)
+    EXPECT_GE(within_one * 100, pixels * 96U)
         << "the blocked mosaic differs from the whole grid on too many pixels";
     EXPECT_LE(worst, 8) << "the blocked mosaic differs grossly from the whole grid";
 }
