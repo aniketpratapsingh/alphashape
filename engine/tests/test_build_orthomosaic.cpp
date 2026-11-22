@@ -2469,6 +2469,96 @@ double median_neighbour_step(const Orthomosaic& ortho, int line, bool vertical, 
 
 }  // namespace
 
+// -- per-camera gain compensation, end to end --------------------------------
+//
+// The unit tests in test_ortho_gain.cpp pin the solve. These prove the wiring:
+// a flight whose photographs carry a KNOWN brightness difference must produce a
+// mosaic whose seam steps shrink when color_correction=true, and the blocked and
+// whole-grid runs must apply the same gains.
+//
+// The brightness difference is applied to COPIES of the photographs, which the
+// rectifier decodes, because the gain is a property of a photograph and there is
+// no other honest place to inject one. The copies live in a temporary directory
+// and the chunk's frames point at them for the duration; the committed fixture is
+// never modified, so every other test in this binary sees it unchanged.
+
+namespace {
+
+namespace fs = std::filesystem;
+
+/// A private copy of the fixture's photographs with alternate frames dimmed,
+/// and the chunk's frames pointed at the copies.
+///
+/// The committed fixture is never touched: the copies live in a temporary
+/// directory, the chunk's frame paths are repointed for the duration, and the
+/// destructor puts the original paths back and deletes the directory. A gain is
+/// a property of a photograph, so the only honest injection point is the file
+/// the rectifier decodes.
+class DimmedFlight {
+public:
+    /// Odd-numbered cameras are dimmed by `factor`; when `dim_even` is set the
+    /// other parity is dimmed by its own factor instead, so a test can build a
+    /// flight with a real exposure spread rather than one alternating pair.
+    DimmedFlight(Chunk& chunk, double factor, double dim_even = 0.0) {
+        const auto& cameras = chunk.cameras();
+        for (const auto& frame : chunk.frames()) {
+            if (frame->camera_id() >= 0) {
+                by_camera_.emplace(frame->camera_id(), frame.get());
+            }
+        }
+        dir_ = fs::temp_directory_path() /
+               ("alphashape-gain-" + std::to_string(static_cast<long long>(::getpid())));
+        fs::create_directories(dir_);
+        for (std::size_t c = 0; c < cameras.size(); ++c) {
+            auto it = by_camera_.find(cameras[c].id);
+            if (it == by_camera_.end()) {
+                continue;
+            }
+            Frame* frame = it->second;
+            const std::string original = frame->path();
+            const fs::path copy =
+                dir_ / (fs::path(original).stem().string() + "_gain.png");
+            Image image = read_image(original);
+            if (image.empty()) {
+                continue;
+            }
+            const double factor_for = (c % 2 == 1) ? factor : dim_even;
+            if (factor_for > 0.0 && factor_for != 1.0) {
+                for (std::size_t i = 0; i + 2 < image.size_bytes(); i += 3) {
+                    for (int channel = 0; channel < 3; ++channel) {
+                        const double v = static_cast<double>(
+                                             image.data()[i + static_cast<std::size_t>(channel)]) *
+                                         factor_for;
+                        image.data()[i + static_cast<std::size_t>(channel)] =
+                            static_cast<std::uint8_t>(std::lround(std::clamp(v, 0.0, 255.0)));
+                    }
+                }
+            }
+            write_png(copy.string(), image);  // PNG content, sniffed by magic bytes
+            restored_.emplace_back(frame, original);
+            frame->set_path(copy.string());
+        }
+    }
+
+    ~DimmedFlight() {
+        for (auto& [frame, path] : restored_) {
+            frame->set_path(path);
+        }
+        std::error_code error;
+        fs::remove_all(dir_, error);  // best effort; a leftover temp dir is not a test failure
+    }
+
+    DimmedFlight(const DimmedFlight&) = delete;
+    DimmedFlight& operator=(const DimmedFlight&) = delete;
+
+private:
+    std::unordered_map<std::int32_t, Frame*> by_camera_;
+    std::vector<std::pair<Frame*, std::string>> restored_;
+    fs::path dir_;
+};
+
+}  // namespace
+
 TEST(BuildOrthomosaic, BlockedMosaicHasNoColourStepAtBlockBoundaries) {
     // THE REGRESSION for the owner's rc.3 smoke test: perfectly sharp, straight
     // colour steps at exact multiples of the block side, whole blocks carrying a
@@ -2611,96 +2701,6 @@ TEST(BuildOrthomosaic, BlockedMosaicHasNoColourStepAtBlockBoundaries) {
         << "the blocked mosaic differs from the whole grid on too many pixels";
     EXPECT_LE(worst, 8) << "the blocked mosaic differs grossly from the whole grid";
 }
-
-// -- per-camera gain compensation, end to end --------------------------------
-//
-// The unit tests in test_ortho_gain.cpp pin the solve. These prove the wiring:
-// a flight whose photographs carry a KNOWN brightness difference must produce a
-// mosaic whose seam steps shrink when color_correction=true, and the blocked and
-// whole-grid runs must apply the same gains.
-//
-// The brightness difference is applied to COPIES of the photographs, which the
-// rectifier decodes, because the gain is a property of a photograph and there is
-// no other honest place to inject one. The copies live in a temporary directory
-// and the chunk's frames point at them for the duration; the committed fixture is
-// never modified, so every other test in this binary sees it unchanged.
-
-namespace {
-
-namespace fs = std::filesystem;
-
-/// A private copy of the fixture's photographs with alternate frames dimmed,
-/// and the chunk's frames pointed at the copies.
-///
-/// The committed fixture is never touched: the copies live in a temporary
-/// directory, the chunk's frame paths are repointed for the duration, and the
-/// destructor puts the original paths back and deletes the directory. A gain is
-/// a property of a photograph, so the only honest injection point is the file
-/// the rectifier decodes.
-class DimmedFlight {
-public:
-    /// Odd-numbered cameras are dimmed by `factor`; when `dim_even` is set the
-    /// other parity is dimmed by its own factor instead, so a test can build a
-    /// flight with a real exposure spread rather than one alternating pair.
-    DimmedFlight(Chunk& chunk, double factor, double dim_even = 0.0) {
-        const auto& cameras = chunk.cameras();
-        for (const auto& frame : chunk.frames()) {
-            if (frame->camera_id() >= 0) {
-                by_camera_.emplace(frame->camera_id(), frame.get());
-            }
-        }
-        dir_ = fs::temp_directory_path() /
-               ("alphashape-gain-" + std::to_string(static_cast<long long>(::getpid())));
-        fs::create_directories(dir_);
-        for (std::size_t c = 0; c < cameras.size(); ++c) {
-            auto it = by_camera_.find(cameras[c].id);
-            if (it == by_camera_.end()) {
-                continue;
-            }
-            Frame* frame = it->second;
-            const std::string original = frame->path();
-            const fs::path copy =
-                dir_ / (fs::path(original).stem().string() + "_gain.png");
-            Image image = read_image(original);
-            if (image.empty()) {
-                continue;
-            }
-            const double factor_for = (c % 2 == 1) ? factor : dim_even;
-            if (factor_for > 0.0 && factor_for != 1.0) {
-                for (std::size_t i = 0; i + 2 < image.size_bytes(); i += 3) {
-                    for (int channel = 0; channel < 3; ++channel) {
-                        const double v = static_cast<double>(
-                                             image.data()[i + static_cast<std::size_t>(channel)]) *
-                                         factor_for;
-                        image.data()[i + static_cast<std::size_t>(channel)] =
-                            static_cast<std::uint8_t>(std::lround(std::clamp(v, 0.0, 255.0)));
-                    }
-                }
-            }
-            write_png(copy.string(), image);  // PNG content, sniffed by magic bytes
-            restored_.emplace_back(frame, original);
-            frame->set_path(copy.string());
-        }
-    }
-
-    ~DimmedFlight() {
-        for (auto& [frame, path] : restored_) {
-            frame->set_path(path);
-        }
-        std::error_code error;
-        fs::remove_all(dir_, error);  // best effort; a leftover temp dir is not a test failure
-    }
-
-    DimmedFlight(const DimmedFlight&) = delete;
-    DimmedFlight& operator=(const DimmedFlight&) = delete;
-
-private:
-    std::unordered_map<std::int32_t, Frame*> by_camera_;
-    std::vector<std::pair<Frame*, std::string>> restored_;
-    fs::path dir_;
-};
-
-}  // namespace
 
 TEST(OrthoGain, CorrectionShrinksSeamStepByAtLeastEightyPercent) {
     // A 20% brightness difference between alternate photographs is a step a
