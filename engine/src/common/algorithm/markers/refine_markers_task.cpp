@@ -409,6 +409,133 @@ struct BlobSeed {
     bool verified_circle = false;
 };
 
+/// Mean intensity on a circle of `radius` about `centre` in `image`, or nullopt
+/// when fewer than half the samples fall inside the image. `centre` is in the
+/// image's own index convention (pixel centres at integer coordinates), which
+/// is what `FloatImage::sample` addresses.
+std::optional<double> ring_mean(const FloatImage& image,
+                                const Eigen::Vector2d& centre, double radius) {
+    if (!(radius > 0.0)) {
+        return std::nullopt;
+    }
+    double sum = 0.0;
+    int count = 0;
+    constexpr int kSamples = 32;
+    for (int step = 0; step < kSamples; ++step) {
+        const double angle = 2.0 * std::numbers::pi_v<double> *
+                             static_cast<double>(step) / kSamples;
+        const double x = centre.x() + radius * std::cos(angle);
+        const double y = centre.y() + radius * std::sin(angle);
+        if (x < 0.0 || y < 0.0 || x > static_cast<double>(image.width() - 1) ||
+            y > static_cast<double>(image.height() - 1)) {
+            continue;
+        }
+        sum += static_cast<double>(image.sample(static_cast<float>(x),
+                                                static_cast<float>(y)));
+        ++count;
+    }
+    if (count < kSamples / 2) {
+        return std::nullopt;
+    }
+    return sum / static_cast<double>(count);
+}
+
+/// Fit a plain printed disc's outer border from `seed` and verify it is a real
+/// printed outline. A disc printed WITHOUT a centre dot has no dark blob and,
+/// at a small apparent size, its bright disk is too weak for the light-on-dark
+/// Hessian pass to fire (the response peaks below the blob threshold), so the
+/// blob seed finds nothing. The disc's own border is still a complete, sharp
+/// outline, so it is fitted directly from the click with a FIRST-edge radial
+/// fit (the first edge from the click is the disc border; the outermost edge
+/// can be background texture). Several search radii are tried because the
+/// apparent size is not known before the first triangulation, and the
+/// lowest-residual fit is kept.
+///
+/// The fit is trusted only on its own evidence: enough edge samples all around
+/// (the sampler already requires 60% of the rays), a low median radial residual
+/// (a printed outline is a fraction of a pixel; background texture is several
+/// tenths), a plausible axis ratio, a radius inside the window, a centre near
+/// the seed, and a BRIGHT interior over a darker exterior (a printed white
+/// disc). `expected_px` is the apparent radius when it is already known (0
+/// before the first triangulation); a fit far from it is rejected.
+std::optional<BlobSeed> fit_plain_disc_border(const FloatImage& crop,
+                                              const GradientField& gradient,
+                                              const Eigen::Vector2d& seed,
+                                              int half, double expected_px) {
+    const double window_limit = static_cast<double>(half) - 2.0;
+    // Search radii spanning a small target up to the window. The disc's
+    // apparent radius is unknown before the first triangulation, so a spread of
+    // hints is tried and the best-residual fit wins; a hint that starts inside
+    // the disc still converges outward to the border because the first
+    // significant edge on each ray is the border.
+    const std::array<double, 5> hints = {4.0, 8.0, 16.0, 0.5 * window_limit,
+                                         window_limit};
+    std::optional<BlobSeed> best;
+    double best_residual = std::numeric_limits<double>::infinity();
+    for (const double hint : hints) {
+        if (!(hint > 0.5) || hint > window_limit) {
+            continue;
+        }
+        const auto fit = fit_boundary_ellipse(gradient, seed, hint, false);
+        if (!fit) {
+            continue;
+        }
+        const double a = fit->ellipse.a;
+        const double b = fit->ellipse.b;
+        const double ratio = a > 0.0 ? b / a : 0.0;
+        // A printed disc is a near-circular outline: reject a degenerate or
+        // strongly elongated fit (a texture streak, a straight edge).
+        if (!(a >= 3.0) || a > window_limit || !(ratio >= 0.3)) {
+            continue;
+        }
+        // A real outline fits to a fraction of a pixel; background texture
+        // does not. This is the evidence that the fit is the printed border.
+        if (!(fit->residual_px <= 0.3)) {
+            continue;
+        }
+        // The centre must stay near the seed: a fit that jumped to a
+        // neighbouring outline is not this target. The bound is generous
+        // enough for a legitimate multi-pixel mis-click (the click is the
+        // seed) yet well inside a neighbouring target, which sits at least a
+        // diameter away.
+        if ((fit->ellipse.center - seed).norm() > std::max(8.0, 1.5 * a)) {
+            continue;
+        }
+        // When the apparent size is already known, the fitted radius must be
+        // consistent with it; a fit at a very different scale is a different
+        // structure.
+        if (expected_px > 0.0 &&
+            (a < 0.5 * expected_px || a > 2.0 * expected_px)) {
+            continue;
+        }
+        // A printed white disc is BRIGHT inside and darker outside. This is the
+        // discriminator a texture edge cannot satisfy: a ground-texture ellipse
+        // has no consistent bright interior, so it is rejected here even when
+        // its residual is low. The interior is sampled at half the radius (well
+        // inside the border) and the exterior at 1.4x (just outside it). The
+        // ellipse centre is in the API convention; the crop samples in its own
+        // index convention, so shift by half a pixel.
+        const Eigen::Vector2d sample_centre =
+            fit->ellipse.center - Eigen::Vector2d(0.5, 0.5);
+        const auto inside = ring_mean(crop, sample_centre, 0.5 * a);
+        const auto outside = ring_mean(crop, sample_centre, 1.4 * a);
+        if (!inside || !outside || !(*inside > *outside + 0.1)) {
+            continue;
+        }
+        if (fit->residual_px < best_residual) {
+            best_residual = fit->residual_px;
+            BlobSeed out;
+            out.pixel = fit->ellipse.center;
+            out.radius = a;
+            out.light_centre = true;
+            out.border_fitted = true;
+            out.verified_circle = true;
+            best = out;
+        }
+    }
+    return best;
+}
+
 /// Locate the circular target around `pixel` in the (possibly reduced) image.
 /// The blob's scale supplies the physical radius; the ellipse refit supplies a
 /// seed for the 2-D fallback. A cross has no blob, so this returns nullopt and
@@ -425,7 +552,8 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                                              const Eigen::Vector2d& pixel,
                                              int half, bool coded_circular,
                                              bool plain_disc,
-                                             double border_multiple) {
+                                             double border_multiple,
+                                             double expected_px = 0.0) {
     const Eigen::Vector2d index = view.index_of(pixel);
     if (!index.allFinite()) {
         return std::nullopt;
@@ -630,15 +758,21 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
         // whenever there is a dot or a light blob.
         std::optional<Eigen::Vector2d> border_centre;
         double border_radius = 0.0;
-        const bool have_scale = light != nullptr || dot_centre.has_value();
-        if (have_scale) {
-            // Seed from the disk blob centre when there is one: it is the
-            // whole bright disk (or its annulus), so it is already near the
-            // printed centre and the radial rays are near-radial to the disk
-            // border. Fall back to the dot centre, then the click.
+        if (dot_centre) {
+            // A disc WITH a centre dot: the light-on-dark blob fit stops at the
+            // dot's bright ring, so the OUTERMOST border fit is the disk. Seed
+            // it from the disk blob centre when there is one (it is the whole
+            // bright disk or its annulus, already near the printed centre) and
+            // from the dot centre otherwise, so the radial rays are near-radial
+            // to the disk border and the fit converges tightly even when the
+            // click is several pixels off.
+            //
+            // The border fit does NOT require a light blob: a disc-with-dot's
+            // bright region is an annulus, which the blob detector may not
+            // report as a single blob. The dot radius alone supplies a hint
+            // that reaches the disk border (the disk is ~3x the dot by design).
             const Eigen::Vector2d border_seed =
-                light != nullptr ? light->center
-                                 : (dot_centre ? *dot_centre : seed);
+                light != nullptr ? light->center : *dot_centre;
             const double hint =
                 std::max({light != nullptr ? light->radius_px : 0.0,
                           2.5 * dot_radius, 4.0});
@@ -664,6 +798,31 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
                     std::max(4.0, 0.5 * fitted_radius)) {
                 border_centre = *fitted;
                 border_radius = fitted_radius;
+            }
+        } else {
+            // A plain bright disk with NO centre dot: there is no dark blob,
+            // and at a small apparent size the bright disk is too weak for the
+            // light-on-dark Hessian pass to fire, so `light` is often null. The
+            // disc's own border is still a complete, sharp outline, so fit it
+            // directly with a FIRST-edge radial fit (the first edge from the
+            // click is the disc border; the outermost edge can be background
+            // texture). The fit is verified on its own evidence (residual, axis
+            // ratio, radius, centre near the seed) inside the helper.
+            //
+            // The click is the primary seed: it is the measured pixel and the
+            // surveyor clicked on the disc, so the first edge on every ray is
+            // the disc border. The light blob centre, when the detector did
+            // fire, is the fallback for a click that landed outside the disc.
+            const GradientField gradient = compute_gradient_field(crop);
+            std::optional<BlobSeed> fitted =
+                fit_plain_disc_border(crop, gradient, seed, half, expected_px);
+            if (!fitted && light != nullptr) {
+                fitted = fit_plain_disc_border(crop, gradient, light->center,
+                                               half, expected_px);
+            }
+            if (fitted) {
+                border_centre = fitted->pixel;
+                border_radius = fitted->radius;
             }
         }
         // The printed centre is the disk's outer border when it fitted and
@@ -887,8 +1046,8 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
                                            std::ceil(1.3 * expected_px)) + 8));
     }
     half = std::min(half, max_half);
-    auto seed =
-        circular_seed_window(view, pixel, half, coded_circular, plain_disc, 2.0);
+    auto seed = circular_seed_window(view, pixel, half, coded_circular,
+                                     plain_disc, 2.0, expected_px);
     // A border fit that needed more room than the window offered means the
     // outline was clipped, so the accepted radius and centre are unreliable; a
     // coded target whose interior also fell outside the window has no light
@@ -907,7 +1066,7 @@ std::optional<BlobSeed> circular_seed(const CameraView& view,
         const int wider = std::min(2 * half, max_half);
         if (auto retried = circular_seed_window(view, pixel, wider,
                                                 coded_circular, plain_disc,
-                                                2.4)) {
+                                                2.4, expected_px)) {
             const bool larger =
                 retried->border_fitted &&
                 retried->radius > static_cast<double>(half) - 2.0;

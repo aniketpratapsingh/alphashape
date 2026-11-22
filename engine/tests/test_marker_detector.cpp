@@ -344,6 +344,38 @@ TEST(MarkerDetector, LightOnDarkPolarity) {
     EXPECT_TRUE(detect_blobs(dark, dark_on_light).empty());
 }
 
+TEST(MarkerDetector, BoundaryFitReportsQuality) {
+    // A plain bright disc (no centre dot) is too weak for the light-on-dark
+    // Hessian pass at a small apparent size, so the refiner fits its border
+    // directly. fit_boundary_ellipse must return the disc centre and radius
+    // with a low residual on a real printed outline, and a high residual on
+    // background texture, which is what lets the caller tell them apart.
+    const int size = 160;
+    const test::EllipseTruth disc = {80.0, 80.0, 12.0, 12.0, 0.0};
+    FloatImage image = test::render_ellipses(size, size, {disc}, 0.5F, 0.95F);
+    image = gaussian_blur(image, 0.8F);
+    const GradientField gradient = compute_gradient_field(image);
+    // The API takes the pixel-centre convention, in which the disc centre is
+    // (80.0, 80.0) (the same convention detect_blobs reports).
+    const auto fit = fit_boundary_ellipse(gradient, Eigen::Vector2d(80.0, 80.0),
+                                          8.0, false);
+    ASSERT_TRUE(fit.has_value());
+    EXPECT_LE((fit->ellipse.center - Eigen::Vector2d(80.0, 80.0)).norm(), 0.3);
+    EXPECT_NEAR(fit->ellipse.a, 12.0, 0.5);
+    EXPECT_GE(fit->ellipse.b / fit->ellipse.a, 0.9);
+    EXPECT_LE(fit->residual_px, 0.2);
+    EXPECT_GE(fit->samples, 38);  // 60% of the 64 rays
+
+    // A flat, texture-free patch has no outline: the fit either fails or
+    // reports a residual far above a printed border's.
+    FloatImage flat(size, size, 0.5F);
+    const GradientField flat_gradient = compute_gradient_field(flat);
+    const auto none =
+        fit_boundary_ellipse(flat_gradient, Eigen::Vector2d(80.0, 80.0), 8.0,
+                             false);
+    EXPECT_FALSE(none.has_value());
+}
+
 TEST(MarkerDetector, QuadCornersAccurate) {
     const int width = 1024;
     const int height = 1024;
