@@ -2759,7 +2759,12 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             // the output (only this block's own region is copied out).
             std::vector<std::int32_t> seed;
             std::vector<std::uint8_t> frozen;
-            if (plan.block_cells > 0) {
+            // `result.labels` is allocated at the first block's interior copy,
+            // which runs AFTER this pin loop, so on the very first block it is
+            // still empty. There is nothing to inherit then (no earlier block has
+            // run), so the pin pass is skipped entirely rather than reading an
+            // empty vector.
+            if (plan.block_cells > 0 && !result.labels.empty()) {
                 const std::size_t window_cells =
                     static_cast<std::size_t>(window.width) * static_cast<std::size_t>(window.height);
                 seed.assign(window_cells, -1);
