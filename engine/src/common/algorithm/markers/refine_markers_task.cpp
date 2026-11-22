@@ -632,9 +632,13 @@ std::optional<BlobSeed> circular_seed_window(const CameraView& view,
         double border_radius = 0.0;
         const bool have_scale = light != nullptr || dot_centre.has_value();
         if (have_scale) {
+            // Seed from the disk blob centre when there is one: it is the
+            // whole bright disk (or its annulus), so it is already near the
+            // printed centre and the radial rays are near-radial to the disk
+            // border. Fall back to the dot centre, then the click.
             const Eigen::Vector2d border_seed =
-                dot_centre ? *dot_centre
-                           : (light != nullptr ? light->center : seed);
+                light != nullptr ? light->center
+                                 : (dot_centre ? *dot_centre : seed);
             const double hint =
                 std::max({light != nullptr ? light->radius_px : 0.0,
                           2.5 * dot_radius, 4.0});
