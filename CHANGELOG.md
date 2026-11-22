@@ -872,6 +872,14 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Fixed
 
+- **`DetectMarkers` left the target kind off markers it attached to.** A
+  detection that landed on an existing marker (an imported GCP, or one created
+  by label) recorded no `target_type`, so `RefineMarkers` treated the marker as
+  untyped and never took the plain-disc refinement path; on a real 430-image
+  block 906 of 928 projections were kept unrefined. The add-projection command
+  now copies each meta key the existing marker does not already have, so the
+  kind is recorded without overwriting a user-set or earlier-run value, and
+  undo restores the previous meta.
 - **Marker and camera references in a projected CRS (MGA, UTM, a national grid)
   were read as degrees or refused.** `OptimizeCameras`, `UpdateTransform`,
   `AlignFromReference` and the alignment georeference now convert a projected

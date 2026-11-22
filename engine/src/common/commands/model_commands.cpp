@@ -1716,6 +1716,16 @@ protected:
         std::int32_t marker_id = -1;
         if (marker != nullptr) {
             marker_id = marker->id;
+            // A detection attached to an existing marker still records the
+            // target kind, because refinement reads it to pick the plain-disc
+            // path. The marker's own meta wins: a user-set or earlier-run kind
+            // is never overwritten. Undo is automatic, since the base class
+            // snapshots the whole markers container before commit.
+            for (const auto& [key, value] : meta_.items) {
+                if (marker->meta.find(key) == nullptr) {
+                    marker->meta.set(key, value);
+                }
+            }
         } else {
             const auto* label = std::get_if<std::string>(&marker_);
             if (label == nullptr) {

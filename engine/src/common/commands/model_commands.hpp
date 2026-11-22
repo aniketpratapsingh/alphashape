@@ -168,7 +168,9 @@ using MarkerRef = std::variant<std::int32_t, std::string>;
 /// With an id the marker must already exist; with a label a missing marker is
 /// created with that label. A newly created marker is pinned when `pinned` and
 /// receives `meta` (target provenance), so a later refinement can tell the
-/// target kind.
+/// target kind. An existing marker receives each `meta` key it does not
+/// already have, so a detection attached to it still records the kind without
+/// overwriting a user-set or earlier-run value.
 std::unique_ptr<AbstractCommand> make_add_marker_with_projection_command(
     std::int32_t chunk_id, MarkerRef marker, std::int32_t camera_id,
     Eigen::Vector2d uv, bool pinned = true, const Meta& meta = Meta{});
