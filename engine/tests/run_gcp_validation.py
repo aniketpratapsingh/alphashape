@@ -17,6 +17,15 @@ Two modes:
     check-point RMS. ``--crs`` must name a geographic (lon/lat) CRS; projected
     coordinates are refused because this script converts references as lon/lat.
 
+The real mode's pass/fail verdict reads ``camera_rtk_engine_defaults``: camera
+RTK references plus the surveyed GCPs, with the lens model left to
+OptimizeCameras' own defaults. On a block with control points those defaults
+select the adaptive model, so this is the configuration the product ships. The
+``camera_rtk_gcps`` variant runs the same references and options but pins the
+plain lens model (``adaptive_fitting_auto=False``); it is reported beside the
+gated variant as the reference row whose numbers stay comparable across engine
+versions. The threshold is the same for both and is never loosened.
+
 ``--ablations`` runs five synthetic scenarios in one process so a pipeline
 defect can be told from noise-limited accuracy: (1) no projection noise, no
 reference noise, with the fixture's exact camera position and attitude pinned
@@ -3139,20 +3148,26 @@ def marker_crop_probe(args, gcps, align_report):
 def optimize_options(options):
     """The OptimizeCameras kwargs a diagnostic variant asks for."""
     kwargs = {"use_gcps": True}
-    if options.get("adaptive_fitting"):
+    if options.get("engine_defaults"):
+        # The shipped configuration: leave the lens model to OptimizeCameras'
+        # own defaults, which select the adaptive model on a block with control
+        # points. No fit_* flag and no adaptive_fitting_auto override, so the
+        # engine's automatic rule is exactly what runs. Checked first so a
+        # caller that also names adaptive_fitting cannot add the fit_*
+        # permission set the shipped default does not set.
+        pass
+    elif options.get("adaptive_fitting"):
         # Adaptive mode reads the fit_* flags as permission, not instruction:
         # permit the full extended model and let the likelihood-ratio selection
         # keep only the terms whose gain pays for their degrees of freedom.
         kwargs["adaptive_fitting"] = True
         kwargs.update(fit_k4=True, fit_b1=True, fit_b2=True,
                       fit_p3=True, fit_p4=True)
-    elif not options.get("engine_defaults"):
-        # Every variant names its lens model, so its numbers stay comparable
-        # across engine versions: one that did not ask for the adaptive model
-        # gets the plain one even though OptimizeCameras now selects the
-        # adaptive model by itself on a block with control points. The
-        # engine_defaults variant is the one that shows what a caller who sets
-        # nothing gets.
+    else:
+        # Every other variant names its lens model, so its numbers stay
+        # comparable across engine versions: one that did not ask for the
+        # adaptive model gets the plain one even though OptimizeCameras now
+        # selects the adaptive model by itself on a block with control points.
         kwargs["adaptive_fitting_auto"] = False
     if options.get("extended_model"):
         # The default fit is f, cx, cy, k1, k2, p1, p2; free the higher-order
@@ -3740,7 +3755,13 @@ DIAGNOSTIC_VARIANTS = (
 
 
 def run_real_odm(args):
-    """The real-block leave-one-out protocol over the ODM GCPs, two variants."""
+    """The real-block leave-one-out protocol over the ODM GCPs.
+
+    Three standard variants: ``gcps_only`` (no camera references),
+    ``camera_rtk_gcps`` (camera references, plain lens pinned) and
+    ``camera_rtk_engine_defaults`` (camera references, the engine's own lens
+    default, the gated one).
+    """
     if args.gcp_height != "ellipsoidal":
         raise ValueError(
             "--gcp-height {} is not supported: converting an orthometric "
@@ -3853,11 +3874,13 @@ def run_real_odm(args):
     variants = {}
     # GCPs only first: its per-fold adjustment is the leak-free source of the
     # estimated antenna lever arm the later variants reuse. The camera-RTK
-    # variant takes an explicitly configured fixed arm when one is supplied.
+    # variants take an explicitly configured fixed arm when one is supplied.
     # The benchmark's adaptive_fitting dispatch parameter selects the same
-    # adaptive calibration model on the two standard variants that the
+    # adaptive calibration model on gcps_only and camera_rtk_gcps that the
     # diagnostics run as an extra probe. Keep the option on the variant's options
-    # dict so the report shows which lens model produced each row.
+    # dict so the report shows which lens model produced each row. The gated
+    # camera_rtk_engine_defaults variant ignores it: the engine's own default
+    # already selects the adaptive model on a controlled block.
     base_options = {"adaptive_fitting": True} if args.adaptive_fitting else None
     variants["gcps_only"] = run_variant(
         args, gcps, align_report, False, base_options)
@@ -3874,10 +3897,26 @@ def run_real_odm(args):
     variants["camera_rtk_gcps"] = run_variant(
         args, gcps, align_report, True, camera_options,
         frame_shifts=default_frame_shifts)
-    # What a caller who sets nothing gets: OptimizeCameras with its own
-    # defaults, which select the adaptive model because the block has control
-    # points. Report-only, so the two standard variants above keep their
-    # meaning across engine versions.
+    # The configuration the product ships: the same camera references, the same
+    # camera options and the same per-fold frame shifts as camera_rtk_gcps, but
+    # the lens model is left to OptimizeCameras' own defaults. On a block with
+    # control points those defaults select the adaptive model, so this is what a
+    # caller who sets nothing gets. This is the gated variant; camera_rtk_gcps
+    # stays as the pinned plain-lens reference so its row keeps its meaning
+    # across engine versions. An explicit --adaptive-fitting is dropped here:
+    # the engine's own default already selects the same model on a controlled
+    # block, and leaving the flag in would add the fit_* permission set the
+    # shipped default does not set.
+    engine_default_options = dict(camera_options)
+    engine_default_options.pop("adaptive_fitting", None)
+    engine_default_options["engine_defaults"] = True
+    variants["camera_rtk_engine_defaults"] = run_variant(
+        args, gcps, align_report, True, engine_default_options,
+        frame_shifts=default_frame_shifts)
+    # What a caller who sets nothing gets on a block with NO camera references:
+    # OptimizeCameras with its own defaults, which still select the adaptive
+    # model because the block has control points. Report-only, so the standard
+    # variants above keep their meaning across engine versions.
     variants["engine_defaults"] = run_variant(
         args, gcps, align_report, False, {"engine_defaults": True},
         catch_all=True)
@@ -4081,7 +4120,11 @@ def run_real_odm(args):
               "{:.3f} / {:.3f} / {:.3f} m".format(
                   label, applied_frame_shift_source, shift[0], shift[1],
                   shift[2]))
-    best_horizontal = variants["camera_rtk_gcps"]["rms_horizontal_m"]
+    # The gate reads the configuration the product ships: camera RTK references
+    # plus GCPs with the engine's own lens-model default (adaptive on a
+    # controlled block). camera_rtk_gcps pins the plain lens and is reported
+    # beside it as the reference row.
+    best_horizontal = variants["camera_rtk_engine_defaults"]["rms_horizontal_m"]
     target = args.horizontal_target
     passed = (best_horizontal is not None and best_horizontal <= target)
     report = {
@@ -4122,6 +4165,10 @@ def run_real_odm(args):
             "shifts_m": applied_frame_shifts,
         },
         "target_horizontal_m": target,
+        # Which variant the pass/fail verdict reads. The shipped default is the
+        # gated one; camera_rtk_gcps is the pinned plain-lens reference.
+        "gate_variant": "camera_rtk_engine_defaults",
+        "reference_variant": "camera_rtk_gcps",
         "passed": passed,
     }
     if args.json_out:
@@ -4129,9 +4176,10 @@ def run_real_odm(args):
             json.dump(report, handle, indent=2, sort_keys=True)
             handle.write("\n")
     print("[gcp validation] scenario={} images={} gcps={} "
-          "camera_rtk_gcps_h={:.6f} gcps_only_h={:.6f} target={:.6f} "
-          "passed={}".format(
+          "camera_rtk_engine_defaults_h={:.6f} camera_rtk_gcps_h={:.6f} "
+          "gcps_only_h={:.6f} target={:.6f} passed={}".format(
               report["scenario"], len(images), len(gcps),
+              variants["camera_rtk_engine_defaults"]["rms_horizontal_m"] or -1.0,
               variants["camera_rtk_gcps"]["rms_horizontal_m"] or -1.0,
               variants["gcps_only"]["rms_horizontal_m"] or -1.0,
               target, passed))
@@ -4170,7 +4218,7 @@ def parse_args(argv):
                              "ODM/OpenSfM integer-origin -> corner-origin "
                              "conversion (+0.5 px)")
     parser.add_argument("--diagnostics", action="store_true",
-                        help="after the two standard variants, run the extra "
+                        help="after the three standard variants, run the extra "
                              "probes (adaptive/extended calibration, marker "
                              "refinement, pixel shift, marker sigma, loosened "
                              "camera weights, fixed and per-fold-estimated "
@@ -4185,11 +4233,13 @@ def parse_args(argv):
                              "this directory, plus index.json; benchmark "
                              "diagnostics only, nothing is written without it")
     parser.add_argument("--camera-accuracy", default="0.05",
-                        help="camera reference accuracy for the camera_rtk_gcps "
-                             "variant: 'per-image' uses each photo's XMP RTK "
-                             "standard deviations and fix status (AddPhotos "
-                             "load_xmp_accuracy), a number of metres gives every "
-                             "camera the same weight (the uniform baseline)")
+                        help="camera reference accuracy for the camera-reference "
+                             "variants (camera_rtk_engine_defaults, the gated "
+                             "one, and camera_rtk_gcps): 'per-image' uses each "
+                             "photo's XMP RTK standard deviations and fix status "
+                             "(AddPhotos load_xmp_accuracy), a number of metres "
+                             "gives every camera the same weight (the uniform "
+                             "baseline)")
     parser.add_argument("--camera-accuracy-uniform", default="0.05",
                         help="uniform accuracy in metres used by the "
                              "camera_rtk_uniform comparison variant when "
@@ -4203,10 +4253,13 @@ def parse_args(argv):
                              "variants and the timing probe always run); e.g. "
                              "'adaptive_fitting,camera_rtk_per_image_adaptive'")
     parser.add_argument("--adaptive-fitting", action="store_true",
-                        help="run the two standard variants (gcps_only and "
-                             "camera_rtk_gcps) with the adaptive calibration "
-                             "model, the same configuration the benchmark's "
-                             "adaptive_fitting dispatch parameter selects")
+                        help="run gcps_only and camera_rtk_gcps with the "
+                             "adaptive calibration model, the same configuration "
+                             "the benchmark's adaptive_fitting dispatch parameter "
+                             "selects. The gated camera_rtk_engine_defaults "
+                             "variant already gets the adaptive model from the "
+                             "engine's own default on a controlled block, so this "
+                             "flag does not change it")
     parser.add_argument("--marker-accuracy", type=float, default=0.015,
                         help="control- and check-point reference accuracy in metres")
     parser.add_argument("--frame-correction", choices=FRAME_CORRECTION_CHOICES,
@@ -4229,7 +4282,7 @@ def parse_args(argv):
                         help="fixed GNSS antenna lever arm in metres in the "
                              "camera frame, 'x,y,z' (e.g. '0,0,-0.23' for an "
                              "antenna 0.23 m above a nadir lens); applied to "
-                             "the camera_rtk_gcps variant and the fit's datum")
+                             "the camera-reference variants and the fit's datum")
     parser.add_argument("--keypoint-limit", type=int, default=250,
                         help="MatchPhotos keypoint_limit_per_mpx for the block")
     parser.add_argument("--match-param", action="append", default=[],

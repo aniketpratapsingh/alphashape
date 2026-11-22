@@ -1680,7 +1680,7 @@ def run_gcp_validation(
     # A repeated run does not: the probes are a dozen extra leave-one-out
     # variants, and paying for them on every repetition would push the job past
     # the 6 h ceiling to re-measure rows the n=1 run already reports. The
-    # repeated comparison uses the two standard variants, which is what its
+    # repeated comparison uses the three standard variants, which is what its
     # dispatch is about.
     diagnostics = bool(gcp.get("diagnostics")) and reps == 1
     if diagnostics:
