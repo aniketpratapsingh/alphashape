@@ -142,6 +142,10 @@ Elevation make_elevation(float base) {
     dem.set_epsg(32633);
     dem.nodata = -9999.0F;
     dem.source = "depth_maps";
+    // A support mask and interpolation mode, so the elevation sidecar's round
+    // trip (and the byte-stable resave) covers them.
+    dem.interpolation = "enabled";
+    dem.support = {1U, 0U, 1U, 1U};
     return dem;
 }
 
@@ -793,7 +797,8 @@ const std::set<std::string>& expected_attributes() {
         "elevation@enabled", "elevation@active", "elevation@path",
         "elevation@width", "elevation@height", "elevation@origin",
         "elevation@pixel_size", "elevation@epsg", "elevation@crs_wkt",
-        "elevation@nodataValue", "elevation@source_data",
+        "elevation@nodataValue", "elevation@source_data", "elevation@support_path",
+        "elevation@interpolation",
         "orthomosaic@id", "orthomosaic@label", "orthomosaic@group",
         "orthomosaic@enabled", "orthomosaic@active", "orthomosaic@path",
         "orthomosaic@labels_path", "orthomosaic@width", "orthomosaic@height",
@@ -1343,6 +1348,9 @@ TEST_F(ProjectV2, LoadsV1Fixture) {
     EXPECT_EQ(dem.nodata, -32767.0F);
     EXPECT_EQ(dem.source, "depth_maps");
     EXPECT_EQ(dem.raster.data, want.elevations().front().data->raster.data);
+    // The support mask and interpolation mode survive the sidecar round trip.
+    EXPECT_EQ(dem.interpolation, want.elevations().front().data->interpolation);
+    EXPECT_EQ(dem.support, want.elevations().front().data->support);
     ASSERT_EQ(got.orthomosaics().size(), 1U);
     EXPECT_EQ(got.orthomosaics().front().data->labels,
               want.orthomosaics().front().data->labels);

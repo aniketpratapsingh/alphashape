@@ -1003,6 +1003,52 @@ std::vector<std::int32_t> decode_ortho_labels(const std::vector<std::uint8_t>& i
     return out;
 }
 
+std::vector<std::uint8_t> encode_elevation_support(const std::vector<std::uint8_t>& support,
+                                                   int width, int height) {
+    std::vector<std::uint8_t> out = with_magic(kElevationSupportMagic);
+    put_u32(out, static_cast<std::uint32_t>(support.size()));
+    put_i32(out, width);
+    put_i32(out, height);
+    out.insert(out.end(), support.begin(), support.end());
+    return out;
+}
+
+std::vector<std::uint8_t> decode_elevation_support(const std::vector<std::uint8_t>& in,
+                                                   int width, int height) {
+    if (!magic_is(in, kElevationSupportMagic) || in.size() < 16) {
+        throw ProjectIOError("elevation support file: bad header");
+    }
+    ByteReader r(in, 4, "elevation support file");
+    // A plain u32 rather than ByteReader::count(): the two dimension fields are
+    // shared by the file's one array, so count(item_bytes) would over-reserve.
+    const std::uint32_t count = r.u32();
+    const std::int32_t stored_width = r.i32();
+    const std::int32_t stored_height = r.i32();
+    if (stored_width != width || stored_height != height) {
+        throw ProjectIOError(
+            "elevation support file: dimensions do not match the GeoTIFF");
+    }
+    const std::uint64_t expected =
+        static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height);
+    if (count != expected) {
+        throw ProjectIOError(
+            "elevation support file: flag count does not match width*height");
+    }
+    if (static_cast<std::uint64_t>(r.remaining()) != expected) {
+        throw ProjectIOError(
+            "elevation support file: truncated or trailing flag bytes");
+    }
+    std::vector<std::uint8_t> out;
+    out.reserve(static_cast<std::size_t>(count));
+    for (std::uint32_t i = 0; i < count; ++i) {
+        out.push_back(r.u8());
+    }
+    if (!r.at_end()) {
+        throw ProjectIOError("elevation support file: trailing bytes");
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Masks: "AMK1", i32 camera_id, i32 width, i32 height, u8 invert, then the
 // width*height bitmap run-length encoded as (u8 run, u8 value) pairs. A run is
@@ -1461,6 +1507,11 @@ void validate_products(const Chunk& chunk) {
         }
         if (!std::isfinite(elevation.nodata)) {
             throw ProjectIOError("elevation: nodata must be finite");
+        }
+        if (!elevation.support.empty() &&
+            elevation.support.size() != static_cast<std::size_t>(expected)) {
+            throw ProjectIOError(
+                "elevation: support mask size does not match width*height");
         }
         if (elevation.crs.epsg < 0) {
             throw ProjectIOError("elevation: epsg must be >= 0");

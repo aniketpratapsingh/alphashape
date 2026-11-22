@@ -533,6 +533,94 @@ TEST(Dem, EnabledFillsHolesInsideTheCameraFootprint) {
     EXPECT_EQ(band.first, 0U);
 }
 
+TEST(Dem, SupportMaskMarksMeasuredCells) {
+    // The DEM records which cells were MEASURED (support = 1) and which the hole
+    // fill interpolated (support = 0), so the orthomosaic can avoid rectifying
+    // photographs onto invented surface at the block edge. A DEM with no filled
+    // cells keeps an empty mask ("every valid cell measured"), so its bytes are
+    // unchanged.
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Sensor sensor;
+    sensor.type = CameraType::Frame;
+    sensor.calibration = Calibration::initial(CameraType::Frame, 2000, 2000, 2000.0);
+    chunk.sensors().push_back(sensor);
+
+    // A band of holes at 0 < x < 12, inside the camera footprint: "enabled"
+    // fills it, so those cells are filled (support 0) while the rest are
+    // measured (support 1).
+    fill_cloud_with_band(chunk, [](double x) { return x > 0.0 && x < 12.0; });
+    add_nadir_camera(chunk, 0.0, 0.0, 100.0);
+
+    Params params = dem_params("point_cloud", "enabled", 0.5, 0, "nearest", "none");
+    run_build_dem(document, params);
+
+    const Elevation& dem = chunk.elevation();
+    ASSERT_FALSE(dem.empty());
+    ASSERT_EQ(dem.support.size(), dem.raster.data.size())
+        << "a DEM with filled cells must carry a support mask";
+    EXPECT_EQ(dem.interpolation, "enabled");
+
+    // Every valid cell is either measured (support 1) or filled (support 0);
+    // every nodata cell is unsupported.
+    std::size_t measured = 0;
+    std::size_t filled = 0;
+    std::size_t nodata_but_supported = 0;
+    for (int row = 0; row < dem.raster.grid.height; ++row) {
+        for (int col = 0; col < dem.raster.grid.width; ++col) {
+            const std::size_t i = static_cast<std::size_t>(row) *
+                                      static_cast<std::size_t>(dem.raster.grid.width) +
+                                  static_cast<std::size_t>(col);
+            const bool valid = dem.raster.data[i] != dem.nodata;
+            if (dem.support[i] != 0U) {
+                ++measured;
+                if (!valid) {
+                    ++nodata_but_supported;
+                }
+            } else if (valid) {
+                ++filled;
+            }
+        }
+    }
+    std::printf("[Dem.SupportMaskMarksMeasuredCells] measured=%zu filled=%zu "
+                "nodata_but_supported=%zu\n",
+                measured, filled, nodata_but_supported);
+    EXPECT_GT(measured, 0U);
+    EXPECT_GT(filled, 0U) << "the filled band must be marked unsupported";
+    EXPECT_EQ(nodata_but_supported, 0U) << "a nodata cell cannot be marked measured";
+
+    // The filled band's cells are unsupported; the measured cells beside it are
+    // supported.
+    const auto support_at = [&](double x, double y) {
+        const Eigen::Vector2d c = dem.raster.grid.to_pixel(x, y);
+        const int col = static_cast<int>(std::floor(c.x()));
+        const int row = static_cast<int>(std::floor(c.y()));
+        if (!dem.raster.grid.contains_pixel(col, row)) {
+            return -1;
+        }
+        return static_cast<int>(dem.support[static_cast<std::size_t>(row) *
+                                                static_cast<std::size_t>(dem.raster.grid.width) +
+                                            static_cast<std::size_t>(col)]);
+    };
+    EXPECT_EQ(support_at(6.0, 0.0), 0) << "a filled band cell must be unsupported";
+    EXPECT_EQ(support_at(-20.0, 0.0), 1) << "a measured cell must be supported";
+
+    // A DEM with interpolation disabled has no filled cells: the mask stays
+    // empty, so an old project's bytes are unchanged.
+    Document disabled_doc = make_local_chunk_document();
+    Chunk& disabled_chunk = *disabled_doc.active_chunk();
+    Sensor disabled_sensor;
+    disabled_sensor.type = CameraType::Frame;
+    disabled_sensor.calibration = Calibration::initial(CameraType::Frame, 2000, 2000, 2000.0);
+    disabled_chunk.sensors().push_back(disabled_sensor);
+    fill_cloud_with_band(disabled_chunk, [](double x) { return x > 0.0 && x < 12.0; });
+    add_nadir_camera(disabled_chunk, 0.0, 0.0, 100.0);
+    Params disabled = dem_params("point_cloud", "disabled", 0.5, 0, "nearest", "none");
+    run_build_dem(disabled_doc, disabled);
+    EXPECT_TRUE(disabled_chunk.elevation().support.empty())
+        << "a DEM with no filled cells keeps an empty support mask";
+}
+
 TEST(Dem, EnabledKeepsTheConcaveGapAndTheOutsideNodata) {
     // Two cameras 60 m apart, each with a ~18 m half-footprint on the ground (90 m
     // of relief below a 100 m camera at f = 5000 px over 2000 px): the union is

@@ -376,57 +376,6 @@ TEST(BuildOrthomosaic, SmoothHoleFillWritesEveryColourChannel) {
     }
 }
 
-TEST(BuildOrthomosaic, HoleFillLeavesLargeHolesNodata) {
-    // The ortho hole fill must complete only genuinely SMALL interior holes. A
-    // large gap is a place the survey did not reconstruct, and filling it with a
-    // smooth interpolation of the surroundings is the soft, textureless patch
-    // that reads as a smudge. The rule is a max EDT distance (half the hole's
-    // width): a hole wider than 2x the cap stays nodata.
-    //
-    // A 41x41 grey field with two interior holes: a small 3x3 one and a large
-    // 21x21 one. With max_distance = 3 cells the small hole (EDT <= 2) fills and
-    // the large one (EDT up to 10) does not.
-    constexpr int kWidth = 41;
-    constexpr int kHeight = 41;
-    std::vector<std::uint8_t> rgba(
-        static_cast<std::size_t>(kWidth) * static_cast<std::size_t>(kHeight) * 4U, 0);
-    for (std::size_t i = 0; i < rgba.size(); i += 4U) {
-        rgba[i] = 120;
-        rgba[i + 1U] = 120;
-        rgba[i + 2U] = 120;
-        rgba[i + 3U] = 255;
-    }
-    const auto punch = [&](int x0, int y0, int side) {
-        for (int y = y0; y < y0 + side; ++y) {
-            for (int x = x0; x < x0 + side; ++x) {
-                const std::size_t i =
-                    (static_cast<std::size_t>(y) * static_cast<std::size_t>(kWidth) +
-                     static_cast<std::size_t>(x)) * 4U;
-                rgba[i + 3U] = 0;
-            }
-        }
-    };
-    punch(5, 5, 3);    // small hole, EDT <= 2
-    punch(15, 15, 21); // large hole, EDT up to 10
-
-    elevation::HoleFillOptions fill;
-    fill.method = elevation::HoleFill::NaturalNeighbour;
-    fill.interior_only = true;
-    fill.max_distance = 3.0;  // cells
-    ortho::detail::fill_smooth_rgba_holes(kWidth, kHeight, rgba, fill);
-
-    const auto alpha_at = [&](int x, int y) {
-        return static_cast<int>(
-            rgba[(static_cast<std::size_t>(y) * static_cast<std::size_t>(kWidth) +
-                  static_cast<std::size_t>(x)) * 4U + 3U]);
-    };
-    // The small hole is completed and opaque.
-    EXPECT_EQ(alpha_at(6, 6), 255) << "a small interior hole must be filled";
-    // The large hole's centre is beyond the cap: it stays nodata.
-    EXPECT_EQ(alpha_at(25, 25), 0) << "a large hole must stay nodata, not be smeared over";
-    // Its rim (within the cap) may fill; the centre is the decisive cell.
-}
-
 TEST(BuildOrthomosaic, MatchesTruthOrtho) {
     OrthoSetup& s = setup();
     Chunk& chunk = *s.document.active_chunk();
@@ -1114,6 +1063,10 @@ TEST(ExportOrthomosaic, ProductsSurviveSaveAndLoad) {
     EXPECT_TRUE(got == project_chunk);
     EXPECT_EQ(got.elevation().epsg(), chunk.elevation().epsg());
     EXPECT_EQ(got.elevation().source, "depth_maps");
+    // The DEM's support mask and interpolation mode survive the round trip, so
+    // a reloaded project's ortho can still gate on measured-vs-filled surface.
+    EXPECT_EQ(got.elevation().interpolation, chunk.elevation().interpolation);
+    EXPECT_EQ(got.elevation().support, chunk.elevation().support);
     EXPECT_EQ(got.orthomosaic().epsg(), chunk.orthomosaic().epsg());
     EXPECT_EQ(got.orthomosaic().surface, "elevation");
     EXPECT_EQ(got.orthomosaic().labels, chunk.orthomosaic().labels);

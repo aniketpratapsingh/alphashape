@@ -849,15 +849,21 @@ All notable changes to alphashape are recorded here. The format follows
   camera's colour into its invalid cells also copies the nearest valid colour
   instead of averaging neighbours, so it no longer synthesises a low-frequency
   value of its own.
-- **Stretched, streaked edges beyond the reconstructed surface.** A cell seen
-  only at a grazing angle (more than about 80 degrees from nadir) is no longer
-  coloured: its footprint is stretched by 1/cos(incidence) and it samples the
-  photograph's own border, which is the "stretched roof with moire" artefact at
-  the edge of a block. Such a cell is left nodata, so the mosaic blend can no
-  longer be forced to use the most oblique view when it is the only one. The
-  orthomosaic's hole fill also completes only genuinely small interior holes
-  (within 1 m of valid data) and leaves larger gaps nodata, instead of smearing a
-  smooth interpolation across a place the survey did not reconstruct.
+- **Stretched, streaked edges beyond the reconstructed surface.** A cell is no
+  longer coloured from a view whose ground footprint is stretched beyond a
+  stated factor. The stretch is measured against the local DEM surface NORMAL
+  (the incidence), not the view against vertical: a near-nadir camera over a
+  steep or wrong surface still hits it at a grazing incidence, and that is the
+  "stretched roof with moire" artefact at the edge of a block. A view whose
+  footprint is stretched by more than 4x (incidence cosine below 0.25, about
+  75.5 degrees) is not used for that cell, and the cell is left nodata when no
+  better view exists. The orthomosaic is also no longer produced over DEM cells
+  that were interpolated or extrapolated rather than measured: the DEM now
+  records a per-cell support mask (measured vs filled), and the ortho leaves an
+  unsupported cell nodata unless the DEM itself was built with extrapolation
+  enabled. The orthomosaic's hole fill still completes every interior hole the
+  survey enclosed (`fill_holes=true` means the whole interior, not a size-gated
+  subset).
 - **Marker and camera references in a projected CRS (MGA, UTM, a national grid)
   were read as degrees or refused.** `OptimizeCameras`, `UpdateTransform`,
   `AlignFromReference` and the alignment georeference now convert a projected

@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 namespace alphashape::ortho {
 namespace {
@@ -62,6 +63,100 @@ double dem_max(const GeoRaster<float>& dem, float nodata) {
     }
     return best;
 }
+
+/// The local surface normal of the DEM at plane-frame (x, y), in the plane frame
+/// (x east, y north, z up), unit length. The gradient is a central difference
+/// over the DEM's own cells, nodata-aware: a missing neighbour falls back to the
+/// one-sided difference, and a cell with no valid neighbour at all returns the
+/// vertical (0, 0, 1) so the incidence test degrades to the view-vs-vertical
+/// floor rather than inventing a slope.
+///
+/// `metres_per_unit_x/y` scale the plane's x/y axes to ground metres: a
+/// Geographic plane carries degrees there while z is metres, so the gradient's
+/// denominator must be the cell's GROUND width (`pixel_size * metres_per_unit`),
+/// not its degree width, or a flat cell would read as a flying cliff.
+///
+/// The normal is what the incidence is measured against. A steep DEM cell (a
+/// wall, a fake ramp, an extrapolated edge) has a normal far from vertical, so a
+/// near-nadir camera hits it at a grazing incidence -- which is the stretch the
+/// view-vs-vertical test cannot see.
+Eigen::Vector3d surface_normal(const GeoRaster<float>& dem, float nodata, double x, double y,
+                              double metres_per_unit_x, double metres_per_unit_y) {
+    const RasterGrid& grid = dem.grid;
+    const Eigen::Vector2d c = grid.to_pixel(x, y);
+    const int col = static_cast<int>(std::floor(c.x()));
+    const int row = static_cast<int>(std::floor(c.y()));
+    const auto height_at = [&](int cc, int rr, double& out) {
+        if (!grid.contains_pixel(cc, rr)) {
+            return false;
+        }
+        const float h = dem.at(cc, rr);
+        if (h == nodata || std::isnan(h)) {
+            return false;
+        }
+        out = static_cast<double>(h);
+        return true;
+    };
+    double h_here = 0.0;
+    if (!height_at(col, row, h_here)) {
+        return Eigen::Vector3d(0.0, 0.0, 1.0);
+    }
+    // Central difference where both neighbours are valid, one-sided otherwise.
+    const auto slope = [&](int dc, int dr, double cell) {
+        double a = 0.0;
+        double b = 0.0;
+        const bool has_a = height_at(col - dc, row - dr, a);
+        const bool has_b = height_at(col + dc, row + dr, b);
+        if (has_a && has_b) {
+            return (b - a) / (2.0 * cell);
+        }
+        if (has_b) {
+            return (b - h_here) / cell;
+        }
+        if (has_a) {
+            return (h_here - a) / cell;
+        }
+        return 0.0;
+    };
+    // The cell's ground width: a metric plane has metres_per_unit = 1, a
+    // Geographic one carries the arc length per degree.
+    const double cell_x = grid.pixel_size_x * (metres_per_unit_x > 0.0 ? metres_per_unit_x : 1.0);
+    const double cell_y = grid.pixel_size_y * (metres_per_unit_y > 0.0 ? metres_per_unit_y : 1.0);
+    // y grows NORTH but row grows SOUTH, so the row difference is negated.
+    const double dz_dx = slope(1, 0, cell_x);
+    const double dz_dy = -slope(0, 1, cell_y);
+    Eigen::Vector3d n(-dz_dx, -dz_dy, 1.0);
+    const double norm = n.norm();
+    return norm > 0.0 ? n / norm : Eigen::Vector3d(0.0, 0.0, 1.0);
+}
+
+/// True when the DEM cell at plane-frame (x, y) is SUPPORTED: measured, or
+/// interpolated in a DEM the user asked to extrapolate. `support` is the DEM's
+/// per-cell mask (1 = measured, 0 = filled); an empty mask means every valid cell
+/// is measured (an old project, or a source with no fill), so the cell is
+/// supported. `allow_unsupported` is set when the DEM was built with
+/// interpolation "extrapolated", where the user explicitly asked for the surface
+/// to be carried past the last measurement.
+bool cell_supported(const std::vector<std::uint8_t>& support, const RasterGrid& grid, double x,
+                    double y, bool allow_unsupported) {
+    if (allow_unsupported || support.empty()) {
+        return true;
+    }
+    const Eigen::Vector2d c = grid.to_pixel(x, y);
+    const int col = static_cast<int>(std::floor(c.x()));
+    const int row = static_cast<int>(std::floor(c.y()));
+    if (!grid.contains_pixel(col, row)) {
+        return false;
+    }
+    const std::size_t index = static_cast<std::size_t>(row) *
+                                  static_cast<std::size_t>(grid.width) +
+                              static_cast<std::size_t>(col);
+    return index < support.size() && support[index] != 0;
+}
+
+/// A shared empty support mask, so a caller that passes an OrthoSupport with no
+/// mask (or no OrthoSupport at all) reads "every valid cell measured".
+const std::vector<std::uint8_t> kEmptySupport;
 
 /// Bilinear colour sample of an 8-bit 1- or 3-channel image at continuous pixel
 /// coordinates (0.5, 0.5) = centre of the top-left pixel. Edges clamp.
@@ -126,17 +221,37 @@ bool blocked(const GeoRaster<float>& dem, float nodata, double tol, double x, do
 /// only what turns "this ray never got above the terrain" into a finite loop.
 constexpr std::size_t kMaxOcclusionSamplesPerRay = 1000000;
 
-/// The smallest cosine of the view angle against vertical a cell may be coloured
-/// from. A view more oblique than this (about 80 degrees from nadir) is a grazing
-/// look at the surface: its ground footprint is stretched by 1/cos(incidence), so
-/// one image pixel covers many ground cells and the rectified colour is a smear
-/// of the image's own border pixels -- the "stretched roof with moire" artefact at
-/// the edge of a block, where the only camera that reaches a marginal cell is the
-/// most oblique one. Such a view is not a measurement of the surface colour, so
-/// the cell is left invalid rather than coloured from it. The seam labeller and
-/// the average blend already prefer a higher score; this makes the preference a
-/// hard floor so the MOSAIC blend (which ignores score) cannot be forced to use a
-/// grazing view when it is the only one. cos(80 deg) = 0.174.
+/// The smallest cosine of the incidence angle (against the local surface normal)
+/// a cell may be coloured from. The ground footprint of one image pixel is
+/// stretched by 1/cos(incidence) along the steepest direction, so a view with
+/// cos(incidence) below 1/kMaxGroundStretch covers more than kMaxGroundStretch
+/// times its nadir area in that one image pixel: the rectified colour is a smear
+/// of a few photograph pixels spread over many ground cells. This is the
+/// "stretched roof with moire" artefact. It is measured against the DEM's local
+/// normal, not against vertical, because a near-nadir camera over a steep or
+/// wrongly interpolated surface still hits that surface at a grazing incidence:
+/// the view being near-vertical says nothing about the stretch when the surface
+/// is what is steep.
+///
+/// kMaxGroundStretch = 4 means an image pixel may cover at most 4x its nadir
+/// ground size before the view is rejected for that cell: cos = 1/4 = 0.25, i.e.
+/// about 75.5 degrees of incidence. A factor of 1-2 is ordinary foreshortening on
+/// a roof or a slope and keeps full texture; by 4x a single photograph pixel
+/// spans four or more output cells and the resampled colour can no longer carry
+/// detail, only the average -- which is exactly the streak. Cells with no view
+/// under the limit are left invalid so the mosaic blend cannot be forced to use
+/// a stretched view when it is the only one.
+constexpr double kMaxGroundStretch = 4.0;
+constexpr double kMinIncidenceCosine = 1.0 / kMaxGroundStretch;
+
+/// The smallest cosine of the view angle against VERTICAL a cell may be coloured
+/// from. This is a cheap, surface-independent pre-filter: a ray more than about
+/// 80 degrees from vertical (cos < 0.174) is a grazing look no matter how the
+/// surface is oriented. It is NOT the stretch test (which is the incidence
+/// against the local normal, above): on a nadir flight the view angle is never
+/// more than ~40 degrees from vertical, so this floor never fires there and can
+/// only catch a genuinely edge-on camera. Kept because it also avoids sampling a
+/// footprint that runs past the reconstructed area entirely.
 constexpr double kMinViewCosine = 0.17;
 
 /// DEM samples taken by the occlusion march since the last reset. Test-only:
@@ -429,7 +544,7 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
                        const RasterGrid& out_grid, const OrthoCamera& camera,
                        int camera_index, double occlusion_tolerance, bool crop,
                        const OrthoSurfaceRange* surface_range,
-                       const OrthoCellLattice* lattice) {
+                       const OrthoCellLattice* lattice, const OrthoSupport* support) {
     OrthoTile tile;
     tile.camera = camera_index;
     if (camera.image == nullptr || camera.image->empty() || dem.empty()) {
@@ -564,6 +679,15 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
             if (z == static_cast<double>(dem_nodata)) {
                 continue;  // no ground here
             }
+            // Support gate: a cell the DEM interpolated or extrapolated is not a
+            // measurement, so it is not rectified onto (unless the DEM was built
+            // with extrapolation enabled). This is what keeps the ortho off the
+            // invented marginal surface at the block edge.
+            if (support != nullptr &&
+                !cell_supported(support->mask != nullptr ? *support->mask : kEmptySupport,
+                                dem.grid, x, y, support->allow_unsupported)) {
+                continue;
+            }
             const Eigen::Vector3d P(x, y, z);
             // Compute the ray in metres when the plane is geographic: the x/y
             // components of `to_cam` and `to_local` (below) are degrees there.
@@ -642,13 +766,22 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
 
             // -- score: cos(view vs vertical) * border taper ----------------
             const double cos_view = std::clamp(dir.z(), 0.0, 1.0);  // plane-frame vertical
-            // A grazing view is not a measurement of the surface colour: its
-            // footprint is stretched by 1/cos(incidence) and it samples the
-            // image's own border. Leave the cell invalid rather than colour it
-            // from such a view (see kMinViewCosine). This is what stops a block
-            // edge -- where the only camera reaching a marginal cell is the most
-            // oblique one -- from being stretched into streaks.
+            // A grazing view is not a measurement of the surface colour. Two
+            // tests, both required:
+            //   1. the view-vs-vertical floor (a cheap, surface-independent
+            //      pre-filter for a genuinely edge-on camera), and
+            //   2. the INCIDENCE against the local DEM normal, which is the real
+            //      stretch test: a near-nadir camera over a steep or wrongly
+            //      interpolated surface still hits it at a grazing incidence, and
+            //      that is the stretched roof / wavy border artefact. A view whose
+            //      footprint is stretched by more than kMaxGroundStretch is not
+            //      used for this cell; with no better view the cell stays invalid.
             if (cos_view < kMinViewCosine) {
+                continue;
+            }
+            const Eigen::Vector3d normal = surface_normal(dem, dem_nodata, x, y, mx, my);
+            const double cos_incidence = dir.dot(normal);
+            if (!(cos_incidence >= kMinIncidenceCosine)) {
                 continue;
             }
             const double edge = std::min(std::min(u, iw - u), std::min(v, ih - v));

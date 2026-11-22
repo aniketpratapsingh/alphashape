@@ -1255,6 +1255,26 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
     elevation.raster.grid = grid;
     elevation.raster.channels = 1;
     elevation.raster.data = std::move(final_values);
+    // The support mask: 1 where the cell was MEASURED (a real dense sample), 0
+    // where the hole fill interpolated or extrapolated it. `observed` is exactly
+    // that measured mask (captured before the fill). It is written only when the
+    // DEM actually has filled cells, so a fully measured DEM (or one built with
+    // interpolation disabled) keeps an empty mask -- "every valid cell measured"
+    // -- and its bytes are unchanged. The orthomosaic reads this to avoid
+    // rectifying photographs onto invented surface at the block edge.
+    bool any_filled = false;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (final_valid[i] != 0U && observed[i] == 0U) {
+            any_filled = true;
+            break;
+        }
+    }
+    if (any_filled) {
+        elevation.support.assign(count, 0U);
+        for (std::size_t i = 0; i < count; ++i) {
+            elevation.support[i] = observed[i] != 0U ? std::uint8_t{1} : std::uint8_t{0};
+        }
+    }
     elevation.set_epsg(frame.epsg());
 #if defined(ALPHASHAPE_USE_PROJ)
     // Keep the canonical WKT beside the code so a custom (uncoded) CRS survives
@@ -1265,6 +1285,7 @@ Elevation build_dem(const Chunk& chunk, const DemOptions& options,
 #endif
     elevation.nodata = -32767.0F;
     elevation.source = source_label;
+    elevation.interpolation = options.interpolation;
     tick(1.0);
     return elevation;
 }

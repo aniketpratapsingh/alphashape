@@ -2005,6 +2005,11 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     // -- the surface raster and the output grid ------------------------------
     GeoRaster<float> surface = dem.raster;
     float surface_nodata = dem.nodata;
+    // The DEM's support mask, kept on the SAME grid as `surface`: it starts on
+    // the DEM's grid and is reprojected alongside the surface when the run
+    // builds in a different CRS (below). Empty means "every valid cell
+    // measured".
+    std::vector<std::uint8_t> surface_support = dem.support;
     // The DTO naming the surface's CRS, so a model-surface DSM is rasterised
     // into the same plane the frame uses.
     CRS surface_crs = dem.empty() ? options.crs : dem.crs;
@@ -2052,6 +2057,20 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         reproject_options.nodata_out = dem.nodata;
         surface = reproject(dem.raster, from, to, surface_grid, reproject_options);
         surface_nodata = dem.nodata;
+        // The support mask must follow the surface onto the new grid, or the
+        // gate would read the wrong cells. A nearest resample of the 0/1 mask
+        // keeps each target cell's support from the source cell it lands on;
+        // cells the source does not cover read 0 (unsupported), which is the
+        // conservative answer for a cell the DEM never measured.
+        if (!surface_support.empty()) {
+            GeoRaster<std::uint8_t> support_raster;
+            support_raster.grid = dem.raster.grid;
+            support_raster.channels = 1;
+            support_raster.data = surface_support;
+            const GeoRaster<std::uint8_t> reprojected =
+                reproject(support_raster, from, to, surface_grid, reproject_options);
+            surface_support = reprojected.data;
+        }
         surface_crs = options.crs;
         frame = elevation::for_options(*chunk, options.crs);
         progress.update("initialize", 0.6);
@@ -2247,6 +2266,22 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     const std::uint64_t budget = platform::memory_budget_bytes();
     const double photo_cells = largest_photograph_cells(cameras);
     const HeightRange heights = surface_height_range(surface, surface_nodata);
+
+    // -- the DEM's support mask ----------------------------------------------
+    // The ortho is not produced over surface the DEM interpolated or
+    // extrapolated rather than measured: at the block edge that filled surface
+    // is a near-flat extrapolation, and rectifying a photograph onto it is what
+    // produces the wavy, unsupported border. The mask is the DEM's own
+    // measured-vs-filled record. It is honoured unless the DEM was built with
+    // interpolation "extrapolated", where the user explicitly asked for the
+    // surface to extend past the last measurement. A "model" surface is a DSM
+    // rasterised from the mesh (every cell is real geometry), so it is fully
+    // supported and carries no mask.
+    ortho::OrthoSupport support;
+    if (options.surface == "elevation" && !surface_support.empty()) {
+        support.mask = &surface_support;
+        support.allow_unsupported = dem.interpolation == "extrapolated";
+    }
 
     // -- memory guard, BEFORE any cell-sized allocation ----------------------
     // Refuse (or, for the automatic cell, coarsen) a run whose peak cannot fit
@@ -2705,7 +2740,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                 tiles.push_back(ortho::orthorectify(
                     surface, surface_nodata, window, camera, static_cast<int>(k),
                     occlusion_tolerance, true, &surface_range,
-                    plan.block_cells > 0 ? &cell_lattice : nullptr));
+                    plan.block_cells > 0 ? &cell_lattice : nullptr, &support));
                 // Apply the camera's precomputed correction to the tile just
                 // rectified, BEFORE the seam labeller reads it. The model is a
                 // whole-flight constant (see estimate_camera_gains /
@@ -2971,20 +3006,12 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         elevation::HoleFillOptions fill;
         fill.method = elevation::HoleFill::NaturalNeighbour;
         fill.interior_only = true;
-        // Only genuinely SMALL interior holes are completed. A hole's EDT
-        // distance to the nearest valid cell is half its width, so capping the
-        // distance at kMaxHoleFillMetres fills holes up to ~2x that across and
-        // leaves larger gaps nodata. This is the "hole-filling depth" rule: a
-        // big gap is not a hole to be invented, it is a place the survey did not
-        // reconstruct, and filling it with a smooth interpolation of the
-        // surroundings is exactly the soft, textureless patch that reads as a
-        // smudge. The cap is in metres, converted to cells with the output cell
-        // size (the fill runs on the output grid).
-        constexpr double kMaxHoleFillMetres = 1.0;
-        const double cell_metres = std::max(grid.pixel_size_x, grid.pixel_size_y);
-        if (cell_metres > 0.0 && std::isfinite(cell_metres)) {
-            fill.max_distance = kMaxHoleFillMetres / cell_metres;
-        }
+        // fill_holes == true means EVERY interior hole is completed: a hole the
+        // survey enclosed is a place the ortho should show, and a user who asks
+        // for hole filling expects the whole interior filled, not a size-gated
+        // subset. (The reported dark smudges were not hole fills -- they were the
+        // multiband blend's low-frequency attenuation at a validity boundary,
+        // fixed in blend.cpp -- so this stage stays a plain interior fill.)
         // Smooth always runs: for "texture" it is both the initial image the
         // exemplar completion starts from and the fallback for a hole it
         // cannot source. Record which cells it is about to change so the

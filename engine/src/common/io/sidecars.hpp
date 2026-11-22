@@ -106,6 +106,11 @@ constexpr char kPointCloudMagic[4] = {'A', 'P', 'C', '1'};
 constexpr char kMeshMagic[4] = {'A', 'M', 'S', '1'};   // legacy, read-only
 constexpr char kMeshMagic2[4] = {'A', 'M', 'S', '2'};  // current
 constexpr char kOrthoLabelsMagic[4] = {'A', 'O', 'L', '1'};
+/// The DEM's per-cell support mask (measured vs filled), a companion to the
+/// elevation GeoTIFF: u32 count, i32 width, i32 height, then count u8 flags.
+/// Absent means "every valid cell measured" (an old project, or a DEM with no
+/// fill), so it needs no migration.
+constexpr char kElevationSupportMagic[4] = {'A', 'E', 'S', '1'};
 constexpr char kMasksMagic[4] = {'A', 'M', 'K', '1'};
 constexpr char kShapesMagic[4] = {'A', 'S', 'H', '1'};
 constexpr char kTrajectoryMagic[4] = {'A', 'T', 'J', '1'};
@@ -161,6 +166,14 @@ Orthomosaic decode_orthomosaic(const std::vector<std::uint8_t>& bytes,
 std::vector<std::uint8_t> encode_ortho_labels(const Orthomosaic& ortho);
 std::vector<std::int32_t> decode_ortho_labels(const std::vector<std::uint8_t>& in,
                                               int width, int height);
+
+/// The DEM support mask sidecar (see kElevationSupportMagic). `support` is
+/// width*height cells; the encoder writes it as-is. The decoder checks the
+/// stored dimensions against `width`/`height` and returns one flag per cell.
+std::vector<std::uint8_t> encode_elevation_support(const std::vector<std::uint8_t>& support,
+                                                   int width, int height);
+std::vector<std::uint8_t> decode_elevation_support(const std::vector<std::uint8_t>& in,
+                                                   int width, int height);
 
 // -- M11 containers ---------------------------------------------------------
 
