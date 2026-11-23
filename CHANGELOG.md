@@ -837,6 +837,14 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Fixed
 
+- **Straight colour steps along block boundaries in a large orthomosaic.** A
+  block decided the seam in its overlap margin and then discarded that decision,
+  so the next block re-optimised the overlap and could switch camera exactly on
+  the shared border, where the interior copy cut it. A block now records the
+  seam it chose in the margin band the next block reads, and that block keeps
+  it, so a camera switch is never cut at a block edge. The final labels and
+  colours of every block's own region are otherwise unchanged, and a run with
+  seamline refinement off is byte-identical.
 - **Dark blurry smudges in the orthomosaic.** The multiband (mosaic) blend's
   per-camera masks partition only the cells a camera actually covers, so near the
   edge of a camera's footprint, a hole or the block border the masks summed to
