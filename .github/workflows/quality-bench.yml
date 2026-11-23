@@ -55,6 +55,7 @@ on:
           - aerial-nadir
           - terrestrial-laser
           - gcp-rtk
+          - gcp-eurosdr
           - all
       # A comma-separated allowlist of the gcp-rtk protocol's diagnostic
       # variants. Empty runs the full set, which is the normal behaviour; a
@@ -322,6 +323,20 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.datasets) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # Free the runner's preinstalled toolchains. The EuroSDR block's archive is
+      # 9.9 GB and its extracted flight is ~3.7 GB, which does not fit the
+      # default ~14 GB free on an ubuntu-24.04 runner alongside the build tree.
+      # These directories are the standard large ones and none is used by this
+      # job; the other datasets are unaffected (they simply have more headroom).
+      - name: Free runner disk
+        run: |
+          echo "before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/local/lib/node_modules /opt/az /usr/share/swift || true
+          sudo apt-get clean
+          echo "after:"; df -h /
 
       # The CLI comes from the build job as a single file, so there is no build tree
       # to unpack and no absolute-path dependence between the two jobs.

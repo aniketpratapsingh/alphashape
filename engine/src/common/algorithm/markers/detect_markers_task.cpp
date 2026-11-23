@@ -230,13 +230,73 @@ std::vector<Detection> detect_circular(const FloatImage& image,
     const std::vector<MarkerCandidate> dark_candidates =
         detect_blobs(image, blob);
     if (spec.kind == MarkerKind::CircularNonCoded) {
+        // A non-coded circular target is a printed disc: a bright disk, often
+        // with a small dark centre dot. The dark-on-light pass above finds the
+        // DOT, whose blob centroid is dragged a few pixels by the surrounding
+        // bright ring at the small dot scale, so the detected centre is biased.
+        // The bright disk is the printed fiducial and its outer border is the
+        // unbiased centre, exactly as for a parity-0 coded target. Run the
+        // light-on-dark pass and, for each dark candidate that a bright disk
+        // encloses, fit that disk's outer border. A dark disc (the dark blob
+        // IS the disk) has no enclosing bright disk, so it keeps the blob
+        // centre, which is already the disk centre.
+        BlobParams light = blob;
+        light.dark_on_light = false;
+        const int light_extent =
+            std::max(3, std::min(image.width(), image.height()));
+        light.max_radius =
+            std::max(light.min_radius,
+                     std::min(light_extent / 2, 4 * blob.max_radius));
+        const std::vector<MarkerCandidate> light_candidates =
+            detect_blobs(image, light);
+        const GradientField gradient = compute_gradient_field(image);
         for (const MarkerCandidate& candidate : dark_candidates) {
             if (candidate.radius_px < params.minimum_size) {
                 continue;
             }
+            // The bright disk enclosing this dark blob, if any: the largest
+            // light blob whose centre is within a dot radius of the dark blob
+            // and whose radius is a plausible disc/dot multiple of it. A
+            // disc-with-dot prints the dot at the disk centre, so the two
+            // centres coincide; the ratio bound rejects a large ground blob
+            // that happens to sit near the dot.
+            const MarkerCandidate* disc = nullptr;
+            for (const MarkerCandidate& bright : light_candidates) {
+                if (bright.radius_px < 1.5 * candidate.radius_px ||
+                    bright.radius_px > 6.0 * candidate.radius_px) {
+                    continue;
+                }
+                if ((bright.center - candidate.center).norm() >
+                    std::max(2.0, 0.5 * candidate.radius_px)) {
+                    continue;
+                }
+                if (disc == nullptr || bright.radius_px > disc->radius_px) {
+                    disc = &bright;
+                }
+            }
             Detection detection;
-            detection.center = candidate.center;
-            detection.radius = candidate.radius_px;
+            if (disc != nullptr) {
+                // Fit the disk's outer border from the dot centre. The light
+                // blob's own radius stops at the dot's bright ring, so the
+                // border search starts past the dot.
+                double fitted_radius = disc->radius_px;
+                const auto fitted = refine_border_center(
+                    gradient, candidate.center, disc->radius_px,
+                    &fitted_radius);
+                if (fitted && fitted_radius >= 0.8 * disc->radius_px &&
+                    fitted_radius <= 2.0 * disc->radius_px &&
+                    (*fitted - candidate.center).norm() <=
+                        std::max(4.0, 0.5 * fitted_radius)) {
+                    detection.center = *fitted;
+                    detection.radius = fitted_radius;
+                } else {
+                    detection.center = disc->center;
+                    detection.radius = disc->radius_px;
+                }
+            } else {
+                detection.center = candidate.center;
+                detection.radius = candidate.radius_px;
+            }
             out.push_back(detection);
         }
         return out;
@@ -572,7 +632,24 @@ void refine_from_windows(std::vector<Detection>& detections,
             seed.center = local;
             seed.radius_px = detection.radius;
             seed.axis_ratio = 1.0;
-            if (detection.coded && !detection.centre_dot) {
+            if (spec.kind == MarkerKind::CircularNonCoded) {
+                // A non-coded disc's fiducial is the disk's outer border, not
+                // the first radial edge (which is the small dark centre dot on
+                // a disc-with-dot). The detection radius is already the fitted
+                // disk radius, so the border search starts from it.
+                const GradientField gradient =
+                    compute_gradient_field(window.image);
+                double fitted_radius = detection.radius;
+                const auto refined = refine_border_center(
+                    gradient, local, detection.radius, &fitted_radius);
+                if (refined && fitted_radius >= 0.8 * detection.radius &&
+                    fitted_radius <= 1.5 * detection.radius &&
+                    (*refined - local).norm() <=
+                        std::max(4.0, 0.5 * fitted_radius)) {
+                    detection.center = *refined + offset;
+                    detection.radius = fitted_radius;
+                }
+            } else if (detection.coded && !detection.centre_dot) {
                 // Parity-0 targets have no centre dot: a first-edge fit takes
                 // the 0.5 R sector ring on some rays and the border on others,
                 // and an asymmetric sector word biases the centre (measured up
@@ -899,7 +976,12 @@ std::size_t estimate_peak_working_set(int width, int height, int scale,
     const std::size_t copies =
         kind == MarkerKind::Cross
             ? std::size_t{3}
-            : (kind == MarkerKind::AprilTag ? std::size_t{2} : std::size_t{1});
+            : (kind == MarkerKind::AprilTag
+                   ? std::size_t{2}
+                   // A non-coded disc runs the dark AND light blob passes plus
+                   // a gradient field for the border fit.
+                   : (kind == MarkerKind::CircularNonCoded ? std::size_t{2}
+                                                           : std::size_t{1}));
     return full + reduced + copies * luminance_bytes(detect_width, detect_height);
 }
 

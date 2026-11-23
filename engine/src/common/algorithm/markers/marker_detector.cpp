@@ -1397,6 +1397,52 @@ std::optional<Eigen::Vector2d> refine_border_center(const FloatImage& gray,
                                 expected_radius, fitted_radius);
 }
 
+std::optional<BoundaryFit> fit_boundary_ellipse(const GradientField& gradient,
+                                                const Eigen::Vector2d& centre,
+                                                double expected_radius,
+                                                bool outermost) {
+    if (gradient.magnitude.empty() || !centre.allFinite() ||
+        !std::isfinite(expected_radius) || !(expected_radius > 0.5)) {
+        return std::nullopt;
+    }
+    const FloatImage& field = gradient.magnitude;
+    Eigen::Vector2d current = centre - Eigen::Vector2d(0.5, 0.5);
+    double radius = expected_radius;
+    std::optional<Ellipse> last;
+    std::vector<WeightedPoint> last_samples;
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        std::vector<WeightedPoint> samples =
+            radial_edge_samples(field, current, radius, outermost);
+        const std::optional<Ellipse> fit = robust_fit(samples);
+        if (!fit) break;
+        last = fit;
+        last_samples = std::move(samples);
+        const double move = (fit->center - current).norm();
+        current = fit->center;
+        radius = std::max(fit->a, 1.0);
+        if (move < 1e-3) break;
+    }
+    if (!last || !current.allFinite()) {
+        return std::nullopt;
+    }
+    // Median radial residual of the accepted samples against the final fit.
+    // The robust fit already dropped gross outliers, so this measures how well
+    // the surviving edge points lie on one ellipse: a printed outline is a
+    // fraction of a pixel, background texture is several tenths.
+    std::vector<double> residuals;
+    residuals.reserve(last_samples.size());
+    for (const WeightedPoint& sample : last_samples) {
+        if (!sample.point.allFinite() || !(sample.weight > 0.0)) continue;
+        residuals.push_back(ellipse_residual(*last, sample.point));
+    }
+    BoundaryFit out;
+    out.ellipse = *last;
+    out.ellipse.center = current + Eigen::Vector2d(0.5, 0.5);
+    out.residual_px = residuals.empty() ? 0.0 : median_of(std::move(residuals));
+    out.samples = static_cast<int>(last_samples.size());
+    return out;
+}
+
 std::vector<MarkerCandidate> detect_blobs(const FloatImage& gray, const BlobParams& params,
                                           DetectionTimings* timings) {
     return detect_blobs_impl(gray, params, timings);

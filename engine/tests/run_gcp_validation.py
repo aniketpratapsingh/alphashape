@@ -535,6 +535,112 @@ def project_world(rotation, centre, focal, width, height, point):
             height / 2.0 + focal * camera[1] / camera[2])
 
 
+def project_marker_pixel(point_local, pose, calibration):
+    """Project a chunk-local point through one camera's full Brown model.
+
+    ``pose`` is the 4x4 world->camera transform (``Camera.pose``) and
+    ``calibration`` a ``Sensor.calibration`` (or any object with the same
+    attributes). Returns ``(u, v)`` in the engine's corner-origin pixel
+    convention, or ``None`` when the point is behind the camera or the
+    projection is not finite. This is the same forward model the engine's
+    ``project_marker`` uses for a frame camera, so a marker's reprojection
+    residual computed here matches the one the bundle adjustment minimises.
+
+    A fisheye sensor is refused rather than projected with the wrong model: the
+    real-block protocol's blocks are frame cameras, and a silent wrong model
+    would make the residual meaningless.
+    """
+    if str(getattr(calibration, "type", "frame")).strip().lower() != "frame":
+        raise ValueError(
+            "project_marker_pixel: only the frame model is supported; got "
+            f"{getattr(calibration, 'type', None)!r}")
+    x = pose[0][0] * point_local[0] + pose[0][1] * point_local[1] + \
+        pose[0][2] * point_local[2] + pose[0][3]
+    y = pose[1][0] * point_local[0] + pose[1][1] * point_local[1] + \
+        pose[1][2] * point_local[2] + pose[1][3]
+    z = pose[2][0] * point_local[0] + pose[2][1] * point_local[1] + \
+        pose[2][2] * point_local[2] + pose[2][3]
+    if not (z > 0.0):
+        return None
+    xs = x / z
+    ys = y / z
+    k1 = float(getattr(calibration, "k1", 0.0))
+    k2 = float(getattr(calibration, "k2", 0.0))
+    k3 = float(getattr(calibration, "k3", 0.0))
+    k4 = float(getattr(calibration, "k4", 0.0))
+    p1 = float(getattr(calibration, "p1", 0.0))
+    p2 = float(getattr(calibration, "p2", 0.0))
+    p3 = float(getattr(calibration, "p3", 0.0))
+    p4 = float(getattr(calibration, "p4", 0.0))
+    r2 = xs * xs + ys * ys
+    r4 = r2 * r2
+    radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r4 * r2 + k4 * r4 * r4
+    xd = xs * radial + p1 * (r2 + 2.0 * xs * xs) + 2.0 * p2 * xs * ys
+    yd = ys * radial + p2 * (r2 + 2.0 * ys * ys) + 2.0 * p1 * xs * ys
+    if p3 != 0.0 or p4 != 0.0:
+        q1 = p1 + p3 * r2
+        q2 = p2 + p4 * r2
+        xd = xs * radial + q1 * (r2 + 2.0 * xs * xs) + 2.0 * q2 * xs * ys
+        yd = ys * radial + q2 * (r2 + 2.0 * ys * ys) + 2.0 * q1 * xs * ys
+    width = float(getattr(calibration, "width", 0))
+    height = float(getattr(calibration, "height", 0))
+    f = float(getattr(calibration, "f", 0.0))
+    b1 = float(getattr(calibration, "b1", 0.0))
+    b2 = float(getattr(calibration, "b2", 0.0))
+    u = width * 0.5 + float(getattr(calibration, "cx", 0.0)) + xd * (f + b1) + yd * b2
+    v = height * 0.5 + float(getattr(calibration, "cy", 0.0)) + yd * f
+    if not (math.isfinite(u) and math.isfinite(v)):
+        return None
+    return (u, v)
+
+
+def marker_reprojection_rms(chunk, labels):
+    """Post-adjustment marker reprojection RMS in pixels, per label and overall.
+
+    For every marker in ``labels`` that has a computed position, each of its
+    projections is reprojected through the camera's own pose and calibration and
+    compared with the measured pixel. Returns ``(per_label, overall)`` where
+    ``per_label`` maps a label to ``{"observations", "rms_px"}`` (``rms_px`` is
+    ``None`` when the marker has no usable projection) and ``overall`` is the
+    RMS over every residual, or ``None`` when there is none. A projection onto a
+    camera that is not in the chunk, or a point that does not project, is
+    skipped rather than counted as a zero residual.
+    """
+    sensors = list(chunk.sensors)
+    cameras = {camera.label: camera for camera in chunk.cameras}
+    per_label = {}
+    residuals = []
+    for marker in chunk.markers:
+        if marker.label not in labels:
+            continue
+        position = marker.position
+        label_residuals = []
+        observations = 0
+        for projection in marker.projections:
+            camera = cameras.get(projection.camera.label)
+            if camera is None or position is None:
+                continue
+            sensor_id = camera.sensor_id
+            if not (0 <= sensor_id < len(sensors)):
+                continue
+            observations += 1
+            pixel = project_marker_pixel(position, camera.pose,
+                                         sensors[sensor_id].calibration)
+            if pixel is None:
+                continue
+            measured = projection.pixel
+            label_residuals.append(
+                math.hypot(pixel[0] - measured[0], pixel[1] - measured[1]))
+        per_label[marker.label] = {
+            "observations": observations,
+            "rms_px": (root_mean_square(label_residuals)
+                       if label_residuals else None),
+        }
+        residuals.extend(label_residuals)
+    overall = root_mean_square(residuals) if residuals else None
+    return per_label, overall
+
+
 def load_truth():
     with open(os.path.join(DATA_DIR, "aerial_truth.json"),
               encoding="utf-8") as handle:
@@ -1533,6 +1639,21 @@ def match_gcp_names(gcps, names):
     return gcps
 
 
+def split_control_check(control_gcps, check_gcps):
+    """Split a full station list into control and check points.
+
+    The dataset's intended protocol: every station of ``--gcp-list`` is
+    control, and every station of ``--check-list`` whose label is not already
+    a control point is a check. A station that appears in both lists is
+    control (it constrains the fit) and is never scored as a check, so the two
+    sets are disjoint. Pure: no chunk, no engine, so it is unit-testable on its
+    own.
+    """
+    control_labels = {gcp["label"] for gcp in control_gcps}
+    checks = [gcp for gcp in check_gcps if gcp["label"] not in control_labels]
+    return list(control_gcps), checks
+
+
 def z_consistency(gcps, gcp_height):
     """Record how the two survey files' z values compare, and what z means.
 
@@ -1688,6 +1809,19 @@ def align_block(args, images, gcps):
     The same block is reloaded for every fold, so the expensive matching and
     alignment happen exactly once. keypoint_limit_per_mpx is the 16 GB-runner
     budget recorded in the manifest; the dense stage never runs.
+
+    ``--align-from-reference`` replaces the incremental alignment with the
+    RTK-first path: place every camera from its own RTK position and gimbal
+    attitude (``AlignFromReference``), rebuild the tie points from the stored
+    matches (``TriangulateTiePoints``), then refine the poses with the RTK
+    positions as priors (``OptimizeCameras``). It exists because
+    ``AlignCameras`` georeferences the block with ONE global similarity fitted
+    to the camera centres, and on a long flight that fit can keep only a small
+    fraction of the cameras inside its inlier threshold: the similarity is then
+    extrapolated from a cluster and is metres off across the rest of the block,
+    so the block registers a small fraction of its images. The RTK-first path
+    avoids the global fit entirely. It needs the XMP gimbal attitude, so the
+    import reads it.
     """
     doc = alphashape.Document()
     chunk = doc.add_chunk("Helenenschacht RTK block")
@@ -1697,13 +1831,25 @@ def align_block(args, images, gcps):
     # keep the historic behaviour (no XMP accuracy) so the comparison against
     # earlier runs is like for like.
     per_image = args.camera_accuracy == CAMERA_ACCURACY_PER_IMAGE
+    align_from_reference = bool(getattr(args, "align_from_reference", False))
     doc.run_task("AddPhotos", filenames=images,
-                 load_xmp_accuracy=per_image)
+                 load_xmp_accuracy=per_image,
+                 load_xmp_orientation=align_from_reference)
     chunk.crs_epsg = 4326
     match_params = getattr(args, "match_params", {}) or {}
     doc.run_task("MatchPhotos", keypoint_limit_per_mpx=args.keypoint_limit,
                  **match_params)
-    doc.run_task("AlignCameras")
+    if align_from_reference:
+        # AlignFromReference only places ENABLED cameras, and AddPhotos leaves
+        # every camera disabled (it has not been aligned yet).
+        for camera in chunk.cameras:
+            if not camera.enabled:
+                camera.enabled = True
+        doc.run_task("AlignFromReference")
+        doc.run_task("TriangulateTiePoints")
+        chunk.optimizeCameras()
+    else:
+        doc.run_task("AlignCameras")
     project = project_path_for(args)
     doc.save(project)
     total = len(chunk.cameras)
@@ -1718,6 +1864,7 @@ def align_block(args, images, gcps):
             "cameras_aligned": aligned,
             "keypoint_limit_per_mpx": args.keypoint_limit,
             "match_params": dict(match_params),
+            "align_from_reference": align_from_reference,
             "camera_accuracy": args.camera_accuracy,
             "xmp_accuracy_imported":
                 args.camera_accuracy == CAMERA_ACCURACY_PER_IMAGE,
@@ -3183,6 +3330,29 @@ def optimize_options(options):
     return kwargs
 
 
+def add_marker_projections(chunk, gcps, shift=0.0):
+    """Add every GCP as a marker and set its image projections.
+
+    ``shift`` is the projection pixel shift a diagnostic variant asks for. An
+    observation whose image is not among the chunk's cameras is skipped: the
+    block may have been aligned from a subset, and a projection onto a camera
+    that is not there cannot be set.
+    """
+    cameras = {camera.label: camera for camera in chunk.cameras}
+    for gcp in gcps:
+        chunk.addMarker(label=gcp["label"])
+    for gcp in gcps:
+        for observation in gcp["observations"]:
+            stem = os.path.splitext(observation["image"])[0]
+            target = stem if stem in cameras else (
+                observation["image"] if observation["image"] in cameras else None)
+            if target is None:
+                continue
+            chunk.setMarkerProjection(gcp["label"], target,
+                                      observation["px"] + shift,
+                                      observation["py"] + shift)
+
+
 def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
     """One leave-one-out fold: reload, project, import, fit, measure the check.
 
@@ -3203,19 +3373,7 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
     if "marker_projection_accuracy" in options:
         chunk.marker_projection_accuracy = options["marker_projection_accuracy"]
     shift = options.get("projection_shift_px", 0.0)
-    cameras = {camera.label: camera for camera in chunk.cameras}
-    for gcp in gcps:
-        chunk.addMarker(label=gcp["label"])
-    for gcp in gcps:
-        for observation in gcp["observations"]:
-            stem = os.path.splitext(observation["image"])[0]
-            target = stem if stem in cameras else (
-                observation["image"] if observation["image"] in cameras else None)
-            if target is None:
-                continue
-            chunk.setMarkerProjection(gcp["label"], target,
-                                      observation["px"] + shift,
-                                      observation["py"] + shift)
+    add_marker_projections(chunk, gcps, shift)
 
     refine = None
     if options.get("refine_markers"):
@@ -3378,6 +3536,135 @@ def run_fold(args, gcps, check_index, camera_refs, align_report, options=None):
             fold["frame_fit"] = camera_reference_frame_fit(
                 chunk, gcp_frame_origin(gcps, check_index))
     return fold
+
+
+def run_control_check(args, control_gcps, check_gcps, camera_refs,
+                      align_report, options=None):
+    """One control/check adjustment: fit on every control point, score the checks.
+
+    This is the dataset's intended protocol (8 control, 51 check) rather than
+    the leave-one-out the gate uses. It follows ``run_fold``'s non-diagnostic
+    path exactly: reload the saved alignment, add every marker and its
+    projections, import the control rows as ``gcp`` and the check rows as
+    ``check_point``, then the same camera-reference / ``updateTransform`` /
+    ``optimizeCameras`` sequence. The check points never constrain the fit, so
+    their errors are an independent measure. Report-only: nothing here changes
+    a variant result or the pass/fail verdict.
+
+    Returns the control count, the scored and unscored check labels, the
+    horizontal/vertical RMS and maximum horizontal error, and the per-point
+    deltas. A check point with no computed position is listed in
+    ``checks_unscored`` rather than failing the run.
+    """
+    options = options or {}
+    doc = alphashape.load_project(align_report["project"])
+    chunk = doc.active_chunk
+
+    chunk.marker_location_accuracy = args.marker_accuracy
+    if "marker_projection_accuracy" in options:
+        chunk.marker_projection_accuracy = options["marker_projection_accuracy"]
+    shift = options.get("projection_shift_px", 0.0)
+    add_marker_projections(chunk, list(control_gcps) + list(check_gcps), shift)
+
+    accuracy = options.get("camera_accuracy", args.camera_accuracy)
+    accuracy_scale = options.get("camera_accuracy_scale", 1.0)
+    along_shift = options.get("along_shift_m", 0.0)
+    frame_mode = options.get("frame_correction")
+    frame_transform = None
+    if frame_mode in FRAME_CRS_EPSG:
+        frame_transform, _ = make_published_frame_transform(
+            frame_mode, options.get("capture_epoch"))
+    frame_shift = options.get("frame_shift_enu_m")
+    with tempfile.TemporaryDirectory() as directory:
+        control_rows = [(gcp["label"], gcp["lon"], gcp["lat"], gcp["height"])
+                        for gcp in control_gcps]
+        check_rows = [(gcp["label"], gcp["lon"], gcp["lat"], gcp["height"])
+                      for gcp in check_gcps]
+        control_path = os.path.join(directory, "control.csv")
+        check_path = os.path.join(directory, "check.csv")
+        write_reference_csv(control_path, control_rows)
+        write_reference_csv(check_path, check_rows)
+        if camera_refs:
+            # Same rule as run_fold: per-image mode without a shift needs no
+            # re-import, because AddPhotos already stored each camera's own
+            # accuracy; anything else re-imports the rows.
+            if (accuracy != CAMERA_ACCURACY_PER_IMAGE or along_shift
+                    or accuracy_scale != 1.0
+                    or frame_transform is not None or frame_shift is not None):
+                import_camera_references_for_block(
+                    chunk, accuracy, directory, along_shift, accuracy_scale,
+                    frame_shift_enu_m=frame_shift,
+                    frame_transform=frame_transform)
+        else:
+            for camera in chunk.cameras:
+                camera.reference_enabled = False
+        chunk.importReference(path=control_path, marker_type="gcp")
+        chunk.importReference(path=check_path, marker_type="check_point")
+
+    antenna = options.get("antenna_offset_m")
+    if antenna is not None:
+        for sensor_index in range(len(chunk.sensors)):
+            chunk.set_sensor_antenna_offset(
+                sensor_index, antenna[0], antenna[1], antenna[2])
+
+    chunk.updateTransform()
+    chunk.optimizeCameras(**optimize_options(options))
+
+    labels = [gcp["label"] for gcp in check_gcps]
+    markers = {marker.label: marker for marker in chunk.markers}
+    # A check point is scorable only when it has both a computed position and
+    # the reference it is scored against; anything else is reported unscored
+    # rather than failing the whole run.
+    positioned = [label for label in labels
+                  if label in markers and markers[label].position is not None
+                  and markers[label].reference is not None]
+    unscored = [label for label in labels if label not in positioned]
+    targets = reference_local_targets(chunk, positioned)
+    errors = check_point_errors(chunk, positioned, targets)
+    # The post-adjustment marker reprojection RMS, per check point and overall.
+    # It is the image-space residual the bundle adjustment minimised, so a point
+    # with a large reprojection RMS is one whose observations do not agree with
+    # the fitted block (a wrong target, or too few well-spread views).
+    reprojection, reprojection_rms = marker_reprojection_rms(chunk, positioned)
+    per_point = []
+    for label, error in zip(positioned, errors):
+        position = markers[label].position
+        target = targets[label]
+        record = reprojection.get(label, {})
+        per_point.append({
+            "label": label,
+            "dx_m": position[0] - target[0],
+            "dy_m": position[1] - target[1],
+            "dz_m": position[2] - target[2],
+            "horizontal_m": error["horizontal"],
+            "observations": record.get("observations", 0),
+            "reprojection_rms_px": record.get("rms_px"),
+        })
+    horizontal = [error["horizontal"] for error in errors]
+    vertical = [error["vertical"] for error in errors]
+    # Split the horizontal RMS by observation count: a point with fewer than six
+    # observations is the one whose intersection is least constrained, so the
+    # two RMS values say whether the block's error is concentrated there.
+    few = [record["horizontal_m"] for record in per_point
+           if record["observations"] < 6]
+    many = [record["horizontal_m"] for record in per_point
+            if record["observations"] >= 6]
+    return {
+        "control": len(control_gcps),
+        "checks": len(positioned),
+        "checks_unscored": unscored,
+        "rms_horizontal_m": root_mean_square(horizontal) if horizontal else None,
+        "rms_vertical_m": root_mean_square(vertical) if vertical else None,
+        "max_horizontal_m": max(horizontal) if horizontal else None,
+        "reprojection_rms_px": reprojection_rms,
+        "rms_horizontal_few_observations_m": (
+            root_mean_square(few) if few else None),
+        "rms_horizontal_many_observations_m": (
+            root_mean_square(many) if many else None),
+        "few_observations": len(few),
+        "many_observations": len(many),
+        "per_point": per_point,
+    }
 
 
 def summarise_camera_consistency(measured):
@@ -3772,6 +4059,16 @@ def run_real_odm(args):
     _, names = parse_gcp_names_csv(args.gcp_names)
     gcps = match_gcp_names(gcps, names)
     z_record = z_consistency(gcps, args.gcp_height)
+    # The dataset's intended control/check protocol, when a full station list
+    # is supplied: every --gcp-list station is control, and every --check-list
+    # station not already control is a check. Report-only, alongside the
+    # leave-one-out gate; the same names CSV covers both lists.
+    control_gcps = None
+    check_gcps = None
+    if args.check_list:
+        _, check_stations = parse_odm_gcp_list(args.check_list, pixel_shift)
+        check_stations = match_gcp_names(check_stations, names)
+        control_gcps, check_gcps = split_control_check(gcps, check_stations)
     images = collect_images(args.real)
     if len(images) < 3:
         raise ValueError("need at least three images in " + args.real)
@@ -4120,6 +4417,71 @@ def run_real_odm(args):
               "{:.3f} / {:.3f} / {:.3f} m".format(
                   label, applied_frame_shift_source, shift[0], shift[1],
                   shift[2]))
+    # The dataset's intended control/check measure, report-only and alongside
+    # the leave-one-out gate. One adjustment per variant: the same options the
+    # variant itself uses, so the two numbers are comparable. A failure here is
+    # recorded, never fatal, and never touches passed/gate_variant.
+    control_check = None
+    if control_gcps is not None:
+        control_check = {"check_list": args.check_list, "variants": {}}
+
+        def control_options(options):
+            # The control/check adjustment is a single fit, not a fold, so a
+            # per-fold estimated frame shift has no value to apply; drop it and
+            # keep every other option the variant uses.
+            return {key: value for key, value in (options or {}).items()
+                    if key != "estimated_frame_shift"}
+
+        # camera_rtk_engine_defaults first: it is the shipped configuration
+        # and the gated variant, so its row is the headline of this measure too.
+        control_check_runs = (
+            ("camera_rtk_engine_defaults", True,
+             control_options(engine_default_options)),
+            ("camera_rtk_gcps", True, control_options(camera_options)),
+            ("camera_rtk_adaptive", True, {"adaptive_fitting": True}),
+            ("gcps_only", False, control_options(base_options)),
+        )
+        for name, camera_refs, options in control_check_runs:
+            try:
+                record = run_control_check(
+                    args, control_gcps, check_gcps, camera_refs,
+                    align_report, options)
+            except Exception as error:  # noqa: BLE001 - report-only, never fatal
+                record = {"error": str(error)}
+            control_check["variants"][name] = record
+            if "error" in record:
+                print("[gcp validation] control/check ({}): error: {}".format(
+                    name, record["error"]))
+                continue
+            print("[gcp validation] control/check ({}): {} control, {} check, "
+                  "h RMS {} cm, v RMS {} cm, max h {} cm".format(
+                      name, record["control"], record["checks"],
+                      "{:.2f}".format(record["rms_horizontal_m"] * 100.0)
+                      if record["rms_horizontal_m"] is not None else "n/a",
+                      "{:.2f}".format(record["rms_vertical_m"] * 100.0)
+                      if record["rms_vertical_m"] is not None else "n/a",
+                      "{:.2f}".format(record["max_horizontal_m"] * 100.0)
+                      if record["max_horizontal_m"] is not None else "n/a"))
+            # The observation-count split and the marker reprojection RMS: a
+            # point with few observations is the one whose intersection is least
+            # constrained, so the two RMS values say whether the block's error is
+            # concentrated there.
+            print("[gcp validation] control/check ({}): h RMS {} cm over {} "
+                  "points with >= 6 observations, {} cm over {} with < 6; "
+                  "marker reprojection RMS {} px".format(
+                      name,
+                      "{:.2f}".format(
+                          record["rms_horizontal_many_observations_m"] * 100.0)
+                      if record["rms_horizontal_many_observations_m"] is not None
+                      else "n/a",
+                      record["many_observations"],
+                      "{:.2f}".format(
+                          record["rms_horizontal_few_observations_m"] * 100.0)
+                      if record["rms_horizontal_few_observations_m"] is not None
+                      else "n/a",
+                      record["few_observations"],
+                      "{:.2f}".format(record["reprojection_rms_px"])
+                      if record["reprojection_rms_px"] is not None else "n/a"))
     # The gate reads the configuration the product ships: camera RTK references
     # plus GCPs with the engine's own lens-model default (adaptive on a
     # controlled block). camera_rtk_gcps pins the plain lens and is reported
@@ -4171,6 +4533,8 @@ def run_real_odm(args):
         "reference_variant": "camera_rtk_gcps",
         "passed": passed,
     }
+    if control_check is not None:
+        report["control_check"] = control_check
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2, sort_keys=True)
@@ -4199,6 +4563,12 @@ def parse_args(argv):
     parser.add_argument("--gcp-list", metavar="PATH",
                         help="ODM gcp_list.txt (header EPSG:4326, rows "
                              "'x y z px py image [label]') for --real")
+    parser.add_argument("--check-list", metavar="PATH",
+                        help="ODM gcp_list.txt of every surveyed station, for "
+                             "the report-only control/check measure: the "
+                             "--gcp-list stations are control and the rest are "
+                             "check points, scored in one adjustment per "
+                             "variant. Never changes the leave-one-out gate")
     parser.add_argument("--gcp-names", metavar="CSV",
                         help="Name;Easting;Northing;Elevation;Longitude;Latitude "
                              "CSV whose points are matched to --gcp-list by "
@@ -4285,6 +4655,14 @@ def parse_args(argv):
                              "the camera-reference variants and the fit's datum")
     parser.add_argument("--keypoint-limit", type=int, default=250,
                         help="MatchPhotos keypoint_limit_per_mpx for the block")
+    parser.add_argument("--align-from-reference", action="store_true",
+                        help="place the cameras from their own RTK position and "
+                             "gimbal attitude (AlignFromReference + "
+                             "TriangulateTiePoints + OptimizeCameras) instead of "
+                             "the incremental AlignCameras. Use it on a long "
+                             "flight whose single global similarity fit keeps only "
+                             "a small fraction of the cameras, which leaves the "
+                             "block registering few images")
     parser.add_argument("--match-param", action="append", default=[],
                         metavar="KEY=VALUE",
                         help="extra MatchPhotos argument for the block's "
