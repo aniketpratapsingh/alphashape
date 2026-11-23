@@ -80,6 +80,13 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Changed
 
+- **The ground-control accuracy gate reads the shipped configuration.** The
+  real-block leave-one-out check now gates on `camera_rtk_engine_defaults`:
+  camera RTK references plus the surveyed GCPs with the lens model left to
+  `OptimizeCameras`' own defaults, which select the adaptive model on a block
+  with control points. The previous gate variant, `camera_rtk_gcps`, pins the
+  plain lens model and is still computed and reported as the pinned plain-lens
+  reference. The 5 cm horizontal threshold is unchanged.
 - **Feature detection fits the machine's memory.** DetectFeatures and the
   detection stage of MatchPhotos work on fewer images at once when one scale
   space per thread would not fit half the task memory budget (about three 20 MP
@@ -872,6 +879,44 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Fixed
 
+- **Straight colour steps along block boundaries in a large orthomosaic.** A
+  block decided the seam in its overlap margin and then discarded that decision,
+  so the next block re-optimised the overlap and could switch camera exactly on
+  the shared border, where the interior copy cut it. A block now records the
+  seam it chose in the margin band the next block reads, and that block keeps
+  it, so a camera switch is never cut at a block edge. The final labels and
+  colours of every block's own region are otherwise unchanged, and a run with
+  seamline refinement off is byte-identical.
+- **Dark blurry smudges in the orthomosaic.** The multiband (mosaic) blend's
+  per-camera masks partition only the cells a camera actually covers, so near the
+  edge of a camera's footprint, a hole or the block border the masks summed to
+  less than one, and the pyramid collapse scaled the low frequencies down by that
+  deficit. The result was a soft darkening up to the pyramid's own reach (about
+  3 m at 2.33 cm), which read as a dark blob with blurred texture inside. Each
+  pyramid level is now normalised by a coverage pyramid, so a partly covered
+  neighbourhood is reconstructed from the covered fraction instead of being
+  darkened; a fully covered interior is unchanged. The pre-pyramid extension of a
+  camera's colour into its invalid cells also copies the nearest valid colour
+  instead of averaging neighbours, so it no longer synthesises a low-frequency
+  value of its own.
+- **Stretched, streaked edges beyond the reconstructed surface.** A cell is no
+  longer coloured from a view whose ground footprint is stretched beyond a
+  stated factor. The stretch is measured against the local DEM surface NORMAL
+  (the incidence), not the view against vertical: a near-nadir camera over a
+  steep or wrong surface still hits it at a grazing incidence, and that is the
+  "stretched roof with moire" artefact at the edge of a block. A view whose
+  footprint is stretched by more than 4x (incidence cosine below 0.25, about
+  75.5 degrees) is not used for that cell, and the cell is left nodata when no
+  better view exists. The orthomosaic is also no longer produced over DEM cells
+  that were extrapolated beyond the measured area: the DEM now records a
+  per-cell support mask (measured or interpolated inside the measured area vs
+  extrapolated beyond it), and the ortho leaves an unsupported cell nodata
+  unless the DEM itself was built with extrapolation enabled. A hole the
+  measured surface surrounds (a roof, water, a shadow) is interpolated inside
+  the measured area and stays supported, so the ortho still rectifies onto it.
+  The orthomosaic's hole fill still completes every interior hole the survey
+  enclosed (`fill_holes=true` means the whole interior, not a size-gated
+  subset).
 - **`DetectMarkers` left the target kind off markers it attached to.** A
   detection that landed on an existing marker (an imported GCP, or one created
   by label) recorded no `target_type`, so `RefineMarkers` treated the marker as

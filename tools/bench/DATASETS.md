@@ -412,12 +412,14 @@ data (see below), so the ordinary `gcp-eurosdr` run needs no measurement step.
 
   | Variant | Control/check H RMS | Control/check V RMS | Leave-one-out H RMS |
   |---|---:|---:|---:|
-  | `camera_rtk_gcps` (shipped defaults) | **4.45 cm** | 4.00 cm | 5.73 cm |
-  | `camera_rtk_adaptive` | 4.50 cm | 4.02 cm | — |
+  | `camera_rtk_gcps` (plain lens) | **4.45 cm** | 4.00 cm | 5.73 cm |
+  | `camera_rtk_adaptive` (the lens model the shipped defaults select) | 4.50 cm | 4.02 cm | — |
   | `gcps_only` | 4.89 cm | 5.57 cm | 9.96 cm |
 
   The same data with the refiner inactive (run 45069050259) gave 5.19 / 4.59 / 6.43 cm
-  for `camera_rtk_gcps`. The control/check measure now meets the 5 cm target. The
+  for `camera_rtk_gcps`. These runs predate the `camera_rtk_engine_defaults` gate
+  (#133); from the merge on, that shipped configuration also gets its own
+  control/check row. The control/check measure now meets the 5 cm target. The
   leave-one-out over eight GCPs, where seven control points carry each fold, still
   misses it.
 

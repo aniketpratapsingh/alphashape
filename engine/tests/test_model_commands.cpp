@@ -907,6 +907,10 @@ Elevation sample_elevation() {
     elevation.raster.data = {100.0F, 101.0F, 102.0F, 103.0F, 104.0F, 105.0F};
     elevation.set_epsg(32633);
     elevation.source = "depth_maps";
+    // A non-empty support mask and interpolation mode, so the undo payload's
+    // round trip of both is exercised (not just the GeoTIFF heights).
+    elevation.interpolation = "enabled";
+    elevation.support = {1U, 1U, 0U, 1U, 0U, 1U};
     return elevation;
 }
 

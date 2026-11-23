@@ -786,19 +786,47 @@ class RepetitionsTest(unittest.TestCase):
             "dataset_manifest": {"title": "Block"},
             "variants": {},
         }
-        path = "variants.camera_rtk_gcps.rms_horizontal_m"
+        path = "variants.camera_rtk_engine_defaults.rms_horizontal_m"
         block = self._block(
-            {path: 0.054, "variants.gcps_only.rms_horizontal_m": 0.065},
-            [{path: 0.053, "variants.gcps_only.rms_horizontal_m": 0.064},
-             {path: 0.055, "variants.gcps_only.rms_horizontal_m": 0.066},
-             {path: 0.054, "variants.gcps_only.rms_horizontal_m": 0.065}],
+            {path: 0.044,
+             "variants.camera_rtk_gcps.rms_horizontal_m": 0.054,
+             "variants.gcps_only.rms_horizontal_m": 0.065},
+            [{path: 0.043,
+              "variants.camera_rtk_gcps.rms_horizontal_m": 0.053,
+              "variants.gcps_only.rms_horizontal_m": 0.064},
+             {path: 0.045,
+              "variants.camera_rtk_gcps.rms_horizontal_m": 0.055,
+              "variants.gcps_only.rms_horizontal_m": 0.066},
+             {path: 0.044,
+              "variants.camera_rtk_gcps.rms_horizontal_m": 0.054,
+              "variants.gcps_only.rms_horizontal_m": 0.065}],
             ["abc", "abc", "abc"],
         )
         current["repetitions"] = block
         text = report.gcp_markdown(current)
         self.assertIn("## Repetitions", text)
+        self.assertIn("variants.camera_rtk_engine_defaults.rms_horizontal_m", text)
         self.assertIn("variants.camera_rtk_gcps.rms_horizontal_m", text)
         self.assertIn("variants.gcps_only.rms_horizontal_m", text)
+
+    def test_the_gated_variant_is_named_in_the_verdict(self):
+        current = {
+            "kind": "gcp",
+            "dataset": "gcp",
+            "dataset_manifest": {"title": "Block"},
+            "target_horizontal_m": 0.05,
+            "passed": True,
+            "gate_variant": "camera_rtk_engine_defaults",
+            "variants": {
+                "camera_rtk_engine_defaults": {"folds": [],
+                                               "rms_horizontal_m": 0.044},
+                "camera_rtk_gcps": {"folds": [], "rms_horizontal_m": 0.054},
+            },
+        }
+        text = report.gcp_markdown(current)
+        self.assertIn("camera_rtk_engine_defaults", text)
+        self.assertIn("camera_rtk_engine_defaults (gated)", text)
+        self.assertIn("camera_rtk_gcps (pinned plain-lens reference)", text)
 
     def test_a_standard_variant_with_an_option_is_not_called_diagnostic(self):
         # The adaptive dispatch selects gcps_only / camera_rtk_gcps with

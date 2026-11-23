@@ -434,14 +434,15 @@ def _repetition_display_paths(current: dict, block: dict) -> list[str]:
     """The metrics worth putting in the repetitions table.
 
     A pipeline run has a gated set (``DIRECTION``) and those are exactly the
-    numbers a reader has to trust; a GCP run has no gated metrics, so its two
+    numbers a reader has to trust; a GCP run has no gated metrics, so its three
     standard variants' RMS values are shown and the diagnostic probes are left to
     the variant tables below. Never the whole numeric leaf set: a median of
     camera counts and image counts is noise beside the measurements.
     """
     medians = block.get("medians") or {}
     if current.get("kind") == "gcp":
-        prefixes = ("variants.gcps_only.", "variants.camera_rtk_gcps.")
+        prefixes = ("variants.gcps_only.", "variants.camera_rtk_gcps.",
+                    "variants.camera_rtk_engine_defaults.")
         return sorted(
             path for path in medians
             if path.startswith(prefixes) and ".rms_" in path
@@ -525,9 +526,11 @@ def gcp_markdown(current: dict) -> str:
     z_record = current.get("z_consistency") or current.get("z_datum") or {}
     target = current.get("target_horizontal_m")
     verdict = "PASS" if current.get("passed") else "MISS"
+    gate_variant = current.get("gate_variant") or "camera_rtk_engine_defaults"
     lines = ["# Quality benchmark: " + str(manifest.get("title") or current.get("dataset", "?")), ""]
     lines.append(f"**Verdict: {verdict}** — check-point horizontal RMS target "
-                 f"{_fmt(target)} m; reported, not gated (first version)")
+                 f"{_fmt(target)} m, read from `{gate_variant}` (the shipped "
+                 f"camera-RTK + GCP defaults); reported, not gated (first version)")
     lines.append("")
     lines.extend(repetitions_markdown(current))
     lines.append("## Provenance")
@@ -604,9 +607,15 @@ def gcp_markdown(current: dict) -> str:
         options = data.get("options") or {}
         # A standard variant can now carry an option too: the benchmark's
         # adaptive_fitting dispatch selects it for gcps_only and camera_rtk_gcps.
-        # It is still one of the two reported configurations, not a probe.
-        is_diagnostic = variant not in ("camera_rtk_gcps", "gcps_only")
+        # The gated camera_rtk_engine_defaults variant carries engine_defaults.
+        # All three are reported configurations, not probes.
+        is_diagnostic = variant not in (
+            "camera_rtk_engine_defaults", "camera_rtk_gcps", "gcps_only")
         suffix = " (diagnostic)" if is_diagnostic else ""
+        if variant == gate_variant:
+            suffix = " (gated)"
+        elif variant == "camera_rtk_gcps":
+            suffix = " (pinned plain-lens reference)"
         lines.append(f"## Variant: {variant}{suffix}")
         lines.append("")
         lines.append("| Check | Horizontal (m) | Vertical (m) | 3D total (m) |")
