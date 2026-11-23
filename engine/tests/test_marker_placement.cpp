@@ -304,6 +304,71 @@ TEST(Markers, NumericLabelDoesNotShadowId) {
     EXPECT_EQ(chunk->markers().size(), 7U);
 }
 
+// A detection attached to an existing marker must still record the target
+// kind: refinement reads it to pick the plain-disc path. The marker's own meta
+// wins, so a user-set or earlier-run kind is never overwritten.
+TEST(Markers, ProjectionStampsTargetTypeOnExistingMarker) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    Camera& camera = add_camera(*chunk, "CAM1");
+    UndoStack stack(&document);
+
+    stack.execute(make_add_marker_command(chunk->id(), std::string("GCP1"),
+                                          std::nullopt));
+    ASSERT_EQ(chunk->markers().size(), 1U);
+    EXPECT_TRUE(chunk->markers()[0].meta.items.empty());
+
+    Meta meta;
+    meta.set("target_type", "Circular");
+    stack.execute(make_add_marker_with_projection_command(
+        chunk->id(), std::string("GCP1"), camera.id, Eigen::Vector2d(10.0, 20.0),
+        false, meta));
+    ASSERT_EQ(chunk->markers().size(), 1U);
+    const std::string* target_type = chunk->markers()[0].meta.find("target_type");
+    ASSERT_NE(target_type, nullptr);
+    EXPECT_EQ(*target_type, "Circular");
+    ASSERT_EQ(chunk->markers()[0].projections.size(), 1U);
+    EXPECT_TRUE(chunk->validate().empty());
+
+    stack.undo();
+    ASSERT_EQ(chunk->markers().size(), 1U);
+    EXPECT_EQ(chunk->markers()[0].meta.find("target_type"), nullptr);
+    EXPECT_TRUE(chunk->markers()[0].projections.empty());
+    EXPECT_TRUE(chunk->validate().empty());
+}
+
+TEST(Markers, ProjectionKeepsExistingTargetType) {
+    Document document = make_document();
+    Chunk* chunk = document.active_chunk();
+    Camera& camera = add_camera(*chunk, "CAM1");
+    UndoStack stack(&document);
+
+    stack.execute(make_add_marker_command(chunk->id(), std::string("GCP1"),
+                                          std::nullopt));
+    ASSERT_EQ(chunk->markers().size(), 1U);
+    chunk->markers()[0].meta.set("target_type", "Circular12");
+
+    Meta meta;
+    meta.set("target_type", "Circular");
+    stack.execute(make_add_marker_with_projection_command(
+        chunk->id(), std::string("GCP1"), camera.id, Eigen::Vector2d(10.0, 20.0),
+        false, meta));
+    ASSERT_EQ(chunk->markers().size(), 1U);
+    const std::string* target_type = chunk->markers()[0].meta.find("target_type");
+    ASSERT_NE(target_type, nullptr);
+    EXPECT_EQ(*target_type, "Circular12");
+    ASSERT_EQ(chunk->markers()[0].projections.size(), 1U);
+    EXPECT_TRUE(chunk->validate().empty());
+
+    stack.undo();
+    ASSERT_EQ(chunk->markers().size(), 1U);
+    target_type = chunk->markers()[0].meta.find("target_type");
+    ASSERT_NE(target_type, nullptr);
+    EXPECT_EQ(*target_type, "Circular12");
+    EXPECT_TRUE(chunk->markers()[0].projections.empty());
+    EXPECT_TRUE(chunk->validate().empty());
+}
+
 TEST(Markers, DeleteLastProjectionDetachesGroupMember) {
     Document document = make_document();
     Chunk* chunk = document.active_chunk();
