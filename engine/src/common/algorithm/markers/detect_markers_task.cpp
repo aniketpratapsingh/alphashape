@@ -1209,8 +1209,10 @@ DetectMarkersPlan plan_detect_markers(const Document& document,
     if (!commands.empty()) {
         auto transaction =
             std::make_unique<CommandTransaction>("Detect Markers");
-        // Record the target kind on newly created markers: refinement uses it
-        // to decide whether the even-parity light-seed path applies.
+        // Record the target kind on created markers and on existing markers
+        // that have no kind yet: refinement reads it to decide whether the
+        // even-parity light-seed (plain-disc) path applies. An existing kind is
+        // left alone, so a user's or an earlier run's choice survives.
         Meta marker_meta;
         marker_meta.set("target_type", options.target_type);
         for (const Assignment& assignment : commands) {
