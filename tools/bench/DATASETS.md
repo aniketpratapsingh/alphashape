@@ -390,8 +390,36 @@ data (see below), so the ordinary `gcp-eurosdr` run needs no measurement step.
   control and the remaining stations as independent check points, scored in one
   adjustment per variant (`--check-list`, the full station list). It never changes
   `passed` or any variant result; the leave-one-out over the eight GCPs remains the
-  gate. The committed full list carries 58 stations (S1 has no observations), so the
-  measure scores 8 control and 50 checks.
+  gate. The committed full list carries 57 stations, so the measure scores 8 control
+  and 49 checks. S1 has no observations, and S2 is excluded as a wrong-target cluster
+  (see below).
+- **Wrong-target bounds and consensus triangulation (2026-11-22).** Two safeguards keep a
+  detection of the wrong object out of the list. Both are robust in-run bounds, the block
+  median plus k x MAD, so no threshold is tuned on a result:
+  - a station whose largest detection shift from its projection exceeds the median
+    + 5 MAD (floor 10 px) is excluded. S2 is the case: 52 px against an 11 px bound;
+  - a station whose consensus intersection lands more than the median + 6 MAD
+    (floor 0.25 m) from its survey is excluded.
+
+  The marker each view is scored against is triangulated from the consensus of the
+  accepted views, after undistorting the pixels. Views closer than 5 degrees of parallax
+  to the rest are not used for the intersection. Without the consensus step, a degenerate
+  pair of near-identical frames (A3, D8) could set the triangulated point.
+- **Result with the disc refiner active (2026-11-23, observations run 45073925795, bench
+  run 45174605128).** Detection now records the target kind on stations that already
+  exist (#142). That lets `RefineMarkers` take its plain-disc border fit, and it moved 325
+  of 928 projections (mean 2.7 px).
+
+  | Variant | Control/check H RMS | Control/check V RMS | Leave-one-out H RMS |
+  |---|---:|---:|---:|
+  | `camera_rtk_gcps` (shipped defaults) | **4.45 cm** | 4.00 cm | 5.73 cm |
+  | `camera_rtk_adaptive` | 4.50 cm | 4.02 cm | — |
+  | `gcps_only` | 4.89 cm | 5.57 cm | 9.96 cm |
+
+  The same data with the refiner inactive (run 45069050259) gave 5.19 / 4.59 / 6.43 cm
+  for `camera_rtk_gcps`. The control/check measure now meets the 5 cm target. The
+  leave-one-out over eight GCPs, where seven control points carry each fold, still
+  misses it.
 
 ## Adding a dataset
 
