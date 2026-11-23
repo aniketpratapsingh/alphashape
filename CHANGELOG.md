@@ -865,16 +865,24 @@ All notable changes to alphashape are recorded here. The format follows
   "stretched roof with moire" artefact at the edge of a block. A view whose
   footprint is stretched by more than 4x (incidence cosine below 0.25, about
   75.5 degrees) is not used for that cell, and the cell is left nodata when no
-  better view exists. The orthomosaic is also no longer produced over DEM cells
-  that were extrapolated beyond the measured area: the DEM now records a
-  per-cell support mask (measured or interpolated inside the measured area vs
-  extrapolated beyond it), and the ortho leaves an unsupported cell nodata
-  unless the DEM itself was built with extrapolation enabled. A hole the
+  better view exists. The DEM records a per-cell support mask (measured or
+  interpolated inside the measured area vs extrapolated beyond it) for
+  reporting, but the ortho does not clip to it: it rectifies onto every valid
+  DEM cell, and the incidence test above rejects a stretched view. A hole the
   measured surface surrounds (a roof, water, a shadow) is interpolated inside
-  the measured area and stays supported, so the ortho still rectifies onto it.
+  the measured area and is rectified onto normally.
   The orthomosaic's hole fill still completes every interior hole the survey
   enclosed (`fill_holes=true` means the whole interior, not a size-gated
   subset).
+- **The orthomosaic was clipped to the measured area of the DEM.** The rc.4
+  ortho refused to rectify onto DEM cells the support mask marked unsupported
+  (filled cells outside the convex hull of measured cells), which on a coastal
+  block cut the mosaic to a polygon around the measured land: the aerial-nadir
+  bench's covered fraction fell from 0.947 to 0.814 and holes inside the hull
+  rose from 15 to 48. The removed sea was rendered correctly before (flat
+  water, a flat filled DEM, no stretching). The ortho again covers the DEM's
+  whole valid area and relies on the incidence-vs-surface-normal test to reject
+  stretched views; the DEM still records its support mask for reporting.
 - **`DetectMarkers` left the target kind off markers it attached to.** A
   detection that landed on an existing marker (an imported GCP, or one created
   by label) recorded no `target_type`, so `RefineMarkers` treated the marker as

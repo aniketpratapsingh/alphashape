@@ -464,6 +464,77 @@ TEST(BuildOrthomosaic, MatchesTruthOrtho) {
     EXPECT_LT(covered - labelled, covered / 100);
 }
 
+TEST(BuildOrthomosaic, FilledSurfaceBeyondTheMeasuredHullIsStillColoured) {
+    // A DEM whose valid (filled) region extends past the measured hull over
+    // flat ground must still get an ortho there. The DEM records a support
+    // mask (1 = measured, 0 = filled beyond the hull), but the ortho does not
+    // clip to it: clipping to the measured hull removed correctly rendered
+    // flat surface (water, a uniform field) on a coastal block. Stretching is
+    // rejected by the incidence-vs-surface-normal test instead.
+    Document document = aerial_fixture::make_truth_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    chunk.transform() = Transform::Identity();
+    chunk.crs().epsg = 0;
+
+    // A flat DEM over the fixture area at a constant height, valid everywhere.
+    constexpr double kCell = 1.0;
+    constexpr float kFlatHeight = 2.0F;
+    Elevation& elevation = chunk.elevation();
+    elevation.set_epsg(0);
+    elevation.source = "depth_maps";
+    elevation.nodata = -32767.0F;
+    elevation.interpolation = "enabled";
+    RasterGrid& grid = elevation.raster.grid;
+    grid.origin_x = aerial_fixture::kAreaX0;
+    grid.origin_y = aerial_fixture::kAreaY1;
+    grid.pixel_size_x = kCell;
+    grid.pixel_size_y = kCell;
+    grid.width = static_cast<int>(
+        std::ceil((aerial_fixture::kAreaX1 - aerial_fixture::kAreaX0) / kCell));
+    grid.height = static_cast<int>(
+        std::ceil((aerial_fixture::kAreaY1 - aerial_fixture::kAreaY0) / kCell));
+    const std::size_t cells = static_cast<std::size_t>(grid.width) *
+                              static_cast<std::size_t>(grid.height);
+    elevation.raster.channels = 1;
+    elevation.raster.data.assign(cells, kFlatHeight);
+
+    // The support mask: measured (1) west of x = 20, filled beyond the hull
+    // (0) east of it. The DEM is valid on both sides.
+    elevation.support.assign(cells, 0U);
+    for (int row = 0; row < grid.height; ++row) {
+        for (int col = 0; col < grid.width; ++col) {
+            const Eigen::Vector2d c = grid.pixel_center(col, row);
+            elevation.support[static_cast<std::size_t>(row) *
+                                  static_cast<std::size_t>(grid.width) +
+                              static_cast<std::size_t>(col)] =
+                c.x() <= 20.0 ? std::uint8_t{1} : std::uint8_t{0};
+        }
+    }
+
+    Params params = ortho_params("mosaic", "elevation", kCell);
+    run_task(builtin_registry(), document, "BuildOrthomosaic", params);
+
+    const Orthomosaic& ortho = chunk.orthomosaic();
+    ASSERT_FALSE(ortho.empty());
+    const auto opaque_at = [&ortho](double x, double y) {
+        const Eigen::Vector2d c = ortho.raster.grid.to_pixel(x, y);
+        const int col = static_cast<int>(std::floor(c.x()));
+        const int row = static_cast<int>(std::floor(c.y()));
+        if (!ortho.raster.grid.contains_pixel(col, row)) {
+            return false;
+        }
+        return ortho.raster.at(col, row, 3) != 0;
+    };
+    // A measured cell (west of the hull edge) is coloured.
+    EXPECT_TRUE(opaque_at(0.0, 0.0)) << "a measured cell must be coloured";
+    // A cell outside the measured hull but inside the DEM's valid area is
+    // coloured too: the ortho covers the DEM's whole valid area.
+    EXPECT_TRUE(opaque_at(30.0, 0.0))
+        << "a filled cell beyond the measured hull must still be coloured";
+    EXPECT_TRUE(opaque_at(50.0, 0.0))
+        << "the DEM's whole valid area must be covered";
+}
+
 // ---------------------------------------------------------------------------
 // 2. The model surface (a DSM rasterised from the mesh)
 // ---------------------------------------------------------------------------
