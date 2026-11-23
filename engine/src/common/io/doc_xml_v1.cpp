@@ -287,7 +287,8 @@ void read_assets(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
     if (const XmlNode* elevation = find_child(node, "elevation")) {
         warn_unknown_attrs(*elevation,
                            {"path", "width", "height", "origin", "pixel_size", "epsg",
-                            "crs_wkt", "nodata", "source", "asset_id", "asset_label"},
+                            "crs_wkt", "nodata", "source", "asset_id", "asset_label",
+                            "support_path", "interpolation"},
                            report);
         const std::string path = require_attr(*elevation, "path");
         Elevation dem =
@@ -314,6 +315,13 @@ void read_assets(const XmlNode& node, Chunk& chunk, const ZipArchive& archive,
         }
         dem.crs.wkt = attr_or(*elevation, "crs_wkt", std::string());
         dem.nodata = static_cast<float>(parse_double(require_attr(*elevation, "nodata")));
+        dem.interpolation = attr_or(*elevation, "interpolation", std::string());
+        // The support mask is optional (see doc_xml_v2): absent means every
+        // valid cell was supported.
+        if (const std::string* support_path = find_attr(*elevation, "support_path")) {
+            dem.support = sidecar::decode_elevation_support(
+                require_entry(archive, *support_path), g.width, g.height);
+        }
         ElevationAsset& asset = chunk.add_elevation(stored_asset_label(*elevation));
         *asset.data = std::move(dem);
         chunk.set_active_elevation_id(restore_asset_id(*elevation, chunk.elevations()));

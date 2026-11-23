@@ -86,6 +86,11 @@ std::string elevation_entry(const Chunk& chunk, std::int32_t asset_id) {
     return chunk_prefix(chunk) + "/elevations/" + std::to_string(asset_id) + ".tif";
 }
 
+std::string elevation_support_entry(const Chunk& chunk, std::int32_t asset_id) {
+    return chunk_prefix(chunk) + "/elevations/" + std::to_string(asset_id) +
+           ".support.bin";
+}
+
 std::string ortho_entry(const Chunk& chunk, std::int32_t asset_id) {
     return chunk_prefix(chunk) + "/orthomosaics/" + std::to_string(asset_id) + ".tif";
 }
@@ -785,6 +790,22 @@ void write_elevations(const Chunk& chunk, XmlNode& node, ZipArchive& archive,
         }
         set_attr(e, "nodataValue", fmt(static_cast<double>(elevation.nodata)));
         set_attr(e, "source_data", elevation.source);
+        // The interpolation mode is written only when it is set, so a DEM from a
+        // pre-interpolation build keeps its bytes. The ortho reads it to decide
+        // whether a filled cell may be coloured (see Elevation::interpolation).
+        if (!elevation.interpolation.empty()) {
+            set_attr(e, "interpolation", elevation.interpolation);
+        }
+        // The support mask is written only when the DEM has extrapolated cells,
+        // so a DEM whose fill is entirely inside the measured area keeps the
+        // pre-support bytes (and an old project reads back as "every valid cell
+        // supported").
+        if (!elevation.support.empty()) {
+            const std::string support_entry = elevation_support_entry(chunk, asset.id);
+            archive.add(support_entry,
+                        sidecar::encode_elevation_support(elevation.support, g.width, g.height));
+            set_attr(e, "support_path", support_entry);
+        }
     }
 }
 
@@ -1723,7 +1744,8 @@ void read_elevations(const XmlNode& node, Chunk& chunk, const ZipArchive& archiv
         warn_unknown_attrs(e,
                            {"id", "label", "group", "enabled", "active", "path",
                             "width", "height", "origin", "pixel_size", "epsg",
-                            "crs_wkt", "nodataValue", "source_data"},
+                            "crs_wkt", "nodataValue", "source_data", "support_path",
+                            "interpolation"},
                            report);
         ElevationAsset slot;
         read_slot_identity(e, slot);
@@ -1756,6 +1778,13 @@ void read_elevations(const XmlNode& node, Chunk& chunk, const ZipArchive& archiv
             dem.crs.wkt = attr_or(e, "crs_wkt", std::string());
             dem.nodata =
                 static_cast<float>(parse_double(require_attr(e, "nodataValue")));
+            dem.interpolation = attr_or(e, "interpolation", std::string());
+            // The support mask is optional: an absent entry means every valid
+            // cell was supported (an old project, or a DEM with no fill).
+            if (const std::string* support_path = find_attr(e, "support_path")) {
+                dem.support = sidecar::decode_elevation_support(
+                    require_entry(archive, *support_path), g.width, g.height);
+            }
             *slot.data = std::move(dem);
         }
         if (attr_or(e, "active", "false") == "true") {

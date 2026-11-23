@@ -2726,19 +2726,33 @@ struct PayloadCodec<Mesh> {
 template <>
 struct PayloadCodec<Elevation> {
     static std::size_t bytes(const Elevation& elevation) {
-        return elevation.raster.data.size() * sizeof(float);
+        return elevation.raster.data.size() * sizeof(float) + elevation.support.size();
     }
     static std::vector<std::uint8_t> encode(const Elevation& elevation) {
         std::vector<std::uint8_t> out;
         docxml::sidecar::put_string(out, elevation.source);
+        docxml::sidecar::put_string(out, elevation.interpolation);
+        // The support mask rides beside the GeoTIFF payload so an undo restores
+        // the DEM exactly, mask included.
+        docxml::sidecar::put_u32(out, static_cast<std::uint32_t>(elevation.support.size()));
+        out.insert(out.end(), elevation.support.begin(), elevation.support.end());
         put_blob(out, docxml::sidecar::encode_elevation(elevation));
         return out;
     }
     static Elevation decode(const std::vector<std::uint8_t>& in) {
         docxml::sidecar::ByteReader reader(in, 0, "undo elevation payload");
         const std::string source = reader.string();
+        const std::string interpolation = reader.string();
+        const std::uint32_t support_count = reader.u32();
+        std::vector<std::uint8_t> support;
+        support.reserve(support_count);
+        for (std::uint32_t i = 0; i < support_count; ++i) {
+            support.push_back(reader.u8());
+        }
         Elevation elevation = docxml::sidecar::decode_elevation(get_blob(reader));
         elevation.source = source;
+        elevation.interpolation = interpolation;
+        elevation.support = std::move(support);
         return elevation;
     }
 };

@@ -173,6 +173,32 @@ struct OrthoSurfaceRange {
     double highest = 0.0;
 };
 
+/// The DEM's per-cell SUPPORT mask, so the ortho is not produced over surface
+/// that was extrapolated beyond the measured area rather than measured or
+/// interpolated inside it.
+///
+/// A DEM built with `interpolation="enabled"` fills the holes inside the
+/// cameras' ground footprints. A hole the measured surface surrounds (a roof,
+/// water, a shadow) is interpolated INSIDE the measured area and is supported:
+/// the ortho rectifies onto it normally. A cell beyond the measured area's
+/// convex hull is a near-flat extrapolation of the terrain, and rectifying a
+/// photograph onto it is what produces the wavy, unsupported border. The mask
+/// says which cells are supported (1: measured, or interpolated inside the
+/// measured area) and which are not (0: extrapolated beyond it); a cell with
+/// support 0 is left invalid unless the DEM itself was built with extrapolation
+/// enabled, where the user explicitly asked for the surface to be carried past
+/// the last measurement.
+struct OrthoSupport {
+    /// width*height cells, 1 = measured or interpolated inside the measured
+    /// area, 0 = extrapolated beyond it. Empty means every valid cell is
+    /// supported (an old project, or a source with no fill), so nothing is
+    /// gated.
+    const std::vector<std::uint8_t>* mask = nullptr;
+    /// True when the DEM was built with interpolation "extrapolated": an
+    /// unsupported cell is still coloured.
+    bool allow_unsupported = false;
+};
+
 /// Rectify `camera` over `out_grid`. `dem` is sampled at output cell centres;
 /// `dem_nodata` marks missing samples. Cells whose ray is blocked by the DEM by
 /// more than `occlusion_tolerance` metres are left invalid.
@@ -189,11 +215,16 @@ struct OrthoSurfaceRange {
 /// `lattice`, when given, says `out_grid` is a window on a larger grid: cell
 /// centres are then evaluated on the parent lattice (see OrthoCellLattice), which
 /// is what makes a block reproduce the whole grid's cells bit for bit.
+///
+/// `support`, when given, gates the output on the DEM's support mask: a cell
+/// whose DEM sample was extrapolated beyond the measured area is left invalid
+/// unless `support->allow_unsupported` is set (see OrthoSupport).
 OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
                        const RasterGrid& out_grid, const OrthoCamera& camera,
                        int camera_index, double occlusion_tolerance, bool crop = true,
                        const OrthoSurfaceRange* surface_range = nullptr,
-                       const OrthoCellLattice* lattice = nullptr);
+                       const OrthoCellLattice* lattice = nullptr,
+                       const OrthoSupport* support = nullptr);
 
 // -- surface-point projection ------------------------------------------------
 //

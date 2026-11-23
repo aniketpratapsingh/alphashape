@@ -533,6 +533,132 @@ TEST(Dem, EnabledFillsHolesInsideTheCameraFootprint) {
     EXPECT_EQ(band.first, 0U);
 }
 
+TEST(Dem, SupportMaskStaysEmptyWhenTheFillIsInsideTheMeasuredArea) {
+    // A band of holes at 0 < x < 12 lies inside BOTH the camera footprint and
+    // the measured cloud: "enabled" interpolates it INSIDE the surveyed area,
+    // which is normal (a roof, water, a shadow), so every valid cell is
+    // supported and the DEM keeps an empty mask -- its bytes are unchanged.
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Sensor sensor;
+    sensor.type = CameraType::Frame;
+    sensor.calibration = Calibration::initial(CameraType::Frame, 2000, 2000, 2000.0);
+    chunk.sensors().push_back(sensor);
+
+    fill_cloud_with_band(chunk, [](double x) { return x > 0.0 && x < 12.0; });
+    add_nadir_camera(chunk, 0.0, 0.0, 100.0);
+
+    Params params = dem_params("point_cloud", "enabled", 0.5, 0, "nearest", "none");
+    run_build_dem(document, params);
+
+    const Elevation& dem = chunk.elevation();
+    ASSERT_FALSE(dem.empty());
+    EXPECT_EQ(dem.interpolation, "enabled");
+    // The band was filled ...
+    const auto band = count_nodata(dem, [](double x, double y) {
+        return x > 1.0 && x < 11.0 && std::abs(y) < 40.0;
+    });
+    EXPECT_GT(band.second, 0U);
+    EXPECT_EQ(band.first, 0U) << "the interior band must be filled";
+    // ... and because the fill lies inside the measured area it is supported,
+    // so no mask is written.
+    EXPECT_TRUE(dem.support.empty())
+        << "a fill inside the measured area is supported and needs no mask";
+
+    // A DEM with interpolation disabled has no filled cells: the mask stays
+    // empty, so an old project's bytes are unchanged.
+    Document disabled_doc = make_local_chunk_document();
+    Chunk& disabled_chunk = *disabled_doc.active_chunk();
+    Sensor disabled_sensor;
+    disabled_sensor.type = CameraType::Frame;
+    disabled_sensor.calibration = Calibration::initial(CameraType::Frame, 2000, 2000, 2000.0);
+    disabled_chunk.sensors().push_back(disabled_sensor);
+    fill_cloud_with_band(disabled_chunk, [](double x) { return x > 0.0 && x < 12.0; });
+    add_nadir_camera(disabled_chunk, 0.0, 0.0, 100.0);
+    Params disabled = dem_params("point_cloud", "disabled", 0.5, 0, "nearest", "none");
+    run_build_dem(disabled_doc, disabled);
+    EXPECT_TRUE(disabled_chunk.elevation().support.empty())
+        << "a DEM with no filled cells keeps an empty support mask";
+}
+
+TEST(Dem, SupportMaskKeepsTheInteriorFillAndDropsTheExtrapolatedEdge) {
+    // The measured cloud covers [-60, 60]^2 on the 0.5 m lattice (one sample per
+    // cell centre) MINUS two regions:
+    //   * an interior square hole |x| < 3, |y| < 3, fully surrounded by measured
+    //     cells, and
+    //   * a corner bite x > 10, y > 10, so the measured set's convex hull cuts
+    //     the top-right corner along x + y ~ 70 while the camera footprint still
+    //     covers cells beyond it.
+    // "enabled" fills both. The new rule marks the interior hole SUPPORTED (it
+    // was interpolated inside the measured area, so the ortho must rectify onto
+    // it) and the cells beyond the hull UNSUPPORTED (the surface was carried
+    // past the last measurement, the wavy block edge).
+    Document document = make_local_chunk_document();
+    Chunk& chunk = *document.active_chunk();
+    Sensor sensor;
+    sensor.type = CameraType::Frame;
+    sensor.calibration = Calibration::initial(CameraType::Frame, 2000, 2000, 2000.0);
+    chunk.sensors().push_back(sensor);
+
+    PointCloud& cloud = chunk.point_cloud();
+    cloud.points.clear();
+    for (int ix = -120; ix <= 120; ++ix) {
+        for (int iy = -120; iy <= 120; ++iy) {
+            const double x = 0.5 * static_cast<double>(ix) + 0.25;
+            const double y = 0.5 * static_cast<double>(iy) + 0.25;
+            const bool interior_hole = std::abs(x) < 3.0 && std::abs(y) < 3.0;
+            const bool corner_bite = x > 10.0 && y > 10.0;
+            if (interior_hole || corner_bite) {
+                continue;
+            }
+            cloud.points.push_back(Eigen::Vector3d(x, y, 10.0 + 0.01 * x));
+        }
+    }
+    // At 90 m above the ~10 m surface with f = 2000 px over 2000 px the half
+    // footprint is 45 m: it reaches past the x + y ~ 70 hull edge.
+    add_nadir_camera(chunk, 0.0, 0.0, 100.0);
+
+    Params params = dem_params("point_cloud", "enabled", 0.5, 0, "nearest", "none");
+    run_build_dem(document, params);
+
+    const Elevation& dem = chunk.elevation();
+    ASSERT_FALSE(dem.empty());
+    ASSERT_EQ(dem.support.size(), dem.raster.data.size())
+        << "a DEM with extrapolated cells must carry a support mask";
+
+    const auto support_at = [&](double x, double y) {
+        const Eigen::Vector2d c = dem.raster.grid.to_pixel(x, y);
+        const int col = static_cast<int>(std::floor(c.x()));
+        const int row = static_cast<int>(std::floor(c.y()));
+        if (!dem.raster.grid.contains_pixel(col, row)) {
+            return -1;
+        }
+        return static_cast<int>(dem.support[static_cast<std::size_t>(row) *
+                                                static_cast<std::size_t>(dem.raster.grid.width) +
+                                            static_cast<std::size_t>(col)]);
+    };
+    const auto nodata_at = [&](double x, double y) {
+        const Eigen::Vector2d c = dem.raster.grid.to_pixel(x, y);
+        const int col = static_cast<int>(std::floor(c.x()));
+        const int row = static_cast<int>(std::floor(c.y()));
+        return !dem.raster.grid.contains_pixel(col, row) || is_nodata(dem, col, row);
+    };
+
+    // The interior hole is filled and supported: interpolating inside the
+    // measured area is normal.
+    EXPECT_FALSE(nodata_at(-0.25, -0.25));
+    EXPECT_EQ(support_at(-0.25, -0.25), 1)
+        << "an interior hole inside the measured hull must be supported";
+    // A measured cell stays supported.
+    EXPECT_EQ(support_at(-20.25, -20.25), 1) << "a measured cell must be supported";
+    // The corner bite is filled (the footprint covers it) but lies beyond the
+    // measured convex hull, so the surface there was carried past the last
+    // measurement and must stay unsupported.
+    EXPECT_FALSE(nodata_at(40.25, 40.25));
+    EXPECT_EQ(support_at(40.25, 40.25), 0)
+        << "surface extrapolated beyond the measured hull must be unsupported";
+}
+
 TEST(Dem, EnabledKeepsTheConcaveGapAndTheOutsideNodata) {
     // Two cameras 60 m apart, each with a ~18 m half-footprint on the ground (90 m
     // of relief below a 100 m camera at f = 5000 px over 2000 px): the union is

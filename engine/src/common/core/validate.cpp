@@ -232,6 +232,17 @@ std::vector<std::string> Chunk::validate() const {
     for (const auto& asset : elevations_) {
         if (!asset.data) {
             report_id(out, "elevation", asset.id, "has a null data pointer");
+            continue;
+        }
+        const Elevation& elevation = *asset.data;
+        if (!elevation.support.empty() && !elevation.raster.empty()) {
+            const std::size_t cells =
+                static_cast<std::size_t>(elevation.raster.grid.width) *
+                static_cast<std::size_t>(elevation.raster.grid.height);
+            if (elevation.support.size() != cells) {
+                report_id(out, "elevation", asset.id,
+                          "support mask size does not match width*height");
+            }
         }
     }
     for (const auto& asset : orthomosaics_) {

@@ -244,6 +244,21 @@ struct Elevation {
     CRS crs;
     float nodata = -32767.0F;  ///< sentinel written for unmeasured cells
     std::string source;        ///< "point_cloud" | "model" | "depth_maps"
+    /// The interpolation mode the DEM was built with: "disabled", "enabled"
+    /// (fill holes inside the cameras' ground footprints) or "extrapolated"
+    /// (fill every hole). Empty for an old project. The orthomosaic reads it to
+    /// decide whether an unsupported (filled) cell may still be coloured: an
+    /// "extrapolated" DEM is the user asking for the surface to extend past the
+    /// last measurement, so the ortho uses it; otherwise the ortho is limited to
+    /// measured cells (see ortho::OrthoSupport).
+    std::string interpolation;
+    /// Per-cell SUPPORT mask, width*height cells: 1 = measured (a real dense
+    /// sample) or interpolated inside the measured area, 0 = extrapolated
+    /// beyond it by the hole fill. Empty means "every valid cell supported" (an
+    /// old project, or a source with no fill), so it needs no migration. The
+    /// orthomosaic reads it to avoid rectifying photographs onto invented
+    /// surface at the block edge (see ortho::OrthoSupport).
+    std::vector<std::uint8_t> support;
 
     /// EPSG code of `crs` (0 for the local frame or a custom CRS).
     int epsg() const { return crs.epsg; }

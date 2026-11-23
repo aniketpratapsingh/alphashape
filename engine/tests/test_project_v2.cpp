@@ -142,6 +142,10 @@ Elevation make_elevation(float base) {
     dem.set_epsg(32633);
     dem.nodata = -9999.0F;
     dem.source = "depth_maps";
+    // A support mask and interpolation mode, so the elevation sidecar's round
+    // trip (and the byte-stable resave) covers them.
+    dem.interpolation = "enabled";
+    dem.support = {1U, 0U, 1U, 1U};
     return dem;
 }
 
@@ -793,7 +797,8 @@ const std::set<std::string>& expected_attributes() {
         "elevation@enabled", "elevation@active", "elevation@path",
         "elevation@width", "elevation@height", "elevation@origin",
         "elevation@pixel_size", "elevation@epsg", "elevation@crs_wkt",
-        "elevation@nodataValue", "elevation@source_data",
+        "elevation@nodataValue", "elevation@source_data", "elevation@support_path",
+        "elevation@interpolation",
         "orthomosaic@id", "orthomosaic@label", "orthomosaic@group",
         "orthomosaic@enabled", "orthomosaic@active", "orthomosaic@path",
         "orthomosaic@labels_path", "orthomosaic@width", "orthomosaic@height",
@@ -848,7 +853,7 @@ TEST_F(ProjectV2, AttributeVocabulary) {
 
     expect_same_vocabulary(attributes, expected_attributes(),
                            "doc.xml attribute vocabulary");
-    EXPECT_EQ(expected_attributes().size(), 232U);
+    EXPECT_EQ(expected_attributes().size(), 234U);
     expect_reader_understands(document, archive);
 }
 
@@ -1192,7 +1197,7 @@ TEST_F(ProjectV2, SidecarMagicsAreDistinct) {
     // magic-tagged sidecar whose four-byte magic is one of the documented ones.
     // A mislabelled entry (a decoder reading a different layout) cannot pass.
     const std::set<std::string> known = {"AKP1", "AMT1", "ATR2", "ADM1", "ADM2", "ADM3",
-                                         "APC1", "AMS2", "AOL1", "AMK1", "ASH1",
+                                         "APC1", "AMS2", "AOL1", "AES1", "AMK1", "ASH1",
                                          "ATJ1", "AFR1", "ATM1"};
     std::set<std::string> seen;
     std::size_t sidecars = 0;
@@ -1343,6 +1348,9 @@ TEST_F(ProjectV2, LoadsV1Fixture) {
     EXPECT_EQ(dem.nodata, -32767.0F);
     EXPECT_EQ(dem.source, "depth_maps");
     EXPECT_EQ(dem.raster.data, want.elevations().front().data->raster.data);
+    // The support mask and interpolation mode survive the sidecar round trip.
+    EXPECT_EQ(dem.interpolation, want.elevations().front().data->interpolation);
+    EXPECT_EQ(dem.support, want.elevations().front().data->support);
     ASSERT_EQ(got.orthomosaics().size(), 1U);
     EXPECT_EQ(got.orthomosaics().front().data->labels,
               want.orthomosaics().front().data->labels);

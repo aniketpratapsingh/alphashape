@@ -341,6 +341,8 @@ element; a payload attribute is only emitted when the slot holds a payload.
 | `elevation` | `nodataValue` | float | only when the slot holds a payload | no-data sentinel |
 | `elevation` | `source_data` | string | only when the slot holds a payload | source product |
 | `elevation` | `crs_wkt` | string | only when the slot holds a payload and the CRS carries a WKT | CRS WKT |
+| `elevation` | `interpolation` | string | only when the slot holds a payload and the mode is set | interpolation mode the DEM was built with |
+| `elevation` | `support_path` | string | only when the DEM has extrapolated cells | support-mask sidecar entry (`AES1`): 1 = measured or interpolated inside the measured area, 0 = extrapolated beyond it |
 | `orthomosaic` | `id` | int | always | asset id |
 | `orthomosaic` | `label` | string | always | asset label |
 | `orthomosaic` | `group` | int | only when >= 0 | owning asset group |
