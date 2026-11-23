@@ -1760,11 +1760,16 @@ TEST(Gpu, AbandonedSubmissionPoolIsFreedOnceADeviceRecovers) {
     REQUIRE_GPU();
     DeviceStateGuard state_guard;
     (void)state_guard;
-    auto context = default_context();
+    // Its own context, not the shared default one: an earlier lost-device test
+    // may legitimately leave a pool parked on the default context (it is freed
+    // by a later signalled fence on that queue or at teardown), and whether one
+    // is still parked here depends on which tests ran in between -- the test
+    // order changes with sharding. The count below must start from zero.
+    auto context = create_context(ContextOptions{});
     ASSERT_NE(context, nullptr);
     ASSERT_FALSE(detail::device_lost());
     ASSERT_EQ(detail::orphaned_pool_count(*context), 0u)
-        << "a clean context starts with no parked pools";
+        << "a fresh context starts with no parked pools";
 
     constexpr std::size_t kCount = 4096;
     std::vector<float> zeros(kCount, 0.0f);
