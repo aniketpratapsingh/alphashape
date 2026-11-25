@@ -123,6 +123,7 @@ if(ALPHASHAPE_USE_PROJ)
         test_reference_settings.cpp
         test_reference_table.cpp
         test_import_reference.cpp
+        test_marker_reference_prediction.cpp
         test_surface_frame.cpp
         test_reproject.cpp)
     # PROJ is linked PRIVATE by alphashape_crs, and this test includes <proj.h>

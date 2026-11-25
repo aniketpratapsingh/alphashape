@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <QWidget>
@@ -31,6 +32,7 @@ class QLabel;
 class QLineEdit;
 class QListView;
 class QMenu;
+class QToolButton;
 
 namespace alphashape::gui {
 
@@ -53,6 +55,12 @@ public:
 
     /// Set the filter programmatically (the filter box follows).
     void set_filter(const QString& text);
+
+    /// Restrict the list to the cameras that see `marker_id`, nearest to the image centre
+    /// first, and show a "filtered by marker <label> — clear" chip. Passing nullopt clears it.
+    /// The pane forwards to the model, which recomputes the set on every rebuild.
+    void set_marker_filter(std::optional<std::int32_t> marker_id, const QString& label);
+    std::optional<std::int32_t> marker_filter() const;
 
     /// Camera ids selected in the list, in row order.
     std::vector<std::int32_t> selected_camera_ids() const;
@@ -85,6 +93,8 @@ private:
     bool refuse_while_busy(const QString& title);
     void update_actions();
     void update_summary();
+    /// Show or hide the "filtered by marker" chip from the model's marker filter.
+    void update_marker_chip();
 
     GuiApp& app_;
     WorkspaceSelection& selection_;
@@ -92,6 +102,10 @@ private:
     QListView* view_ = nullptr;
     QLineEdit* filter_ = nullptr;
     QLabel* summary_ = nullptr;
+    /// The "filtered by marker <label> — clear" chip, hidden when no marker filter is set.
+    QWidget* marker_chip_ = nullptr;
+    QLabel* marker_chip_label_ = nullptr;
+    QToolButton* marker_chip_clear_ = nullptr;
     QAction* enable_action_ = nullptr;
     QAction* disable_action_ = nullptr;
     ErrorHandler error_handler_;

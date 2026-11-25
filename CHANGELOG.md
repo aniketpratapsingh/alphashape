@@ -235,6 +235,17 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Added
 
+- **Imported control points are predicted on every photo.** Once a block is
+  georeferenced from its camera GPS, a marker that has only a surveyed
+  reference (an imported GCP, before it is adjusted) now shows a blue predicted
+  flag on each photo where it lands, so you can see which target is GCP 1, 2,
+  3 and drag the flag onto it. The prediction is the reference carried into the
+  chunk's local frame through the georeferencing transform; a marker that
+  already has an estimated position still uses that, because it is the better
+  estimate. The Reference pane gains "Show photos with this marker", which
+  filters the Photos dock to the photos that see the selected marker (nearest
+  to the image centre first) with a "Filtered by marker <label> — Clear" chip.
+
 - **Marker placement in the GUI.** The central area gains a Photo tab beside the
   3-D Model view: double-click a photo in the Photos dock (or use Reference >
   Place on photo) to open it, then right-click to add a marker at the cursor,

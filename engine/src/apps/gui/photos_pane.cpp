@@ -23,6 +23,7 @@
 #include <QSize>
 #include <QStyle>
 #include <QStyledItemDelegate>
+#include <QToolButton>
 #include <QVariant>
 #include <QVBoxLayout>
 
@@ -231,6 +232,28 @@ PhotosPane::PhotosPane(GuiApp& app, WorkspaceSelection& selection, QWidget* pare
     header_layout->addStretch(1);
     layout->addWidget(header);
 
+    // The "filtered by marker" chip: a second header row that appears only while a marker
+    // filter is active, so the list's restriction is always visible and one click clears it.
+    marker_chip_ = new QWidget(this);
+    marker_chip_->setObjectName(QStringLiteral("photos.marker_filter"));
+    auto* chip_layout = new QHBoxLayout(marker_chip_);
+    chip_layout->setContentsMargins(6, 2, 6, 2);
+    chip_layout->setSpacing(6);
+    marker_chip_label_ = new QLabel(marker_chip_);
+    marker_chip_label_->setObjectName(QStringLiteral("photos.marker_filter.label"));
+    chip_layout->addWidget(marker_chip_label_);
+    marker_chip_clear_ = new QToolButton(marker_chip_);
+    marker_chip_clear_->setObjectName(QStringLiteral("photos.marker_filter.clear"));
+    marker_chip_clear_->setText(tr("Clear"));
+    marker_chip_clear_->setToolTip(tr("Show every photo again"));
+    marker_chip_clear_->setAutoRaise(true);
+    connect(marker_chip_clear_, &QToolButton::clicked, this,
+            [this]() { set_marker_filter(std::nullopt, QString()); });
+    chip_layout->addWidget(marker_chip_clear_);
+    chip_layout->addStretch(1);
+    marker_chip_->setVisible(false);
+    layout->addWidget(marker_chip_);
+
     model_ = new PhotosModel(app_, this);
     view_ = new QListView(this);
     view_->setObjectName(QStringLiteral("view.photos"));
@@ -298,6 +321,10 @@ PhotosPane::PhotosPane(GuiApp& app, WorkspaceSelection& selection, QWidget* pare
     });
     connect(&app_, &GuiApp::document_replaced, this, [this]() {
         view_->selectionModel()->clear();
+        // A replaced document has no marker with the old id; drop the filter so the list is
+        // not silently empty.
+        model_->set_marker_filter(std::nullopt, QString());
+        update_marker_chip();
         update_actions();
         update_summary();
     });
@@ -308,6 +335,7 @@ PhotosPane::PhotosPane(GuiApp& app, WorkspaceSelection& selection, QWidget* pare
     connect(model_, &PhotosModel::reset_completed, this, [this]() {
         on_shared_selection_changed();
         update_actions();
+        update_marker_chip();
         update_summary();
     });
     connect(&app_.jobs(), &JobManager::busy_changed, this, [this](bool) { update_actions(); });
@@ -316,6 +344,7 @@ PhotosPane::PhotosPane(GuiApp& app, WorkspaceSelection& selection, QWidget* pare
             [this](ThemeMode) { view_->viewport()->update(); });
 
     update_actions();
+    update_marker_chip();
     update_summary();
 }
 
@@ -342,8 +371,30 @@ void PhotosPane::set_filter(const QString& text) {
     filter_->setText(text);  // textChanged does the rest
 }
 
+void PhotosPane::set_marker_filter(std::optional<std::int32_t> marker_id, const QString& label) {
+    model_->set_marker_filter(marker_id, label);
+    update_marker_chip();
+    update_summary();
+}
+
+std::optional<std::int32_t> PhotosPane::marker_filter() const {
+    return model_->marker_filter();
+}
+
+void PhotosPane::update_marker_chip() {
+    if (marker_chip_ == nullptr) {
+        return;
+    }
+    const bool active = model_->marker_filter().has_value();
+    if (active && marker_chip_label_ != nullptr) {
+        marker_chip_label_->setText(
+            tr("Filtered by marker %1").arg(model_->marker_filter_label()));
+    }
+    marker_chip_->setVisible(active);
+}
+
 void PhotosPane::update_summary() {
-    if (filter_->text().trimmed().isEmpty()) {
+    if (filter_->text().trimmed().isEmpty() && !model_->marker_filter().has_value()) {
         summary_->setText(tr("%1 photos").arg(model_->total_count()));
     } else {
         summary_->setText(tr("%1 of %2 photos").arg(model_->rowCount()).arg(model_->total_count()));

@@ -179,6 +179,13 @@ MainWindow::MainWindow(GuiApp& app, QWidget* parent)
     // "Place on photo" in the Reference pane opens the selected camera in the Photo tab.
     connect(reference_pane_, &ReferencePane::place_on_photo_requested, this,
             [this](qint32 camera_id) { open_photo(camera_id); });
+    // "Show photos with this marker" filters the Photos dock to the cameras that see it.
+    connect(reference_pane_, &ReferencePane::show_marker_photos_requested, this,
+            [this](qint32 marker_id, const QString& label) {
+                if (photos_pane_ != nullptr) {
+                    photos_pane_->set_marker_filter(marker_id, label);
+                }
+            });
 #endif
 
     // The start screen appears when no project is open. The command line decides the initial

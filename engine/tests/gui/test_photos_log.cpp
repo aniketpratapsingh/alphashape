@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include <Eigen/Core>
+
 #include <gtest/gtest.h>
 
 #include <QAbstractItemModelTester>
@@ -23,6 +25,7 @@
 #include <QImage>
 #include <QItemSelectionModel>
 #include <QKeySequence>
+#include <QLabel>
 #include <QLineEdit>
 #include <QListView>
 #include <QMenu>
@@ -42,9 +45,12 @@
 #include "apps/gui/workspace_pane.hpp"
 #include "base/utils/log.hpp"
 #include "common/commands/model_commands.hpp"
+#include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
+#include "common/core/marker.hpp"
 #include "common/tasks/registry.hpp"
+#include "model/camera/calibration.hpp"
 #include "harness.hpp"
 
 using namespace alphashape;
@@ -203,6 +209,56 @@ TEST_F(PhotosPaneTest, FilterIsASubstringMatch) {
     EXPECT_EQ(model().rowCount(), 0);
     filter()->clear();
     EXPECT_EQ(model().rowCount(), 6);
+    EXPECT_TRUE(warnings().empty()) << warnings().text();
+}
+
+// The marker filter lists only the cameras whose image contains the marker, nearest to the
+// image centre first, and shows a clearable chip.
+TEST_F(PhotosPaneTest, MarkerFilterListsOnlyCamerasThatSeeTheMarker) {
+    const BuiltChunk built = build_chunk(4, /*with_files=*/false);
+    Chunk& chunk = chunk_ref(built.id);
+    // Give every camera a sensor and an identity pose so a marker at the origin projects to the
+    // image centre of each. The chunk builder left the poses non-identity for odd cameras, so
+    // reset them here.
+    Sensor sensor;
+    sensor.width = 64;
+    sensor.height = 48;
+    sensor.calibration = Calibration::initial(CameraType::Frame, 64, 48, 50.0);
+    chunk.sensors().push_back(sensor);
+    for (Camera& camera : chunk.cameras()) {
+        camera.sensor_id = 0;
+        camera.pose = Transform::Identity();
+    }
+    // A marker on the optical axis of every camera: all four see it.
+    Marker marker;
+    marker.id = chunk.allocate_id();
+    marker.label = "GCP 1";
+    marker.position = Eigen::Vector3d(0.0, 0.0, 1.0);
+    chunk.markers().push_back(marker);
+    model().refresh();
+    ASSERT_EQ(model().rowCount(), 4);
+
+    photos().set_marker_filter(marker.id, QStringLiteral("GCP 1"));
+    EXPECT_EQ(model().marker_filter(), std::optional<std::int32_t>(marker.id));
+    EXPECT_EQ(model().rowCount(), 4);
+    // The chip is visible and names the marker.
+    auto* chip = window().findChild<QWidget*>(QStringLiteral("photos.marker_filter"));
+    ASSERT_NE(chip, nullptr);
+    EXPECT_TRUE(chip->isVisibleTo(&photos()));
+    auto* label = window().findChild<QLabel*>(QStringLiteral("photos.marker_filter.label"));
+    ASSERT_NE(label, nullptr);
+    EXPECT_TRUE(label->text().contains(QStringLiteral("GCP 1")));
+
+    // Move the marker behind the cameras: no camera sees it, so the list is empty.
+    chunk.markers()[0].position = Eigen::Vector3d(0.0, 0.0, -1.0);
+    model().refresh();
+    EXPECT_EQ(model().rowCount(), 0);
+
+    // Clearing the filter restores every photo and hides the chip.
+    photos().set_marker_filter(std::nullopt, QString());
+    EXPECT_FALSE(model().marker_filter().has_value());
+    EXPECT_EQ(model().rowCount(), 4);
+    EXPECT_FALSE(chip->isVisibleTo(&photos()));
     EXPECT_TRUE(warnings().empty()) << warnings().text();
 }
 

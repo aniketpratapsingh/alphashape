@@ -553,7 +553,27 @@ void PhotoView::refresh() {
             calibration.reset();
         }
 
-        for (const Marker& marker : chunk->markers()) {
+        // A marker with no estimated position but a surveyed reference can still be predicted
+        // once the chunk is georeferenced: its reference is carried into the local frame and
+        // projected. Computed once for the whole list (the geodetic conversion reads it whole),
+        // and only when some marker actually needs it.
+        std::vector<std::optional<Eigen::Vector3d>> reference_locals;
+        if (calibration.has_value()) {
+            bool any_without_position = false;
+            for (const Marker& marker : chunk->markers()) {
+                if (!marker.position.has_value()) {
+                    any_without_position = true;
+                    break;
+                }
+            }
+            if (any_without_position) {
+                reference_locals = marker_locals_from_references(*chunk);
+            }
+        }
+
+        for (std::size_t marker_index = 0; marker_index < chunk->markers().size();
+             ++marker_index) {
+            const Marker& marker = chunk->markers()[marker_index];
             Flag flag;
             flag.marker_id = marker.id;
             flag.label = QString::fromStdString(marker.label);
@@ -570,8 +590,18 @@ void PhotoView::refresh() {
                 if (!calibration.has_value()) {
                     continue;
                 }
-                const std::optional<Eigen::Vector2d> predicted =
-                    project_marker(marker, *camera, *calibration, /*clip_to_image=*/false);
+                // The estimated position is the better estimate and is used whenever it exists;
+                // only a marker without one (an imported control point, before it is adjusted)
+                // falls back to its surveyed reference.
+                std::optional<Eigen::Vector2d> predicted;
+                if (marker.position.has_value()) {
+                    predicted = project_marker(marker, *camera, *calibration,
+                                               /*clip_to_image=*/false);
+                } else if (marker_index < reference_locals.size() &&
+                           reference_locals[marker_index].has_value()) {
+                    predicted = project_marker(*reference_locals[marker_index], *camera,
+                                               *calibration, /*clip_to_image=*/false);
+                }
                 if (!predicted.has_value()) {
                     continue;
                 }
