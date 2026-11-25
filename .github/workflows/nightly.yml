@@ -65,11 +65,38 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           ref: main
+      # The same collection as publish.yml: `pattern: alphashape-*` merged into one folder
+      # also takes alphashape-windows-installer and the Windows artifact's own folder layout,
+      # which left a directory inside dist/ and made the checksum step fail every night.
       - uses: actions/download-artifact@v8.0.2
         with:
           path: dist
-          pattern: alphashape-*
+          pattern: alphashape-linux-*
           merge-multiple: true
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          pattern: alphashape-macos-*
+          merge-multiple: true
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: alphashape-windows-x86_64
+          path: dist-windows
+      - name: Collect the Windows assets
+        run: |
+          find dist-windows -maxdepth 2 -name '*.exe' -exec mv {} dist/ \;
+          find dist-windows -maxdepth 2 -name '*.zip' -exec mv {} dist/ \;
+          rm -rf dist-windows
+      - name: Every platform has its installer
+        run: |
+          fail=0
+          for pattern in '*.deb' '*.AppImage' '*.dmg' '*.exe'; do
+            if ! compgen -G "dist/${pattern}" >/dev/null; then
+              echo "::error::no ${pattern} in the built assets"
+              fail=1
+            fi
+          done
+          [ "$fail" = 0 ] || { ls -lR dist; exit 1; }
       - name: Checksums
         run: cd dist && sha256sum -- * > SHA256SUMS && ls -lh
       - name: Replace the nightly release
