@@ -2005,11 +2005,6 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     // -- the surface raster and the output grid ------------------------------
     GeoRaster<float> surface = dem.raster;
     float surface_nodata = dem.nodata;
-    // The DEM's support mask, kept on the SAME grid as `surface`: it starts on
-    // the DEM's grid and is reprojected alongside the surface when the run
-    // builds in a different CRS (below). Empty means "every valid cell
-    // supported".
-    std::vector<std::uint8_t> surface_support = dem.support;
     // The DTO naming the surface's CRS, so a model-surface DSM is rasterised
     // into the same plane the frame uses.
     CRS surface_crs = dem.empty() ? options.crs : dem.crs;
@@ -2057,20 +2052,6 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         reproject_options.nodata_out = dem.nodata;
         surface = reproject(dem.raster, from, to, surface_grid, reproject_options);
         surface_nodata = dem.nodata;
-        // The support mask must follow the surface onto the new grid, or the
-        // gate would read the wrong cells. A nearest resample of the 0/1 mask
-        // keeps each target cell's support from the source cell it lands on;
-        // cells the source does not cover read 0 (unsupported), which is the
-        // conservative answer for a cell the DEM never measured.
-        if (!surface_support.empty()) {
-            GeoRaster<std::uint8_t> support_raster;
-            support_raster.grid = dem.raster.grid;
-            support_raster.channels = 1;
-            support_raster.data = surface_support;
-            const GeoRaster<std::uint8_t> reprojected =
-                reproject(support_raster, from, to, surface_grid, reproject_options);
-            surface_support = reprojected.data;
-        }
         surface_crs = options.crs;
         frame = elevation::for_options(*chunk, options.crs);
         progress.update("initialize", 0.6);
@@ -2268,22 +2249,17 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     const HeightRange heights = surface_height_range(surface, surface_nodata);
 
     // -- the DEM's support mask ----------------------------------------------
-    // The ortho is not produced over surface the DEM extrapolated beyond the
-    // measured area: at the block edge that filled surface is a near-flat
-    // extrapolation, and rectifying a photograph onto it is what produces the
-    // wavy, unsupported border. A hole interpolated INSIDE the measured area (a
-    // roof, water, a shadow) is supported and rectified onto normally. The mask
-    // is the DEM's own record of measured-or-interpolated-inside vs
-    // extrapolated-beyond. It is honoured unless the DEM was built with
-    // interpolation "extrapolated", where the user explicitly asked for the
-    // surface to extend past the last measurement. A "model" surface is a DSM
-    // rasterised from the mesh (every cell is real geometry), so it is fully
-    // supported and carries no mask.
-    ortho::OrthoSupport support;
-    if (options.surface == "elevation" && !surface_support.empty()) {
-        support.mask = &surface_support;
-        support.allow_unsupported = dem.interpolation == "extrapolated";
-    }
+    // The DEM still records its support mask (1 = measured or interpolated
+    // inside the measured area, 0 = extrapolated beyond it); it is kept in the
+    // project and its sidecar for reporting and future use. The ortho does NOT
+    // clip to it: clipping to the measured hull removed correctly rendered flat
+    // surface (water, a uniform field) on a coastal block, where the sea has
+    // almost no dense points but the filled DEM is flat and rectifies cleanly.
+    // The ortho therefore rectifies onto every valid DEM cell (measured or
+    // filled within the DEM's own fill region), and a stretched view is rejected
+    // by the incidence-vs-surface-normal test in orthorectify() instead. The
+    // `support` argument is left null so no mask gates the output.
+    const ortho::OrthoSupport* support = nullptr;
 
     // -- memory guard, BEFORE any cell-sized allocation ----------------------
     // Refuse (or, for the automatic cell, coarsen) a run whose peak cannot fit
@@ -2742,7 +2718,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                 tiles.push_back(ortho::orthorectify(
                     surface, surface_nodata, window, camera, static_cast<int>(k),
                     occlusion_tolerance, true, &surface_range,
-                    plan.block_cells > 0 ? &cell_lattice : nullptr, &support));
+                    plan.block_cells > 0 ? &cell_lattice : nullptr, support));
                 // Apply the camera's precomputed correction to the tile just
                 // rectified, BEFORE the seam labeller reads it. The model is a
                 // whole-flight constant (see estimate_camera_gains /
