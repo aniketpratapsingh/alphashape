@@ -14,7 +14,9 @@
 #include <QThreadPool>
 
 #include "apps/gui/app.hpp"
+#include "apps/gui/job_manager.hpp"
 #include "base/utils/log.hpp"
+#include "common/algorithm/markers/project_markers.hpp"
 #include "common/core/chunk.hpp"
 #include "common/core/document.hpp"
 #include "common/core/frame.hpp"
@@ -295,34 +297,40 @@ void PhotosModel::rebuild() {
     });
 
     const bool same_document = chunk_id == chunk_id_ && document_path == document_path_;
-    if (same_document && rows == rows_) {
-        return;  // nothing visible changed; keep the view's scroll position and selection
-    }
+    // With a marker filter the visible set depends on the chunk transform and the marker
+    // references, not only on the rows, so a job that moved the transform without touching a
+    // camera would leave `rows` identical while the set changed. Skip the in-place shortcuts
+    // and rebuild the visible list every time.
+    if (!marker_filter_.has_value()) {
+        if (same_document && rows == rows_) {
+            return;  // nothing visible changed; keep the view's scroll position and selection
+        }
 
-    // Same cameras, same labels, same files: only the badges moved (an enable/disable round
-    // trip). Update in place so the list keeps its selection and scroll position.
-    bool same_identity = same_document && rows.size() == rows_.size();
-    for (std::size_t i = 0; same_identity && i < rows.size(); ++i) {
-        same_identity = rows[i].camera_id == rows_[i].camera_id && rows[i].label == rows_[i].label &&
-                        rows[i].path == rows_[i].path;
-    }
-    if (same_identity) {
-        for (std::size_t i = 0; i < rows.size(); ++i) {
-            if (rows[i].aligned == rows_[i].aligned && rows[i].enabled == rows_[i].enabled) {
-                continue;
-            }
-            rows_[i] = rows[i];
-            for (std::size_t v = 0; v < visible_.size(); ++v) {
-                if (visible_[v] != static_cast<int>(i)) {
+        // Same cameras, same labels, same files: only the badges moved (an enable/disable round
+        // trip). Update in place so the list keeps its selection and scroll position.
+        bool same_identity = same_document && rows.size() == rows_.size();
+        for (std::size_t i = 0; same_identity && i < rows.size(); ++i) {
+            same_identity = rows[i].camera_id == rows_[i].camera_id &&
+                            rows[i].label == rows_[i].label && rows[i].path == rows_[i].path;
+        }
+        if (same_identity) {
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                if (rows[i].aligned == rows_[i].aligned && rows[i].enabled == rows_[i].enabled) {
                     continue;
                 }
-                const QModelIndex changed = index(static_cast<int>(v), 0);
-                Q_EMIT dataChanged(changed, changed,
-                                   {Qt::ToolTipRole, Qt::ForegroundRole, AlignedRole,
-                                    EnabledRole, BadgesRole, BadgeKindsRole});
+                rows_[i] = rows[i];
+                for (std::size_t v = 0; v < visible_.size(); ++v) {
+                    if (visible_[v] != static_cast<int>(i)) {
+                        continue;
+                    }
+                    const QModelIndex changed = index(static_cast<int>(v), 0);
+                    Q_EMIT dataChanged(changed, changed,
+                                       {Qt::ToolTipRole, Qt::ForegroundRole, AlignedRole,
+                                        EnabledRole, BadgesRole, BadgeKindsRole});
+                }
             }
+            return;
         }
-        return;
     }
 
     if (!same_document) {
@@ -355,11 +363,64 @@ void PhotosModel::end_reset() {
 void PhotosModel::rebuild_visible() {
     visible_.clear();
     const QString needle = filter_.trimmed();
+    if (marker_filter_.has_value()) {
+        // The marker filter decides the set AND the order (nearest to the image centre first);
+        // the text filter narrows it further without reordering.
+        const std::vector<std::int32_t> seeing = cameras_for_marker_filter();
+        for (const std::int32_t camera_id : seeing) {
+            for (std::size_t i = 0; i < rows_.size(); ++i) {
+                if (rows_[i].camera_id != camera_id) {
+                    continue;
+                }
+                if (needle.isEmpty() || rows_[i].label.contains(needle, Qt::CaseInsensitive)) {
+                    visible_.push_back(static_cast<int>(i));
+                }
+                break;
+            }
+        }
+        return;
+    }
     for (std::size_t i = 0; i < rows_.size(); ++i) {
         if (needle.isEmpty() || rows_[i].label.contains(needle, Qt::CaseInsensitive)) {
             visible_.push_back(static_cast<int>(i));
         }
     }
+}
+
+std::vector<std::int32_t> PhotosModel::cameras_for_marker_filter() const {
+    std::vector<std::int32_t> ids;
+    if (!marker_filter_.has_value()) {
+        return ids;
+    }
+    // A running job holds the document exclusively; reading it here would block the GUI thread.
+    // The list is empty until the job finishes, when refresh_after_job() rebuilds it.
+    if (app_.jobs().busy()) {
+        return ids;
+    }
+    const std::int32_t marker_id = *marker_filter_;
+    app_.read_document([&](const Document& document) {
+        const Chunk* chunk = nullptr;
+        for (const auto& workspace : document.workspaces()) {
+            for (const auto& candidate : workspace->chunks()) {
+                if (candidate->id() == chunk_id_) {
+                    chunk = candidate.get();
+                }
+            }
+        }
+        if (chunk == nullptr) {
+            return;
+        }
+        for (std::size_t i = 0; i < chunk->markers().size(); ++i) {
+            if (chunk->markers()[i].id != marker_id) {
+                continue;
+            }
+            for (const MarkerCameraHit& hit : cameras_seeing_marker(*chunk, i)) {
+                ids.push_back(hit.camera_id);
+            }
+            return;
+        }
+    });
+    return ids;
 }
 
 void PhotosModel::request_thumbnails() {
@@ -375,6 +436,18 @@ void PhotosModel::set_filter(const QString& text) {
         return;
     }
     filter_ = text;
+    begin_reset();
+    rebuild_visible();
+    end_reset();
+}
+
+void PhotosModel::set_marker_filter(std::optional<std::int32_t> marker_id,
+                                    const QString& label) {
+    if (marker_id == marker_filter_ && label == marker_filter_label_) {
+        return;
+    }
+    marker_filter_ = marker_id;
+    marker_filter_label_ = marker_id.has_value() ? label : QString();
     begin_reset();
     rebuild_visible();
     end_reset();

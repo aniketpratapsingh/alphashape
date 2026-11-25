@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <QAbstractListModel>
@@ -151,6 +152,15 @@ public:
     void set_filter(const QString& text);
     QString filter() const { return filter_; }
 
+    /// Restrict the list to the cameras that see `marker_id` (a placed projection, or a
+    /// prediction from the marker's position or surveyed reference), nearest to the image
+    /// centre first. `label` is the marker's label, shown by the pane's filter chip. Passing
+    /// nullopt clears the restriction. The set is recomputed on every rebuild, so a finished
+    /// georeferencing job or an undo updates it.
+    void set_marker_filter(std::optional<std::int32_t> marker_id, const QString& label);
+    std::optional<std::int32_t> marker_filter() const { return marker_filter_; }
+    QString marker_filter_label() const { return marker_filter_label_; }
+
     /// Re-read the document. Only marks the model stale while a job is active.
     void refresh();
     bool stale() const { return stale_; }
@@ -185,6 +195,9 @@ private:
     void refresh_after_job();
     void rebuild();
     void rebuild_visible();
+    /// The camera ids that see the marker filter, nearest to the image centre first, or an
+    /// empty vector when no marker filter is set. Read from the document under the shared lock.
+    std::vector<std::int32_t> cameras_for_marker_filter() const;
     void request_thumbnails();
     /// Emit dataChanged for every visible row that shows `path`.
     void thumbnails_changed(const QString& path);
@@ -199,6 +212,10 @@ private:
     std::vector<Row> rows_;
     std::vector<int> visible_;  ///< indices into rows_ after the filter
     QString filter_;
+    /// When set, only the cameras that see this marker are visible, in the order
+    /// `cameras_seeing_marker` returns them (nearest to the image centre first).
+    std::optional<std::int32_t> marker_filter_;
+    QString marker_filter_label_;
     std::int32_t chunk_id_ = -1;
     QString document_path_;
     bool stale_ = false;

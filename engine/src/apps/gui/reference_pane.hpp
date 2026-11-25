@@ -56,6 +56,10 @@ Q_SIGNALS:
     /// markers are placed. The pane never opens the tab itself.
     void place_on_photo_requested(qint32 camera_id);
 
+    /// "Show photos with this marker" was triggered: the window filters the Photos pane to the
+    /// cameras that see `marker_id`, labelled `label`. The pane never touches the Photos dock.
+    void show_marker_photos_requested(qint32 marker_id, const QString& label);
+
 private:
     void create_toolbar();
     void create_tables();
@@ -65,6 +69,8 @@ private:
     /// The camera "Place on photo" should open: the selected camera of the active chunk, else
     /// the first camera that has a frame, else -1.
     std::int32_t camera_for_photo() const;
+    /// The marker row the "Show photos" action should use: the selected marker row, else -1.
+    std::int32_t selected_marker_row() const;
 
     GuiApp& app_;
     WorkspaceSelection& selection_;
@@ -80,6 +86,7 @@ private:
     QAction* convert_ = nullptr;
     QAction* import_markers_ = nullptr;
     QAction* pick_ = nullptr;
+    QAction* show_photos_ = nullptr;
 };
 
 }  // namespace alphashape::gui

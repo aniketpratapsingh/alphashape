@@ -12,6 +12,7 @@
 #include <QDialog>
 #include <QDoubleSpinBox>
 #include <QHeaderView>
+#include <QItemSelectionModel>
 #include <QLabel>
 #include <QMessageBox>
 #include <QString>
@@ -144,6 +145,9 @@ void ReferencePane::create_tables() {
     };
     camera_view_ = make_view(camera_model_, QStringLiteral("reference.cameras"));
     marker_view_ = make_view(marker_model_, QStringLiteral("reference.markers"));
+    // "Show photos with this marker" is only meaningful with a marker row selected.
+    connect(marker_view_->selectionModel(), &QItemSelectionModel::selectionChanged, this,
+            [this]() { update_actions(); });
     auto* layout = qobject_cast<QVBoxLayout*>(this->layout());
     auto* camera_title = new QLabel(tr("Cameras"), this);
     camera_title->setContentsMargins(6, 2, 6, 0);
@@ -224,6 +228,39 @@ void ReferencePane::create_toolbar() {
             Q_EMIT place_on_photo_requested(camera_id);
         }
     });
+
+    // "Show photos with this marker": filters the Photos dock to the cameras that see the
+    // selected marker row, so the user can find the photos where a control point is visible.
+    show_photos_ = make(QStringLiteral("action.reference.show_photos"),
+                        tr("Show photos with this marker"));
+    show_photos_->setToolTip(
+        tr("Filter the Photos list to the photos that see the selected marker"));
+    connect(show_photos_, &QAction::triggered, this, [this]() {
+        if (app_.jobs().busy()) {
+            return;
+        }
+        const std::int32_t row = selected_marker_row();
+        if (row < 0) {
+            return;
+        }
+        const std::int32_t marker_id = marker_model_->row_id(row);
+        if (marker_id < 0) {
+            return;
+        }
+        Q_EMIT show_marker_photos_requested(
+            marker_id, QString::fromStdString(marker_model_->row(row).label));
+    });
+}
+
+std::int32_t ReferencePane::selected_marker_row() const {
+    if (marker_view_ == nullptr || marker_view_->selectionModel() == nullptr) {
+        return -1;
+    }
+    const QModelIndexList rows = marker_view_->selectionModel()->selectedRows();
+    if (rows.isEmpty()) {
+        return -1;
+    }
+    return rows.front().row();
 }
 
 std::int32_t ReferencePane::camera_for_photo() const {
@@ -330,6 +367,9 @@ void ReferencePane::update_actions() {
     }
     if (pick_ != nullptr) {
         pick_->setEnabled(idle_chunk);
+    }
+    if (show_photos_ != nullptr) {
+        show_photos_->setEnabled(idle_chunk && selected_marker_row() >= 0);
     }
     if (QAction* settings = action(QStringLiteral("action.reference.settings"))) {
         settings->setEnabled(idle_chunk);
