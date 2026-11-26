@@ -101,8 +101,9 @@ void run_match_photos(Document& document, std::int64_t keypoint_limit_per_mpx = 
     run_task(builtin_registry(), document, "MatchPhotos", params);
 }
 
-void run_align_cameras(Document& document) {
+void run_align_cameras(Document& document, bool fit_intrinsics = true) {
     Params params = make_params(builtin_registry().require("AlignCameras"));
+    params.set("fit_intrinsics", fit_intrinsics);
     run_task(builtin_registry(), document, "AlignCameras", params);
 }
 
@@ -117,11 +118,14 @@ void run_optimize_cameras(Document& document, bool fit_k3 = true) {
     run_task(builtin_registry(), document, "OptimizeCameras", params);
 }
 
-/// A fully prepared chunk: AddPhotos + MatchPhotos + AlignCameras.
+/// A fully prepared chunk: AddPhotos + MatchPhotos + AlignCameras. The
+/// alignment's own self-calibration is off by default here, so these tests
+/// isolate OptimizeCameras: the sensor starts at its EXIF calibration and only
+/// the OptimizeCameras solve moves it.
 Document aligned_document(const std::vector<std::string>& files) {
     Document document = make_document(files);
     run_match_photos(document);
-    run_align_cameras(document);
+    run_align_cameras(document, /*fit_intrinsics=*/false);
     return document;
 }
 

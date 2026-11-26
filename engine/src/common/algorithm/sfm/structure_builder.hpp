@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Core>
@@ -38,10 +40,29 @@ struct BuilderCamera {
     std::vector<Eigen::Vector2d> pixels;
     /// Already-aligned camera to keep when continuing an alignment.
     std::optional<AbsolutePose> initial_pose;
+    /// Sensor grouping key. Cameras that share a non-negative `sensor_id` share
+    /// one calibration in bundle adjustment, so self-calibration refines one
+    /// lens per physical sensor rather than one per photo. A negative value
+    /// (the default) makes the camera its own sensor, which -- with the
+    /// minimum-camera gate below -- leaves its intrinsics fixed, the historical
+    /// behaviour.
+    std::int32_t sensor_id = -1;
+};
+
+/// Per-sensor metadata the builder needs to honour a sensor's held coefficients.
+struct BuilderSensor {
+    std::int32_t id = -1;
+    /// Coefficients held fixed during self-calibration (Sensor::fixed_params),
+    /// named as in kCalibrationParamNames. A coefficient named here is never
+    /// freed, whatever the refinement schedule would otherwise allow.
+    std::vector<std::string> fixed_params;
 };
 
 struct BuilderInput {
     std::vector<BuilderCamera> cameras;
+    /// Optional per-sensor metadata, matched to BuilderCamera::sensor_id. A
+    /// sensor id with no entry here simply has no held coefficients.
+    std::vector<BuilderSensor> sensors;
     std::vector<PairMatches> matches;  ///< verified pair matches (camera ids)
     std::vector<Track> tracks;         ///< tracks over those keypoints;
                                        ///< .point = initial point if continuing
@@ -61,6 +82,31 @@ struct BuilderOptions {
     /// then every max(1, registered/10).
     std::size_t global_ba_every = 1;
     std::uint64_t seed = 0x5eed;
+
+    /// Self-calibration during the global bundle adjustments. When true (the
+    /// default) the builder refines each sensor's focal length, principal point
+    /// and low-order radial/tangential distortion once enough of that sensor's
+    /// cameras are registered; see the schedule in structure_builder.cpp. When
+    /// false every intrinsic stays at its input value, the pre-self-calibration
+    /// behaviour.
+    bool fit_intrinsics = true;
+    /// Minimum number of registered cameras of one sensor before its intrinsics
+    /// are freed at all. Below this the sensor's calibration is held fixed, so a
+    /// handful of views cannot drag the lens off its EXIF seed. Ten is the low
+    /// end of the range mainstream incremental SfM uses, and it is early enough
+    /// on a real block that a wrong lens is corrected before the structure can
+    /// bend around it.
+    std::size_t min_cameras_for_intrinsics = 10;
+    /// Registered-camera count at which the full free set (f, cx, cy, k1, k2,
+    /// k3, p1, p2) is released. Between min_cameras_for_intrinsics and this the
+    /// builder frees only f and k1, the two best-conditioned terms.
+    std::size_t full_intrinsics_cameras = 15;
+    /// Divergence guards. A refined calibration is rejected (reverted to the
+    /// previous value for that sensor) when the focal length moves by more than
+    /// this fraction of its initial value, when |k1| exceeds the bound, when any
+    /// coefficient is non-finite, or when the global BA RMS got worse.
+    double max_focal_change_fraction = 0.30;
+    double max_abs_k1 = 2.0;
 };
 
 struct BuilderResult {
@@ -69,6 +115,11 @@ struct BuilderResult {
     std::size_t registered = 0;
     std::int32_t initial_camera_a = -1, initial_camera_b = -1;
     double final_rms_px = 0.0;
+    /// The refined calibration of every sensor that was self-calibrated, keyed
+    /// by BuilderCamera::sensor_id. A sensor absent here kept its input
+    /// calibration (never freed, or reverted by a divergence guard). The caller
+    /// writes these back to the sensor's ADJUSTED calibration.
+    std::vector<std::pair<std::int32_t, Calibration>> refined_calibrations;
 };
 
 /// Incremental SfM.

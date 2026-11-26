@@ -890,6 +890,18 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Fixed
 
+- **Align Photos never estimated the lens, so a distorted block bent.** The
+  incremental alignment held every camera intrinsic at its EXIF seed (focal
+  length with zero distortion) and never refined it, so a block shot through a
+  strong-distortion lens was reconstructed with the wrong camera model. On a
+  214-photo drone block with strong lens distortion the block bent by tens of
+  metres: camera heights ranged over -14 to 142 m for a flight at 84-96 m, and
+  georeferencing to the GPS positions gave a 36.6 m RMS error, against 1.55 m
+  with the correct lens. Alignment now refines each sensor's focal length,
+  principal point and low-order radial/tangential distortion during its global
+  bundle adjustments, once enough of that sensor's cameras are registered, with
+  guards that revert a diverging lens. A new `fit_intrinsics` option (on by
+  default) keeps the old fixed-lens behaviour when turned off.
 - **Straight colour steps along block boundaries in a large orthomosaic.** A
   block decided the seam in its overlap margin and then discarded that decision,
   so the next block re-optimised the overlap and could switch camera exactly on
