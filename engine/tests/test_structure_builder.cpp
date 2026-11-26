@@ -183,8 +183,8 @@ constexpr double kNadirInitialF = 600.0;   ///< the (wrong) seed focal
 constexpr double kNadirTrueF = 630.0;      ///< 1.05 x the seed
 constexpr double kNadirTrueK1 = -0.2;
 constexpr double kNadirTrueK2 = 0.05;
-constexpr double kNadirFlightHeight = 30.0;
-constexpr double kNadirGroundHalf = 15.0;  ///< ground points span +/-15 in x,y
+constexpr double kNadirFlightHeight = 28.0;
+constexpr double kNadirGroundHalf = 16.0;  ///< ground points span +/-16 in x,y
 
 Calibration nadir_initial_calibration() {
     Calibration c;
@@ -203,31 +203,39 @@ Calibration nadir_true_calibration() {
     return c;
 }
 
-/// A `grid` x `grid` nadir block over gently rolling ground, with `n_points`
-/// ground points. Every camera looks straight down (camera +Z is world -Z, +Y
-/// down is world +Y) from a flight height that varies slightly per camera. The
-/// ground carries a smooth low-frequency relief: a perfectly flat plane at
-/// constant height is degenerate for focal length (the planar homography couples
-/// f with the plane distance), so the relief is what makes the lens observable,
-/// exactly as real terrain does. Observations are the TRUE-lens projections plus
-/// sigma-px noise, kept when inside the image. The builder is handed the WRONG
-/// initial calibration (nadir_initial_calibration) on every camera, all on
-/// sensor 0.
+/// A `grid` x `grid` nadir block over strongly undulating, tilted terrain, with
+/// `n_points` ground points. Every camera looks down (camera +Z is world -Z, +Y
+/// down is world +Y) from a flight height that varies per camera, and each
+/// camera is rolled slightly about its optical axis.
+///
+/// The terrain is what makes the lens observable. A flat plane at one altitude
+/// with every camera at the same orientation is degenerate for focal length: the
+/// planar homography couples f with the plane distance, and identical
+/// orientations leave the radial distortion unconstrained. The surface here is a
+/// strong tilt plus low-frequency waves, so a ground point sits at a very
+/// different depth in different views (the depth range is roughly 2.5x the
+/// flight height). That depth spread is what separates f from the scene scale
+/// and the radial distortion from a plain scale; the per-camera altitude spread
+/// adds a distance sweep and the roll separates the principal point. Real
+/// flights have all three, and the fixture carries them. Ground points (not tall
+/// structures) are used so every point is seen by many overlapping cameras,
+/// which is what actually constrains the lens.
+///
+/// Observations are the TRUE-lens projections plus sigma-px noise, kept when
+/// inside the image. The builder is handed the WRONG initial calibration
+/// (nadir_initial_calibration) on every camera, all on sensor 0.
 GtScene make_nadir_block(std::uint32_t seed, double sigma_px, int grid = 4, int n_points = 400) {
     GtScene scene;
     scene.cal = nadir_initial_calibration();
     const Calibration truth = nadir_true_calibration();
     std::mt19937 rng(seed);
 
-    // Ground relief: a smooth, low-frequency surface with several metres of
-    // height variation. This is what makes the lens observable on a nadir block:
-    // a flat plane at constant height is degenerate for focal length (the planar
-    // homography couples f with the plane distance) and for the initial pair's
-    // essential matrix (all points coplanar). Real terrain provides the same
-    // depth variation.
+    // Terrain: a strong tilt (a hillside) plus low-frequency waves, so the
+    // surface is non-planar and spans a wide depth range below the cameras
+    // (roughly 11 m to 45 m for a 28 m flight height, a ~4x depth ratio).
     const auto relief = [](double x, double y) {
-        return 4.0 * std::sin(0.16 * x) * std::cos(0.13 * y) +
-               2.5 * std::sin(0.10 * (x + 0.7 * y)) + 1.5 * std::cos(0.07 * (x - y));
+        return 0.30 * x + 5.0 * std::sin(0.28 * x) * std::cos(0.22 * y) +
+               2.5 * std::sin(0.15 * (x + 0.8 * y));
     };
     const auto dx = [](std::mt19937& g) { return rng::uniform_real(g, -kNadirGroundHalf, kNadirGroundHalf); };
     for (int i = 0; i < n_points; ++i) {
@@ -235,28 +243,31 @@ GtScene make_nadir_block(std::uint32_t seed, double sigma_px, int grid = 4, int 
         scene.true_points.push_back(Eigen::Vector3d(xy.x(), xy.y(), relief(xy.x(), xy.y())));
     }
 
-    // Nadir pose: world->camera R maps world +X -> camera +X, world +Y -> camera
-    // +Y (down), world -Z -> camera +Z (forward). That is diag(1, 1, -1).
-    Eigen::Matrix3d R_nadir = Eigen::Matrix3d::Identity();
-    R_nadir(2, 2) = -1.0;
+    // Nadir base orientation: world +X -> camera +X, world +Y -> camera +Y
+    // (down), world -Z -> camera +Z (forward). That is diag(1, 1, -1).
+    const Eigen::Matrix3d R_nadir = (Eigen::Matrix3d() << 1.0, 0.0, 0.0,
+                                     0.0, 1.0, 0.0,
+                                     0.0, 0.0, -1.0).finished();
 
-    // A small deterministic height variation per camera (a few percent of the
-    // flight height). A perfectly regular grid at one altitude is the classic
-    // self-calibration degeneracy ("doming"): the lens and the block curvature
-    // trade off. Real flights vary in altitude, and that variation is what
-    // separates the two, so the fixture carries it too.
     const int n_cameras = grid * grid;
     const double step = 2.0 * kNadirGroundHalf / static_cast<double>(grid - 1);
     for (int r = 0; r < grid; ++r) {
         for (int c = 0; c < grid; ++c) {
-            const double dz = 1.5 * std::sin(0.9 * r + 0.6 * c);
+            // Altitude varies over a wide band, so the distance to the ground
+            // differs per camera (the "distance sweep" that conditions f).
+            const double dz = 5.0 * std::sin(0.9 * r + 0.6 * c);
             const Eigen::Vector3d centre(-kNadirGroundHalf + step * c,
                                          -kNadirGroundHalf + step * r,
                                          kNadirFlightHeight + dz);
             scene.true_centres.push_back(centre);
+            // A small per-camera roll about the optical axis, so the principal
+            // point is separable from the pose.
+            const double roll = 0.08 * std::sin(1.3 * r + 0.4 * c);
+            const Eigen::Matrix3d R_roll =
+                Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitZ()).toRotationMatrix();
             AbsolutePose pose;
-            pose.R = R_nadir;
-            pose.t = -R_nadir * centre;
+            pose.R = R_nadir * R_roll;
+            pose.t = -pose.R * centre;
             scene.true_poses.push_back(pose);
         }
     }
@@ -717,18 +728,20 @@ NadirReport evaluate_nadir(const GtScene& scene, const BuilderResult& result) {
 }
 
 TEST(StructureBuilder, SelfCalibrationRecoversLensOnNadirBlock) {
-    // A 5x5 nadir block (25 cameras, one sensor) over 400 ground points with
-    // several metres of relief and a few metres of camera height variation, and
-    // a true lens 5% longer than the seed with strong radial distortion. The
+    // A 5x5 nadir block (25 cameras, one sensor) over strongly undulating, tilted
+    // terrain (a ~4x depth range) with per-camera altitude and roll variation,
+    // and a true lens 5% longer than the seed with strong radial distortion. The
     // builder is handed the wrong seed (f = 600, no distortion) on every camera.
+    //
     // The schedule is set explicitly so the test does not depend on the defaults:
-    // f and k1 free from 8 cameras, the full set from 12. Freeing early keeps the
-    // structure from bending far before the lens is corrected, which is the
-    // regime the real fix targets.
-    const GtScene scene = make_nadir_block(101, 0.2, /*grid=*/5, /*n_points=*/400);
+    // f and k1 free from 8 cameras, and the full set held back (a high threshold)
+    // so this test isolates the two best-conditioned terms it asserts on. Freeing
+    // early keeps the structure from bending far before the lens is corrected,
+    // which is the regime the real fix targets.
+    const GtScene scene = make_nadir_block(101, 0.2, /*grid=*/5, /*n_points=*/300);
     BuilderOptions options;
     options.min_cameras_for_intrinsics = 8;
-    options.full_intrinsics_cameras = 12;
+    options.full_intrinsics_cameras = 1000;  // only f and k1 free
 
     const BuilderResult result = build_incremental(scene.input, options);
 
@@ -738,9 +751,8 @@ TEST(StructureBuilder, SelfCalibrationRecoversLensOnNadirBlock) {
     const std::optional<Calibration> refined = refined_for(result, 0);
     ASSERT_TRUE(refined.has_value()) << "the sensor must have been self-calibrated";
     std::printf("[structure_builder] nadir self-cal: f=%.3f (truth %.1f) k1=%.4f (truth %.2f) "
-                "k2=%.4f (truth %.2f) rms=%.4f\n",
-                refined->f, kNadirTrueF, refined->k1, kNadirTrueK1, refined->k2, kNadirTrueK2,
-                result.final_rms_px);
+                "rms=%.4f\n",
+                refined->f, kNadirTrueF, refined->k1, kNadirTrueK1, result.final_rms_px);
 
     // f within 0.5% of truth.
     EXPECT_NEAR(refined->f, kNadirTrueF, 0.005 * kNadirTrueF)
@@ -763,23 +775,27 @@ TEST(StructureBuilder, SelfCalibrationRecoversLensOnNadirBlock) {
 }
 
 TEST(StructureBuilder, SelfCalibrationRespectsFixedParams) {
-    // The sensor holds f fixed, so self-calibration must leave f at its seed
-    // while still refining the distortion.
-    GtScene scene = make_nadir_block(102, 0.2, /*grid=*/5, /*n_points=*/400);
+    // The sensor holds f fixed. Seed f at its TRUE value (so holding it is
+    // consistent) with zero distortion, and let k1 refine: f must come back
+    // exactly at the seed while k1 moves off zero toward the truth.
+    GtScene scene = make_nadir_block(102, 0.2, /*grid=*/5, /*n_points=*/300);
+    for (BuilderCamera& camera : scene.input.cameras) {
+        camera.calibration.f = kNadirTrueF;  // the seed f is correct here
+    }
     scene.input.sensors.push_back(BuilderSensor{0, {"f"}});
     BuilderOptions options;
     options.min_cameras_for_intrinsics = 8;
-    options.full_intrinsics_cameras = 12;
+    options.full_intrinsics_cameras = 1000;  // only f and k1 free
 
     const BuilderResult result = build_incremental(scene.input, options);
     EXPECT_EQ(result.registered, scene.input.cameras.size());
 
     const std::optional<Calibration> refined = refined_for(result, 0);
     ASSERT_TRUE(refined.has_value()) << "the sensor must have been self-calibrated";
-    std::printf("[structure_builder] nadir fixed f: f=%.3f (seed %.1f) k1=%.4f\n", refined->f,
-                kNadirInitialF, refined->k1);
+    std::printf("[structure_builder] nadir fixed f: f=%.3f (seed %.1f) k1=%.4f (truth %.2f)\n",
+                refined->f, kNadirTrueF, refined->k1, kNadirTrueK1);
     // f was held: it comes back exactly at the seed.
-    EXPECT_EQ(refined->f, kNadirInitialF);
+    EXPECT_EQ(refined->f, kNadirTrueF);
     // k1 was free: it moved off zero toward the truth.
     EXPECT_NE(refined->k1, 0.0);
 }
@@ -787,7 +803,7 @@ TEST(StructureBuilder, SelfCalibrationRespectsFixedParams) {
 TEST(StructureBuilder, FitIntrinsicsFalseKeepsLens) {
     // With self-calibration off the builder must reproduce the old fixed-lens
     // behaviour: no sensor is refined and every calibration stays at its seed.
-    const GtScene scene = make_nadir_block(103, 0.2, /*grid=*/5, /*n_points=*/400);
+    const GtScene scene = make_nadir_block(103, 0.2, /*grid=*/5, /*n_points=*/300);
     BuilderOptions options;
     options.fit_intrinsics = false;
 

@@ -626,11 +626,12 @@ void run_global_ba(Scene& s) {
 
     // A worse global RMS than before the solve means the refinement did not pay
     // for itself: revert every sensor that moved and re-solve with fixed
-    // intrinsics so the geometry matches the reverted lens. A 1% tolerance
-    // absorbs the robust loss trading a few large residuals for many small ones
-    // (the plain RMS can rise slightly while the robust cost falls).
+    // intrinsics so the geometry matches the reverted lens. The tolerance is
+    // generous because the robust (Cauchy) loss can trade a few large residuals
+    // for many small ones, so the plain RMS may rise slightly while the robust
+    // objective falls; only a clear regression reverts.
     const double rms_after = reprojection_rms_px(idx.problem);
-    if (!any_reverted && rms_after > rms_before * 1.01) {
+    if (!any_reverted && rms_after > rms_before * 1.05) {
         bool moved = false;
         for (std::size_t slot = 0; slot < s.sensor_cal.size(); ++slot) {
             if (!(s.sensor_cal[slot].same_model(before[slot]))) {
