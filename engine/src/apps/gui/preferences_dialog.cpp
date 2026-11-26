@@ -6,12 +6,20 @@
 #include <QFormLayout>
 #include <QLabel>
 #include <QPushButton>
+#include <QSettings>
 #include <QVBoxLayout>
 
 namespace alphashape::gui {
 
-PreferencesDialog::PreferencesDialog(UpdateChecker& checker, QWidget* parent)
-    : QDialog(parent), checker_(checker) {
+namespace {
+/// QSettings key for the Add Photos "load XMP lens calibration" option. The
+/// same key is read by MainWindow and WorkflowController when they build the
+/// AddPhotos parameters.
+constexpr const char* kLoadXmpCalibrationKey = "photos/load_xmp_calibration";
+}  // namespace
+
+PreferencesDialog::PreferencesDialog(UpdateChecker& checker, QSettings& settings, QWidget* parent)
+    : QDialog(parent), checker_(checker), settings_(settings) {
     setObjectName(QStringLiteral("preferencesDialog"));
     setWindowTitle(tr("Preferences"));
 
@@ -49,6 +57,21 @@ PreferencesDialog::PreferencesDialog(UpdateChecker& checker, QWidget* parent)
     check_now_->setObjectName(QStringLiteral("preferences.check_now"));
     layout->addWidget(check_now_);
 
+    auto* photos_heading = new QLabel(tr("Photos"), this);
+    photos_heading->setObjectName(QStringLiteral("preferences.photos_heading"));
+    layout->addWidget(photos_heading);
+
+    load_xmp_calibration_ =
+        new QCheckBox(tr("Load the DJI XMP lens calibration when adding photos"), this);
+    load_xmp_calibration_->setObjectName(QStringLiteral("preferences.load_xmp_calibration"));
+    load_xmp_calibration_->setToolTip(
+        tr("Seed each sensor's initial calibration from the DJI factory lens calibration "
+           "(DewarpData) in the photo's XMP. Off by default; the EXIF focal length is used "
+           "instead."));
+    load_xmp_calibration_->setChecked(
+        settings_.value(QString::fromLatin1(kLoadXmpCalibrationKey), false).toBool());
+    layout->addWidget(load_xmp_calibration_);
+
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, this);
     buttons->setObjectName(QStringLiteral("preferences.buttons"));
     layout->addWidget(buttons);
@@ -59,6 +82,9 @@ PreferencesDialog::PreferencesDialog(UpdateChecker& checker, QWidget* parent)
     connect(channel_, &QComboBox::currentIndexChanged, this, [this](int index) {
         const auto channel = static_cast<update::Channel>(channel_->itemData(index).toInt());
         checker_.set_channel(channel);
+    });
+    connect(load_xmp_calibration_, &QCheckBox::toggled, this, [this](bool checked) {
+        settings_.setValue(QString::fromLatin1(kLoadXmpCalibrationKey), checked);
     });
     connect(check_now_, &QPushButton::clicked, this, &PreferencesDialog::check_requested);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::accept);

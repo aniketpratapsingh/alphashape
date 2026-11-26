@@ -76,6 +76,58 @@ std::optional<int> parse_int(std::string_view text) {
     return static_cast<int>(*value);
 }
 
+/// Parse a DJI `DewarpData` value: `<date>;fx,fy,cx,cy,k1,k2,p1,p2,k3`.
+///
+/// The date part is optional (some firmware omits it), so the coefficient list
+/// is whatever follows the last ';' — or the whole string when there is none.
+/// The list must hold at least nine comma-separated numbers; a shorter list, a
+/// non-numeric token or a non-finite value makes the whole field unusable
+/// (nullopt) rather than a partial calibration. Extra trailing numbers are
+/// ignored. The leading space real firmware writes is trimmed by the caller.
+std::optional<XmpDewarpCalibration> parse_dewarp_data(std::string_view text) {
+    const std::string_view trimmed = trim(text);
+    if (trimmed.empty()) {
+        return std::nullopt;
+    }
+    const std::size_t semicolon = trimmed.rfind(';');
+    const std::string_view list =
+        semicolon == std::string_view::npos ? trimmed : trimmed.substr(semicolon + 1);
+
+    std::array<double, 9> values{};
+    std::size_t count = 0;
+    std::size_t pos = 0;
+    while (pos <= list.size()) {
+        const std::size_t comma = list.find(',', pos);
+        const std::size_t end = comma == std::string_view::npos ? list.size() : comma;
+        const std::optional<double> value = parse_double(list.substr(pos, end - pos));
+        if (!value.has_value()) {
+            return std::nullopt;
+        }
+        if (count < values.size()) {
+            values[count] = *value;
+        }
+        ++count;
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+    if (count < values.size()) {
+        return std::nullopt;
+    }
+    XmpDewarpCalibration calibration;
+    calibration.fx = values[0];
+    calibration.fy = values[1];
+    calibration.cx = values[2];
+    calibration.cy = values[3];
+    calibration.k1 = values[4];
+    calibration.k2 = values[5];
+    calibration.p1 = values[6];
+    calibration.p2 = values[7];
+    calibration.k3 = values[8];
+    return calibration;
+}
+
 /// Collect every `xmlns:prefix="uri"` declaration before interpreting fields,
 /// so an attribute may appear before the declaration in the same start tag.
 std::map<std::string, std::string> collect_namespaces(std::string_view packet) {
@@ -194,7 +246,16 @@ void store_field(std::string_view name, std::string_view raw, ScanState& state) 
         const std::string_view value = trim(raw);
         if (!value.empty()) {
             out.dewarp_data = std::string(value);
+            out.dewarp = parse_dewarp_data(value);
         }
+    } else if (name == "CalibratedFocalLength") {
+        out.calibrated_focal_length = parse_double(raw);
+    } else if (name == "CalibratedOpticalCenterX") {
+        out.calibrated_optical_center_x = parse_double(raw);
+    } else if (name == "CalibratedOpticalCenterY") {
+        out.calibrated_optical_center_y = parse_double(raw);
+    } else if (name == "DewarpFlag") {
+        out.dewarp_flag = parse_int(raw);
     } else if (name == "GpsLatitudeRef" || name == "GPSLatitudeRef") {
         if (!raw.empty()) {
             state.lat_ref = raw[0];

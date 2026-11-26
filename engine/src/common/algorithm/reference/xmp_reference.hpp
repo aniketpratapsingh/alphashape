@@ -83,6 +83,29 @@ struct XmpOrientation {
     double roll_deg = 0.0;
 };
 
+/// The lens calibration a DJI `DewarpData` string carries, in the OpenCV
+/// pinhole + Brown-Conrady convention (all lengths in pixels):
+///
+///     x_d = x (1 + k1 r^2 + k2 r^4 + k3 r^6) + 2 p1 x y + p2 (r^2 + 2 x^2)
+///     y_d = y (1 + k1 r^2 + k2 r^4 + k3 r^6) + p1 (r^2 + 2 y^2) + 2 p2 x y
+///     u   = W/2 + cx + x_d fx,   v = H/2 + cy + y_d fy
+///
+/// `cx`/`cy` are OFFSETS of the principal point from the image centre, exactly
+/// as the engine's `Calibration::cx`/`cy` are. The engine's own distortion
+/// polynomial uses the opposite tangential naming (its `p1` is OpenCV's `p2`),
+/// so a consumer must swap the two; see `add_photos_task.cpp`.
+struct XmpDewarpCalibration {
+    double fx = 0.0;
+    double fy = 0.0;
+    double cx = 0.0;
+    double cy = 0.0;
+    double k1 = 0.0;
+    double k2 = 0.0;
+    double p1 = 0.0;  ///< OpenCV p1 (the y-heavy term)
+    double p2 = 0.0;  ///< OpenCV p2 (the x-heavy term)
+    double k3 = 0.0;
+};
+
 /// The reference fields read from an XMP packet. Every field is nullopt when
 /// absent or unparsable.
 struct XmpReference {
@@ -100,9 +123,22 @@ struct XmpReference {
     std::optional<double> rtk_std_lon_m;
     std::optional<double> rtk_std_lat_m;
     std::optional<double> rtk_std_hgt_m;
-    /// `drone-dji:DewarpData` verbatim. The AddPhotos task records but does not
-    /// yet apply it; see the task documentation.
+    /// `drone-dji:DewarpData` verbatim (trimmed). Kept for diagnostics; the
+    /// typed `dewarp` below is what a consumer applies.
     std::optional<std::string> dewarp_data;
+    /// The parsed `DewarpData` coefficient list, or nullopt when the field is
+    /// absent or malformed (fewer than nine numbers, a non-finite value, ...).
+    std::optional<XmpDewarpCalibration> dewarp;
+    /// `drone-dji:CalibratedFocalLength`, in pixels.
+    std::optional<double> calibrated_focal_length;
+    /// `drone-dji:CalibratedOpticalCenterX/Y`, in pixels (absolute image
+    /// coordinates, not offsets from the centre).
+    std::optional<double> calibrated_optical_center_x;
+    std::optional<double> calibrated_optical_center_y;
+    /// `drone-dji:DewarpFlag`. 1 means the camera already undistorted the JPEG,
+    /// so the distortion coefficients must NOT be applied (the focal length and
+    /// principal point still describe the image).
+    std::optional<int> dewarp_flag;
 
     /// True when both horizontal components are present.
     bool has_location() const {
