@@ -243,12 +243,6 @@ GtScene make_nadir_block(std::uint32_t seed, double sigma_px, int grid = 4, int 
         scene.true_points.push_back(Eigen::Vector3d(xy.x(), xy.y(), relief(xy.x(), xy.y())));
     }
 
-    // Nadir base orientation: world +X -> camera +X, world +Y -> camera +Y
-    // (down), world -Z -> camera +Z (forward). That is diag(1, 1, -1).
-    const Eigen::Matrix3d R_nadir = (Eigen::Matrix3d() << 1.0, 0.0, 0.0,
-                                     0.0, 1.0, 0.0,
-                                     0.0, 0.0, -1.0).finished();
-
     const int n_cameras = grid * grid;
     const double step = 2.0 * kNadirGroundHalf / static_cast<double>(grid - 1);
     for (int r = 0; r < grid; ++r) {
@@ -260,13 +254,29 @@ GtScene make_nadir_block(std::uint32_t seed, double sigma_px, int grid = 4, int 
                                          -kNadirGroundHalf + step * r,
                                          kNadirFlightHeight + dz);
             scene.true_centres.push_back(centre);
-            // A small per-camera roll about the optical axis, so the principal
-            // point is separable from the pose.
+            // A slight per-camera tilt (a few degrees) about a point near the
+            // camera's own footprint, varying per camera, plus a small roll. A
+            // pure nadir block (every camera at the same orientation) leaves the
+            // radial distortion degenerate with the focal length; the tilt
+            // variation breaks that, exactly as a real gimbal's small attitude
+            // spread does, while the block stays essentially nadir. The frame
+            // convention matches make_arc_scene: camera +Z forward, +Y down,
+            // built from world_up = +Y.
+            const Eigen::Vector3d target(centre.x() + 4.0 * std::sin(0.8 * r + 0.3 * c),
+                                         centre.y() + 4.0 * std::cos(0.5 * r + 0.9 * c), 0.0);
+            const Eigen::Vector3d forward = (target - centre).normalized();
+            const Eigen::Vector3d right =
+                forward.cross(Eigen::Vector3d::UnitY()).normalized();
+            const Eigen::Vector3d up = right.cross(forward);
+            Eigen::Matrix3d R_wc;  // columns: right, down, forward
+            R_wc.col(0) = right;
+            R_wc.col(1) = -up;
+            R_wc.col(2) = forward;
             const double roll = 0.08 * std::sin(1.3 * r + 0.4 * c);
             const Eigen::Matrix3d R_roll =
                 Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitZ()).toRotationMatrix();
             AbsolutePose pose;
-            pose.R = R_nadir * R_roll;
+            pose.R = R_roll * R_wc.transpose();
             pose.t = -pose.R * centre;
             scene.true_poses.push_back(pose);
         }
