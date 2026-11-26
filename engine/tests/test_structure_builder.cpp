@@ -739,19 +739,20 @@ NadirReport evaluate_nadir(const GtScene& scene, const BuilderResult& result) {
 
 TEST(StructureBuilder, SelfCalibrationRecoversLensOnNadirBlock) {
     // A 5x5 nadir block (25 cameras, one sensor) over strongly undulating, tilted
-    // terrain (a ~4x depth range) with per-camera altitude and roll variation,
-    // and a true lens 5% longer than the seed with strong radial distortion. The
-    // builder is handed the wrong seed (f = 600, no distortion) on every camera.
+    // terrain (a ~4x depth range) with per-camera altitude, tilt and roll
+    // variation, and a true lens 5% longer than the seed with strong radial
+    // distortion (k1 = -0.2, k2 = 0.05). The builder is handed the wrong seed
+    // (f = 600, no distortion) on every camera.
     //
     // The schedule is set explicitly so the test does not depend on the defaults:
-    // f and k1 free from 8 cameras, and the full set held back (a high threshold)
-    // so this test isolates the two best-conditioned terms it asserts on. Freeing
-    // early keeps the structure from bending far before the lens is corrected,
-    // which is the regime the real fix targets.
+    // f and k1 free from 8 cameras, the full set from 10. The full set is needed
+    // here because the true lens carries k2, and freeing only k1 would make it
+    // absorb the unmodelled k2. Freeing early keeps the structure from bending
+    // far before the lens is corrected, which is the regime the real fix targets.
     const GtScene scene = make_nadir_block(101, 0.2, /*grid=*/5, /*n_points=*/300);
     BuilderOptions options;
     options.min_cameras_for_intrinsics = 8;
-    options.full_intrinsics_cameras = 1000;  // only f and k1 free
+    options.full_intrinsics_cameras = 10;
 
     const BuilderResult result = build_incremental(scene.input, options);
 
