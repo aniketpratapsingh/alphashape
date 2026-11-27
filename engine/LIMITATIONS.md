@@ -1111,11 +1111,14 @@ toolchain versions and commands are in `docs/plan/WINDOWS_TOOLCHAIN.md`.
 
 M11 is complete and green; the following are the knowingly partial parts.
 
-- **The project archive is in memory and has no Zip64.** `ZipArchive` keeps the
-  whole archive and its inflated entries in RAM, and the writer refuses a file
-  above 4 GiB or more than 65 535 entries with "Zip64 not supported yet". A
-  project beyond that size cannot be saved, and opening one costs the archive
-  plus the decoded document in memory.
+- **The project archive is held in memory.** `ZipArchive` keeps the whole
+  archive and its inflated entries in RAM, so opening a project costs the
+  archive plus the decoded document in memory. The container itself is no longer
+  size-limited: the writer emits Zip64 (PKWARE APPNOTE 4.5.3) when an entry, the
+  central directory or the entry count overflows the classic 32/16-bit fields,
+  and the reader accepts both layouts, so a project with depth maps past 4 GiB
+  saves and loads. The zlib calls are chunked, so a single entry larger than
+  4 GiB compresses and decompresses correctly.
 - **Shapes are stored in our own container, not a GIS file.** Features, layers
   and groups live in the chunk sidecar with the other containers; there is no
   GeoPackage export yet, so vector data cannot be handed to GIS tools without

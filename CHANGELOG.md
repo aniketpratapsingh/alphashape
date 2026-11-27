@@ -890,6 +890,18 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Fixed
 
+- **A project with large depth maps could not be saved.** The project container
+  is a zip, and the writer refused any entry, offset or entry count that did not
+  fit the classic 32/16-bit zip fields, so a project whose depth maps pushed an
+  entry or the archive past 4 GiB failed to save with "entry exceeds 4 GiB
+  (Zip64 not supported yet)" — losing the depth maps and everything built after
+  them. The project file now uses Zip64 (PKWARE APPNOTE 4.5.3) when a size,
+  offset or entry count overflows: the overflowing field holds the sentinel and
+  the real value moves into a Zip64 extra field or the Zip64 end-of-central-
+  directory records. An archive that fits the classic fields is written exactly
+  as before, byte for byte, and the reader accepts both. The zlib calls are also
+  chunked, so a single entry larger than 4 GiB compresses and decompresses
+  correctly (zlib's `uInt` is 32-bit, and `uLong` is 32-bit on Windows).
 - **Align Photos could not estimate the lens, so a distorted block bent.** The
   incremental alignment always held every camera intrinsic at its input value,
   so a block shot through a strong-distortion lens and seeded from EXIF (focal

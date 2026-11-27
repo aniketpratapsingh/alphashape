@@ -11,6 +11,7 @@ add_executable(alphashape_tests
     test_update.cpp
     test_project_v2.cpp
     test_project_layout.cpp
+    test_zip.cpp
     test_job_db.cpp
     test_run_script.cpp
     test_detector.cpp
