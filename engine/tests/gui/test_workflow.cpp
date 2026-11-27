@@ -432,9 +432,9 @@ TEST_F(WorkflowTest, AddPhotosUsesTheFilePickerAndSubmitsTheFileList) {
     EXPECT_EQ(submitted_[0].params.get_string_list("filenames"),
               (std::vector<std::string>{"/data/a.jpg", "/data/b.jpg"}));
     EXPECT_TRUE(submitted_[0].params.get_bool("load_reference"));
-    // The XMP lens calibration option follows the Preferences setting, off by
+    // The XMP lens calibration option follows the Preferences setting, on by
     // default.
-    EXPECT_FALSE(submitted_[0].params.get_bool("load_xmp_calibration"));
+    EXPECT_TRUE(submitted_[0].params.get_bool("load_xmp_calibration"));
 
     // Cancelling the picker submits nothing.
     workflow().set_photos_handler([]() { return QStringList(); });
@@ -445,12 +445,13 @@ TEST_F(WorkflowTest, AddPhotosUsesTheFilePickerAndSubmitsTheFileList) {
 
 TEST_F(WorkflowTest, AddPhotosHonoursThePreferencesXmpCalibrationOption) {
     // The Preferences checkbox stores "photos/load_xmp_calibration"; the
-    // Workflow Add Photos path must read it into the task parameters.
-    app().settings().setValue(QStringLiteral("photos/load_xmp_calibration"), true);
+    // Workflow Add Photos path must read it into the task parameters, so a
+    // user who turned it off gets the EXIF-seeded calibration.
+    app().settings().setValue(QStringLiteral("photos/load_xmp_calibration"), false);
     workflow().set_photos_handler([]() { return QStringList{"/data/a.jpg"}; });
     ASSERT_TRUE(trigger("action.workflow.add_photos"));
     ASSERT_EQ(submitted_.size(), 1U);
-    EXPECT_TRUE(submitted_[0].params.get_bool("load_xmp_calibration"));
+    EXPECT_FALSE(submitted_[0].params.get_bool("load_xmp_calibration"));
 }
 
 TEST_F(WorkflowTest, ASubmitFailureIsReportedNotThrown) {

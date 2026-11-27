@@ -1259,10 +1259,10 @@ bool MainWindow::add_photos_to_active_chunk(const QStringList& files) {
         }
         values.set("filenames", ParamValue(std::move(names)));
         // The Add Photos import options live in Preferences; the schema default
-        // (off) applies when the user has never set them.
+        // (on) applies when the user has never set them.
         values.set("load_xmp_calibration",
                    ParamValue{app_.settings()
-                                  .value(QStringLiteral("photos/load_xmp_calibration"), false)
+                                  .value(QStringLiteral("photos/load_xmp_calibration"), true)
                                   .toBool()});
         app_.jobs().submit("AddPhotos", std::move(values), chunk_id);
     } catch (const std::exception& error) {

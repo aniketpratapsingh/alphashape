@@ -954,6 +954,25 @@ TEST(Xmp, AddPhotosAppliesDewarpCalibrationWhenEnabled) {
     remove_file(path);
 }
 
+TEST(Xmp, AddPhotosAppliesDewarpCalibrationByDefault) {
+    // The option is on by default: a plain AddPhotos (no option set) seeds the
+    // sensor from the DJI factory calibration, not from the EXIF focal length.
+    const std::string packet = attribute_packet(
+        std::string("drone-dji:DewarpData=\"") + kDewarpData + "\"");
+    const std::string path = temp_path(".jpg");
+    write_bytes(path, jpeg_with_packet(read_bytes(fixture("cam_b1.jpg")), packet));
+
+    Document document = document_with_chunk();
+    Params params = make_params(builtin_registry().require("AddPhotos"));
+    EXPECT_TRUE(params.get_bool("load_xmp_calibration"));
+    params.set("filenames", ParamValue{std::vector<std::string>{path}});
+    run_task(builtin_registry(), document, "AddPhotos", params);
+    const Calibration& c = document.active_chunk()->sensors().front().calibration;
+    EXPECT_DOUBLE_EQ(c.f, 3664.66);
+    EXPECT_DOUBLE_EQ(c.k1, -0.268152);
+    remove_file(path);
+}
+
 TEST(Xmp, AddPhotosKeepsExifCalibrationWhenDisabled) {
     const std::string packet = attribute_packet(
         std::string("drone-dji:DewarpData=\"") + kDewarpData + "\"");

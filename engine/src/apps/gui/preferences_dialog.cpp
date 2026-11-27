@@ -66,10 +66,10 @@ PreferencesDialog::PreferencesDialog(UpdateChecker& checker, QSettings& settings
     load_xmp_calibration_->setObjectName(QStringLiteral("preferences.load_xmp_calibration"));
     load_xmp_calibration_->setToolTip(
         tr("Seed each sensor's initial calibration from the DJI factory lens calibration "
-           "(DewarpData) in the photo's XMP. Off by default; the EXIF focal length is used "
-           "instead."));
+           "(DewarpData) in the photo's XMP. On by default; when it is off, or a photo "
+           "carries no such calibration, the EXIF focal length is used instead."));
     load_xmp_calibration_->setChecked(
-        settings_.value(QString::fromLatin1(kLoadXmpCalibrationKey), false).toBool());
+        settings_.value(QString::fromLatin1(kLoadXmpCalibrationKey), true).toBool());
     layout->addWidget(load_xmp_calibration_);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, this);
