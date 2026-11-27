@@ -69,6 +69,12 @@ sfm::AbsolutePose transform_to_pose(const Transform& transform) {
 void AlignCamerasTask::declare_params(Params& params) const {
     params.declare({"reset_alignment", ParamType::Bool, false,
                     "Discard the existing alignment and realign every camera from scratch."});
+    params.declare({"fit_intrinsics", ParamType::Bool, false,
+                    "Refine each sensor's focal length, principal point and lens distortion "
+                    "during alignment (self-calibration). Use it when the input calibration "
+                    "is known to be wrong, e.g. a strong-distortion lens seeded from EXIF "
+                    "with zero distortion; otherwise keep it off and refine with Optimize "
+                    "Cameras after alignment."});
 }
 
 std::vector<Stage> AlignCamerasTask::stages() const {
@@ -77,6 +83,7 @@ std::vector<Stage> AlignCamerasTask::stages() const {
 
 void AlignCamerasTask::apply(Document& document, Params& params, const Progress& progress) {
     const bool reset_alignment = params.get_bool("reset_alignment");
+    const bool fit_intrinsics = params.get_bool("fit_intrinsics");
 
     // -- validate everything before touching the chunk -----------------------
     progress.update("prepare", 0.0);
@@ -88,6 +95,9 @@ void AlignCamerasTask::apply(Document& document, Params& params, const Progress&
     if (tie_points.matches.empty() || tie_points.tracks.empty()) {
         throw ValueError("AlignCameras: no tie points \u2014 run MatchPhotos first");
     }
+    // A slave sensor shares its master's calibration; an invalid link is a hard
+    // error before any work is done (the same check OptimizeCameras makes).
+    validate_sensor_masters(chunk->sensors());
 
     std::unordered_map<std::int32_t, const Camera*> camera_by_id;
     for (const Camera& camera : chunk->cameras()) {
@@ -136,15 +146,23 @@ void AlignCamerasTask::apply(Document& document, Params& params, const Progress&
 
     sfm::BuilderInput input;
     input.cameras.reserve(input_ids.size());
+    // One BuilderSensor per effective sensor, so the builder can honour each
+    // sensor's held coefficients and group its cameras into one calibration.
+    // `used_sensors` keeps every raw sensor id a camera names, so a slave can
+    // receive its master's refined calibration on commit.
+    std::vector<std::int32_t> sensor_ids;
+    std::vector<std::int32_t> used_sensors;
     for (const std::int32_t id : input_ids) {
         const Camera& camera = *camera_by_id.at(id);
         const KeypointSet& set = *set_by_id.at(id);
         require_ready(id);  // a camera with keypoints but no sensor cannot be aligned
 
+        const std::int32_t effective = effective_sensor_id(chunk->sensors(), camera.sensor_id);
         sfm::BuilderCamera builder_camera;
         builder_camera.id = id;
+        builder_camera.sensor_id = effective;
         builder_camera.calibration =
-            sensor_pipeline_calibration(effective_sensor(*chunk, camera));
+            sensor_pipeline_calibration(chunk->sensors()[static_cast<std::size_t>(effective)]);
         builder_camera.pixels.reserve(set.keypoints.size());
         for (const Keypoint& keypoint : set.keypoints) {
             builder_camera.pixels.push_back(keypoint_to_pixel(keypoint));
@@ -154,6 +172,20 @@ void AlignCamerasTask::apply(Document& document, Params& params, const Progress&
             builder_camera.initial_pose = transform_to_pose(camera.pose);
         }
         input.cameras.push_back(std::move(builder_camera));
+        if (std::find(sensor_ids.begin(), sensor_ids.end(), effective) == sensor_ids.end()) {
+            sensor_ids.push_back(effective);
+        }
+        if (std::find(used_sensors.begin(), used_sensors.end(), camera.sensor_id) ==
+            used_sensors.end()) {
+            used_sensors.push_back(camera.sensor_id);
+        }
+    }
+    for (const std::int32_t effective : sensor_ids) {
+        sfm::BuilderSensor sensor;
+        sensor.id = effective;
+        sensor.fixed_params =
+            chunk->sensors()[static_cast<std::size_t>(effective)].fixed_params;
+        input.sensors.push_back(std::move(sensor));
     }
     input.matches = tie_points.matches;
     input.tracks = tie_points.tracks;
@@ -168,8 +200,10 @@ void AlignCamerasTask::apply(Document& document, Params& params, const Progress&
     // The cancelled callback is polled between registrations, outside any
     // OpenMP region, so it may safely call back into the host.
     progress.update("align", 0.0);
+    sfm::BuilderOptions builder_options;
+    builder_options.fit_intrinsics = fit_intrinsics;
     const sfm::BuilderResult result =
-        sfm::build_incremental(input, sfm::BuilderOptions{},
+        sfm::build_incremental(input, builder_options,
                                [&progress]() { return progress.is_cancelled(); });
     progress.update("align", 1.0);
 
@@ -223,6 +257,26 @@ void AlignCamerasTask::apply(Document& document, Params& params, const Progress&
     staged.cameras() = std::move(new_cameras);
     staged.tie_points().tracks = std::move(new_tracks);
     staged.region() = new_region;
+    // Write each self-calibrated sensor's refined lens back to its ADJUSTED
+    // calibration (the field OptimizeCameras writes). A sensor the builder did
+    // not refine keeps its input calibration untouched.
+    for (const auto& [sensor_id, calibration] : result.refined_calibrations) {
+        if (sensor_id < 0 ||
+            sensor_id >= static_cast<std::int32_t>(staged.sensors().size())) {
+            continue;
+        }
+        staged.sensors()[static_cast<std::size_t>(sensor_id)].calibration = calibration;
+    }
+    // A slave sensor shares its master's calibration, so it receives the same
+    // refined value (the builder refines the effective/master sensor).
+    for (const std::int32_t sensor_id : used_sensors) {
+        const std::int32_t master =
+            staged.sensors()[static_cast<std::size_t>(sensor_id)].master_sensor_id;
+        if (master >= 0) {
+            staged.sensors()[static_cast<std::size_t>(sensor_id)].calibration =
+                staged.sensors()[static_cast<std::size_t>(master)].calibration;
+        }
+    }
     // Place the reconstruction into a metric ENU frame when the cameras carry
     // GNSS references; otherwise it stays in the builder's arbitrary frame.
     const sfm::GeoreferenceReport geo_report = sfm::georeference_chunk(staged);

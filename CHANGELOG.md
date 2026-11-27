@@ -890,6 +890,21 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Fixed
 
+- **Align Photos could not estimate the lens, so a distorted block bent.** The
+  incremental alignment always held every camera intrinsic at its input value,
+  so a block shot through a strong-distortion lens and seeded from EXIF (focal
+  length, zero distortion) was reconstructed with the wrong camera model. On a
+  214-photo drone block the block bent by tens of metres: camera heights ranged
+  over -14 to 142 m for a flight at 84-96 m, and georeferencing to the GPS
+  positions gave a 36.6 m RMS error, against 1.55 m with the correct lens.
+  AlignCameras has a new `fit_intrinsics` option that refines each sensor's
+  focal length, principal point and low-order radial/tangential distortion
+  during its global bundle adjustments, once enough of that sensor's cameras
+  are registered, with guards that revert a diverging lens. It is off by
+  default: on the quality benches, refining during alignment made the dense
+  cloud and DEM of already well-calibrated blocks worse. For a DJI drone,
+  loading the calibration recorded in the photos (Preferences) is the better
+  fix; use `fit_intrinsics` when no good calibration is available.
 - **Add Photos' "load XMP calibration" option did nothing.** The option was
   accepted but never applied, so a DJI Phantom 4 RTK block was seeded from the
   EXIF 35 mm-equivalent focal length with zero lens distortion. Because the

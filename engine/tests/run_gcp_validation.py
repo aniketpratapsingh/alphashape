@@ -946,7 +946,13 @@ def run_synthetic(args, projection_noise_px, reference_noise_m, camera_gnss):
     # references above. With the exact references this is the fixture's truth
     # GPS, which is the zero-noise pipeline-exactness ablation.
     doc.run_task("MatchPhotos", keypoint_limit_per_mpx=10000)
-    doc.run_task("AlignCameras")
+    # The aerial fixture is a distortion-free pinhole render, and this validation
+    # measures the GCP pipeline, not self-calibration. Letting AlignCameras
+    # self-calibrate distortion on this near-planar scene would fit noise into a
+    # radial term (a depth/distortion degeneracy) and bow the model, so the
+    # alignment holds every intrinsic fixed here (the same reason the
+    # OptimizeCameras call below holds them).
+    doc.run_task("AlignCameras", fit_intrinsics=False)
     # The survey references carry the configured per-axis noise; say so, so the
     # control points are not treated as exact. Zero is not a valid accuracy
     # (the setter refuses it): the exact-reference scenarios keep the default,

@@ -41,17 +41,20 @@
 #include "common/algorithm/sfm/structure_builder.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include <Eigen/Core>
 
 #include "base/utils/error.hpp"
+#include "base/utils/log.hpp"
 #include "common/algorithm/sfm/bundle_adjustment.hpp"
 #include "common/algorithm/sfm/essential.hpp"
 #include "common/algorithm/sfm/triangulation.hpp"
@@ -62,6 +65,10 @@ namespace {
 constexpr std::size_t kNoIndex = static_cast<std::size_t>(-1);
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kBehindCameraErrorPx = 1.0e9;
+/// Ours: a sensor needs at least this many triangulated observations over its
+/// registered cameras before any intrinsic is freed, so a thin network cannot
+/// trade structure against a lens it cannot observe.
+constexpr std::size_t kMinIntrinsicObservations = 100;
 
 double deg2rad(double d) { return d * kPi / 180.0; }
 
@@ -79,6 +86,14 @@ struct Scene {
     std::vector<std::vector<std::size_t>> cam_tracks;           ///< cam -> track indices
     std::vector<std::vector<std::pair<std::size_t, std::uint32_t>>> track_obs;  ///< track -> (cam, kp)
 
+    // Self-calibration state. Cameras are grouped into sensor slots; every
+    // camera of one slot shares one working calibration in bundle adjustment.
+    std::vector<std::size_t> cam_sensor;   ///< cam -> sensor slot
+    std::vector<std::int32_t> sensor_id;   ///< slot -> input sensor id (>= 0) or -1 (own sensor)
+    std::vector<Calibration> sensor_cal;   ///< slot -> working calibration
+    std::vector<Calibration> sensor_initial;  ///< slot -> input calibration (guard reference)
+    std::vector<std::array<bool, kCalibrationParamCount>> sensor_fixed;  ///< slot -> held terms
+
     std::vector<std::uint8_t> registered;
     std::vector<std::uint8_t> failed;  ///< failed this round
     std::vector<AbsolutePose> pose;
@@ -91,7 +106,9 @@ struct Scene {
 std::map<std::int32_t, std::size_t> validate_input(const BuilderInput& in);
 void init_scene(Scene& s, const std::map<std::int32_t, std::size_t>& id_to_index);
 std::size_t registered_count(const Scene& s);
+const Calibration& camera_calibration(const Scene& s, std::size_t cam);
 double camera_f(const Scene& s, std::size_t cam);
+void refresh_camera_bearings(Scene& s, std::size_t cam);
 double reprojection_error_px(const Scene& s, std::size_t cam, std::uint32_t kp,
                              const Eigen::Vector3d& x);
 void triangulate_track(Scene& s, std::size_t ti);
@@ -105,6 +122,8 @@ struct BAIndex {
     std::vector<std::size_t> track_ba;  ///< track index -> ba index (kNoIndex if no point)
     std::vector<std::size_t> ba_to_cam;
     std::vector<std::size_t> ba_to_track;
+    std::vector<std::size_t> ba_sensor;  ///< ba calibration index -> sensor slot
+    std::vector<std::array<bool, kCalibrationParamCount>> ba_fit;  ///< per ba calibration
 };
 BAIndex build_ba(Scene& s);
 void run_global_ba(Scene& s);
@@ -174,12 +193,57 @@ void init_scene(Scene& s, const std::map<std::int32_t, std::size_t>& id_to_index
     s.camera_id.resize(s.ncams);
     s.bearings.resize(s.ncams);
     s.cam_tracks.resize(s.ncams);
+
+    // Group cameras into sensor slots. A camera with a non-negative sensor_id
+    // shares its slot with every other camera of that sensor; a camera with a
+    // negative id is its own slot (so its intrinsics stay fixed under the
+    // minimum-camera gate). Slots are created in first-seen camera order, which
+    // keeps the mapping deterministic.
+    s.cam_sensor.assign(s.ncams, kNoIndex);
+    std::map<std::int32_t, std::size_t> sensor_slot;
     for (std::size_t c = 0; c < s.ncams; ++c) {
         const BuilderCamera& cam = in.cameras[c];
         s.camera_id[c] = cam.id;
+        if (cam.sensor_id >= 0) {
+            const auto it = sensor_slot.find(cam.sensor_id);
+            if (it != sensor_slot.end()) {
+                s.cam_sensor[c] = it->second;
+            } else {
+                const std::size_t slot = s.sensor_id.size();
+                sensor_slot.emplace(cam.sensor_id, slot);
+                s.sensor_id.push_back(cam.sensor_id);
+                s.sensor_cal.push_back(cam.calibration);
+                s.sensor_initial.push_back(cam.calibration);
+                s.sensor_fixed.emplace_back();
+                s.cam_sensor[c] = slot;
+            }
+        } else {
+            const std::size_t slot = s.sensor_id.size();
+            s.sensor_id.push_back(-1);
+            s.sensor_cal.push_back(cam.calibration);
+            s.sensor_initial.push_back(cam.calibration);
+            s.sensor_fixed.emplace_back();
+            s.cam_sensor[c] = slot;
+        }
         s.bearings[c].reserve(cam.pixels.size());
         for (const Eigen::Vector2d& px : cam.pixels) {
             s.bearings[c].push_back(cam.calibration.unproject(px));
+        }
+    }
+
+    // Held coefficients per sensor, from the optional BuilderSensor metadata.
+    for (const BuilderSensor& sensor : in.sensors) {
+        const auto it = sensor_slot.find(sensor.id);
+        if (it == sensor_slot.end()) {
+            continue;  // a sensor no camera uses
+        }
+        std::array<bool, kCalibrationParamCount>& fixed = s.sensor_fixed[it->second];
+        for (const std::string& name : sensor.fixed_params) {
+            for (int k = 0; k < kCalibrationParamCount; ++k) {
+                if (name == kCalibrationParamNames[static_cast<std::size_t>(k)]) {
+                    fixed[static_cast<std::size_t>(k)] = true;
+                }
+            }
         }
     }
 
@@ -213,15 +277,33 @@ std::size_t registered_count(const Scene& s) {
     return n;
 }
 
+/// The working calibration of a camera's sensor slot.
+const Calibration& camera_calibration(const Scene& s, std::size_t cam) {
+    return s.sensor_cal[s.cam_sensor[cam]];
+}
+
 double camera_f(const Scene& s, std::size_t cam) {
-    const double f = s.in->cameras[cam].calibration.f;
+    const double f = camera_calibration(s, cam).f;
     return f > 0.0 ? f : 1.0;
+}
+
+/// Recompute one camera's keypoint bearings from its sensor's current working
+/// calibration. Called after a self-calibration step changes the calibration,
+/// so resection and triangulation never use bearings from a stale lens.
+void refresh_camera_bearings(Scene& s, std::size_t cam) {
+    const Calibration& cal = camera_calibration(s, cam);
+    const std::vector<Eigen::Vector2d>& pixels = s.in->cameras[cam].pixels;
+    std::vector<Eigen::Vector3d>& bearings = s.bearings[cam];
+    bearings.resize(pixels.size());
+    for (std::size_t k = 0; k < pixels.size(); ++k) {
+        bearings[k] = cal.unproject(pixels[k]);
+    }
 }
 
 /// Reprojection error in pixels of point x as seen by camera cam at keypoint kp.
 double reprojection_error_px(const Scene& s, std::size_t cam, std::uint32_t kp,
                              const Eigen::Vector3d& x) {
-    const Calibration& cal = s.in->cameras[cam].calibration;
+    const Calibration& cal = camera_calibration(s, cam);
     const Eigen::Vector3d p_cam = s.pose[cam].R * x + s.pose[cam].t;
     if (cal.type == CameraType::Frame && !(p_cam.z() > 0.0)) {
         return kBehindCameraErrorPx;  // behind the image plane: unprojectable
@@ -319,25 +401,91 @@ void filter_points(Scene& s) {
 
 // --- bundle adjustment ---
 
+/// The free-coefficient mask for one sensor slot at the current reconstruction
+/// size, or all-false when the sensor is not yet eligible. The schedule (ours,
+/// from the incremental-SfM literature's practice of holding intrinsics until
+/// the network is large enough):
+///   * fewer than min_cameras_for_intrinsics registered cameras of the sensor,
+///     or fewer than kMinIntrinsicObservations observations over them: nothing
+///     free (the lens stays at its input value);
+///   * from there up to full_intrinsics_cameras: only f and k1, the two
+///     best-conditioned terms;
+///   * at or above full_intrinsics_cameras: f, cx, cy, k1, k2, k3, p1, p2.
+/// A coefficient the sensor holds in fixed_params is never freed.
+std::array<bool, kCalibrationParamCount> intrinsic_free_mask(const Scene& s,
+                                                             std::size_t slot) {
+    std::array<bool, kCalibrationParamCount> mask = {};
+    if (!s.opt->fit_intrinsics) {
+        return mask;
+    }
+    std::size_t cameras = 0;
+    std::size_t observations = 0;
+    for (std::size_t c = 0; c < s.ncams; ++c) {
+        if (s.cam_sensor[c] != slot || s.registered[c] == 0) {
+            continue;
+        }
+        ++cameras;
+        for (std::size_t ti : s.cam_tracks[c]) {
+            if (s.point[ti].has_value()) {
+                ++observations;
+            }
+        }
+    }
+    if (cameras < s.opt->min_cameras_for_intrinsics ||
+        observations < kMinIntrinsicObservations) {
+        return mask;
+    }
+    // Packed order: f, cx, cy, b1, b2, k1, k2, k3, k4, p1, p2, p3, p4.
+    constexpr std::size_t kF = 0, kCx = 1, kCy = 2, kK1 = 5, kK2 = 6, kK3 = 7, kP1 = 9,
+                          kP2 = 10;
+    mask[kF] = true;
+    mask[kK1] = true;
+    if (cameras >= s.opt->full_intrinsics_cameras) {
+        mask[kCx] = true;
+        mask[kCy] = true;
+        mask[kK2] = true;
+        mask[kK3] = true;
+        mask[kP1] = true;
+        mask[kP2] = true;
+    }
+    const std::array<bool, kCalibrationParamCount>& fixed = s.sensor_fixed[slot];
+    for (int k = 0; k < kCalibrationParamCount; ++k) {
+        const std::size_t kk = static_cast<std::size_t>(k);
+        mask[kk] = mask[kk] && !fixed[kk];
+    }
+    return mask;
+}
+
 /// Populate a BAProblem from the registered cameras and triangulated tracks.
-/// Index maps let the caller write results back.
+/// Index maps let the caller write results back. One calibration is created per
+/// sensor slot that has a registered camera, shared by every camera of that
+/// sensor, with the free mask from intrinsic_free_mask.
 BAIndex build_ba(Scene& s) {
     BAIndex idx;
     idx.cam_ba.assign(s.ncams, kNoIndex);
     idx.track_ba.assign(s.ntracks, kNoIndex);
 
+    std::vector<std::size_t> slot_ba(s.sensor_id.size(), kNoIndex);
     for (std::size_t c = 0; c < s.ncams; ++c) {
         if (s.registered[c] == 0) {
             continue;
         }
+        const std::size_t slot = s.cam_sensor[c];
+        if (slot_ba[slot] == kNoIndex) {
+            slot_ba[slot] = idx.problem.calibrations.size();
+            idx.problem.calibrations.push_back(s.sensor_cal[slot]);
+            idx.ba_sensor.push_back(slot);
+            idx.ba_fit.push_back(intrinsic_free_mask(s, slot));
+        }
         idx.cam_ba[c] = idx.problem.poses.size();
         idx.ba_to_cam.push_back(c);
-        idx.problem.calibrations.push_back(s.in->cameras[c].calibration);
+        idx.problem.camera_sensor.push_back(slot_ba[slot]);
         BAPose pose;
         pose.R = s.pose[c].R;
         pose.t = s.pose[c].t;
         idx.problem.poses.push_back(pose);
     }
+    idx.problem.fit_intrinsics = idx.ba_fit;
     for (std::size_t t = 0; t < s.ntracks; ++t) {
         if (!s.point[t].has_value()) {
             continue;
@@ -398,8 +546,41 @@ BAIndex build_ba(Scene& s) {
     return idx;
 }
 
+/// True when a refined calibration is implausible and must be reverted: a
+/// non-finite coefficient, a focal length that moved by more than
+/// max_focal_change_fraction from the sensor's initial value, or |k1| beyond
+/// max_abs_k1. `initial` is the sensor's input calibration.
+bool calibration_diverged(const Calibration& refined, const Calibration& initial,
+                          const BuilderOptions& opt) {
+    if (!std::isfinite(refined.f) || !std::isfinite(refined.cx) || !std::isfinite(refined.cy) ||
+        !std::isfinite(refined.k1) || !std::isfinite(refined.k2) || !std::isfinite(refined.k3) ||
+        !std::isfinite(refined.p1) || !std::isfinite(refined.p2)) {
+        return true;
+    }
+    if (!(refined.f > 0.0)) {
+        return true;
+    }
+    if (initial.f > 0.0 &&
+        std::abs(refined.f - initial.f) > opt.max_focal_change_fraction * initial.f) {
+        return true;
+    }
+    if (std::abs(refined.k1) > opt.max_abs_k1) {
+        return true;
+    }
+    return false;
+}
+
 /// Run a global bundle adjustment over all registered cameras and points, then
-/// write the refined poses / points back into the Scene.
+/// write the refined poses / points / calibrations back into the Scene.
+///
+/// Self-calibration. Each sensor slot's working calibration is refined per the
+/// schedule in intrinsic_free_mask. After the solve every freed sensor is
+/// checked against the divergence guards: a sensor whose refined calibration is
+/// implausible, or whose solve made the reprojection RMS worse than before the
+/// solve, is reverted to its pre-solve value and logged. When any sensor is
+/// reverted the poses and points are re-solved once with every intrinsic held
+/// fixed, so the geometry is not left at a state fitted to a rejected lens.
+/// Bearings of every camera whose calibration changed are refreshed afterwards.
 void run_global_ba(Scene& s) {
     if (s.index_a == kNoIndex) {
         return;
@@ -411,13 +592,100 @@ void run_global_ba(Scene& s) {
     BAOptions options;
     options.loss_scale_px = s.opt->ba_loss_scale_px;
     options.num_threads = 1;  // TODO: determinism over speed; revisit later.
+
+    // The pre-solve calibration of every sensor slot, for the guards.
+    const std::vector<Calibration> before = s.sensor_cal;
+    const double rms_before = reprojection_rms_px(idx.problem);
+
     bundle_adjust(idx.problem, options);
+
+    // Accept or revert each freed sensor. A sensor is "freed" when its mask has
+    // any true entry; only those can have moved.
+    bool any_reverted = false;
+    for (std::size_t b = 0; b < idx.ba_sensor.size(); ++b) {
+        const std::size_t slot = idx.ba_sensor[b];
+        bool freed = false;
+        for (bool f : idx.ba_fit[b]) {
+            freed = freed || f;
+        }
+        if (!freed) {
+            continue;
+        }
+        const Calibration& refined = idx.problem.calibrations[b];
+        if (calibration_diverged(refined, s.sensor_initial[slot], *s.opt)) {
+            any_reverted = true;
+            if (Log::enabled(LogLevel::Warn)) {
+                log(LogLevel::Warn) << "structure_builder: sensor " << s.sensor_id[slot]
+                                    << " self-calibration diverged (f " << refined.f << ", k1 "
+                                    << refined.k1 << "); reverting to the previous calibration";
+            }
+            continue;
+        }
+        s.sensor_cal[slot] = refined;
+    }
+
+    // A worse global RMS than before the solve means the refinement did not pay
+    // for itself: revert every sensor that moved and re-solve with fixed
+    // intrinsics so the geometry matches the reverted lens. The tolerance is
+    // generous because the robust (Cauchy) loss can trade a few large residuals
+    // for many small ones, so the plain RMS may rise slightly while the robust
+    // objective falls; only a clear regression reverts.
+    const double rms_after = reprojection_rms_px(idx.problem);
+    if (!any_reverted && rms_after > rms_before * 1.05) {
+        bool moved = false;
+        for (std::size_t slot = 0; slot < s.sensor_cal.size(); ++slot) {
+            if (!(s.sensor_cal[slot].same_model(before[slot]))) {
+                moved = true;
+            }
+        }
+        if (moved) {
+            any_reverted = true;
+            if (Log::enabled(LogLevel::Warn)) {
+                log(LogLevel::Warn) << "structure_builder: self-calibration raised the RMS ("
+                                    << rms_before << " -> " << rms_after
+                                    << " px); reverting to the previous calibration";
+            }
+            s.sensor_cal = before;
+        }
+    }
+
+    if (any_reverted) {
+        // Write the solved geometry back first, so the fixed re-solve starts
+        // from the refined poses and points rather than the pre-solve state.
+        for (std::size_t i = 0; i < idx.ba_to_cam.size(); ++i) {
+            s.pose[idx.ba_to_cam[i]].R = idx.problem.poses[i].R;
+            s.pose[idx.ba_to_cam[i]].t = idx.problem.poses[i].t;
+        }
+        for (std::size_t i = 0; i < idx.ba_to_track.size(); ++i) {
+            s.point[idx.ba_to_track[i]] = idx.problem.points[i];
+        }
+        // Re-solve the geometry with every intrinsic held fixed at the reverted
+        // values, so poses and points are consistent with the accepted lens.
+        BAIndex fixed = build_ba(s);
+        for (std::array<bool, kCalibrationParamCount>& mask : fixed.problem.fit_intrinsics) {
+            mask.fill(false);
+        }
+        if (!fixed.problem.poses.empty() && !fixed.problem.points.empty()) {
+            bundle_adjust(fixed.problem, options);
+            idx = std::move(fixed);
+        }
+    }
+
     for (std::size_t i = 0; i < idx.ba_to_cam.size(); ++i) {
         s.pose[idx.ba_to_cam[i]].R = idx.problem.poses[i].R;
         s.pose[idx.ba_to_cam[i]].t = idx.problem.poses[i].t;
     }
     for (std::size_t i = 0; i < idx.ba_to_track.size(); ++i) {
         s.point[idx.ba_to_track[i]] = idx.problem.points[i];
+    }
+
+    // Refresh the bearings of every camera whose sensor calibration changed, so
+    // resection and triangulation use the refined lens rather than the input one.
+    for (std::size_t c = 0; c < s.ncams; ++c) {
+        const std::size_t slot = s.cam_sensor[c];
+        if (!s.sensor_cal[slot].same_model(before[slot])) {
+            refresh_camera_bearings(s, c);
+        }
     }
 }
 
@@ -699,6 +967,14 @@ BuilderResult build_incremental(const BuilderInput& input, const BuilderOptions&
     }
     for (std::size_t t = 0; t < s.ntracks; ++t) {
         result.points[t] = s.point[t];
+    }
+    // Report every sensor whose working calibration differs from its input, so
+    // the caller writes the refined lens back to the sensor. A sensor that was
+    // never freed, or reverted by a guard, is absent and keeps its input value.
+    for (std::size_t slot = 0; slot < s.sensor_id.size(); ++slot) {
+        if (s.sensor_id[slot] >= 0 && !s.sensor_cal[slot].same_model(s.sensor_initial[slot])) {
+            result.refined_calibrations.emplace_back(s.sensor_id[slot], s.sensor_cal[slot]);
+        }
     }
     result.registered = registered_count(s);
     return result;

@@ -36,6 +36,7 @@
 #include "common/core/document.hpp"
 #include "common/io/project_io.hpp"
 #include "common/tasks/registry.hpp"
+#include "model/camera/calibration.hpp"
 #include "model/geo/geodesy.hpp"
 
 namespace alphashape {
@@ -70,6 +71,14 @@ std::vector<std::string> geo_seq_files(int count = 8) {
     std::vector<std::string> files;
     for (int i = 0; i < count; ++i) {
         files.push_back(fixture("geo_seq_" + std::to_string(i) + ".jpg"));
+    }
+    return files;
+}
+
+std::vector<std::string> calgrid_files(int count = 12) {
+    std::vector<std::string> files;
+    for (int i = 0; i < count; ++i) {
+        files.push_back(fixture("calgrid_" + std::to_string(i) + ".jpg"));
     }
     return files;
 }
@@ -607,6 +616,7 @@ TEST(AlignCamerasMeta, RecordsParamInMeta) {
     Document document = aligned_document(seq_files());
     const Meta& meta = document.active_chunk()->meta();
     EXPECT_NE(meta.find("AlignCameras/reset_alignment"), nullptr);
+    EXPECT_NE(meta.find("AlignCameras/fit_intrinsics"), nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +743,64 @@ TEST(AlignCamerasGeo, ContinueOnGeoreferencedChunkIsStable) {
     EXPECT_LT(worst_move, 0.01) << "worst move " << worst_move;
     EXPECT_EQ(document.active_chunk()->crs().epsg, 4326);
     EXPECT_LT((document.active_chunk()->transform() - transform_before).cwiseAbs().maxCoeff(), 1e-6);
+}
+
+// ---------------------------------------------------------------------------
+// 12. Self-calibration writes the refined lens back to the sensor
+// ---------------------------------------------------------------------------
+//
+// The calgrid fixture is a 12-view calibration network whose true lens is
+// f = 500, k1 = -0.08, k2 = 0.02, cx = 3, cy = -2, while the EXIF seed is
+// f = 475 with zero distortion. With fit_intrinsics on, twelve cameras clear the
+// default min_cameras_for_intrinsics (10), so AlignCameras refines the lens and writes
+// it back to the sensor's ADJUSTED calibration. This is the end-to-end proof
+// that the fix reaches the chunk, not just the builder.
+
+TEST(AlignCamerasSelfCalibration, RefinesAndWritesBackTheLens) {
+    Document document = make_document(calgrid_files());
+    run_match_photos(document);
+    const Calibration seed = document.active_chunk()->sensors()[0].calibration;
+    ASSERT_NEAR(seed.f, 475.0, 1e-9) << "the fixture's EXIF must start f at 475";
+
+    Params params = make_params(builtin_registry().require("AlignCameras"));
+    params.set("fit_intrinsics", true);
+    run_task(builtin_registry(), document, "AlignCameras", params);
+    const Chunk& chunk = *document.active_chunk();
+    ASSERT_EQ(chunk.cameras().size(), 12U);
+    for (const Camera& camera : chunk.cameras()) {
+        ASSERT_TRUE(camera.enabled) << "camera " << camera.id << " not aligned";
+    }
+
+    const Calibration& cal = chunk.sensors()[0].calibration;
+    std::printf("[align_cameras] calgrid self-cal: f=%.3f (seed 475, truth 500) k1=%.4f "
+                "(truth -0.08) k2=%.4f (truth 0.02)\n",
+                cal.f, cal.k1, cal.k2);
+
+    // The refined lens reached the chunk: the sensor's calibration is no longer
+    // the EXIF seed, and f moved off 475 toward the true 500. At 12 cameras only
+    // f and k1 are free (the full set releases at 15), so this asserts the
+    // write-back and the direction of the focal correction, not a tight fit.
+    EXPECT_FALSE(cal.same_model(seed)) << "the sensor must carry the refined lens";
+    EXPECT_GT(cal.f, 480.0) << "f = " << cal.f << " (seed 475, truth 500)";
+    EXPECT_LT(cal.f, 520.0) << "f = " << cal.f << " (seed 475, truth 500)";
+}
+
+// ---------------------------------------------------------------------------
+// 13. By default (fit_intrinsics off) the seed lens is kept
+// ---------------------------------------------------------------------------
+
+TEST(AlignCamerasSelfCalibration, DefaultKeepsSeedLens) {
+    Document document = make_document(calgrid_files());
+    run_match_photos(document);
+    const Calibration seed = document.active_chunk()->sensors()[0].calibration;
+
+    Params params = make_params(builtin_registry().require("AlignCameras"));
+    ASSERT_FALSE(params.get_bool("fit_intrinsics")) << "self-calibration must be opt-in";
+    run_task(builtin_registry(), document, "AlignCameras", params);
+
+    const Calibration& cal = document.active_chunk()->sensors()[0].calibration;
+    // The old fixed-lens behaviour: the sensor keeps its EXIF calibration.
+    EXPECT_TRUE(cal.same_model(seed)) << "f = " << cal.f << " (seed " << seed.f << ")";
 }
 
 }  // namespace alphashape
