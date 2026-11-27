@@ -26,6 +26,8 @@
 #include "common/core/document.hpp"
 #include "common/tasks/registry.hpp"
 #include "image/io/exif.hpp"
+#include "image/io/image_io.hpp"
+#include "model/camera/calibration.hpp"
 
 #if defined(ALPHASHAPE_USE_PROJ)
 #include "common/algorithm/reference/convert_reference.hpp"
@@ -293,6 +295,16 @@ void run_add_photos(Document& document, const std::string& path, bool xmp_accura
     run_task(builtin_registry(), document, "AddPhotos", params);
 }
 
+/// Run AddPhotos with the XMP lens-calibration option set, everything else at
+/// its default.
+void run_add_photos_with_calibration(Document& document, const std::string& path,
+                                     bool load_xmp_calibration) {
+    Params params = make_params(builtin_registry().require("AddPhotos"));
+    params.set("filenames", ParamValue{std::vector<std::string>{path}});
+    params.set("load_xmp_calibration", ParamValue{load_xmp_calibration});
+    run_task(builtin_registry(), document, "AddPhotos", params);
+}
+
 TEST(Xmp, ParsesDjiLatLonAlt) {
     const XmpReference xmp = parse_xmp_reference(attribute_packet(
         "drone-dji:GpsLatitude=\"+45.1\" drone-dji:GpsLongitude=\"-9.25\" "
@@ -547,6 +559,73 @@ TEST(Xmp, MissingPacketIsNoOp) {
     EXPECT_FALSE(xmp.orientation_zyx().has_value());
     EXPECT_FALSE(xmp.has_rtk_fix());
     EXPECT_FALSE(xmp.rtk_accuracy_m().has_value());
+    EXPECT_FALSE(xmp.dewarp.has_value());
+    EXPECT_FALSE(xmp.calibrated_focal_length.has_value());
+    EXPECT_FALSE(xmp.dewarp_flag.has_value());
+}
+
+TEST(Xmp, ParsesDewarpDataWithLeadingSpace) {
+    // The exact shape a Phantom 4 RTK writes: a leading space, a date, then the
+    // nine OpenCV coefficients.
+    const XmpReference xmp = parse_xmp_reference(attribute_packet(
+        "drone-dji:DewarpData=\" 2018-09-04;3670.280000000000,3664.660000000000,"
+        "2.680000000000,1.640000000000,-0.268152000000,0.113388000000,"
+        "0.000041654400,0.000017653600,-0.033956100000\""));
+    ASSERT_TRUE(xmp.dewarp.has_value());
+    const XmpDewarpCalibration& d = *xmp.dewarp;
+    EXPECT_DOUBLE_EQ(d.fx, 3670.28);
+    EXPECT_DOUBLE_EQ(d.fy, 3664.66);
+    EXPECT_DOUBLE_EQ(d.cx, 2.68);
+    EXPECT_DOUBLE_EQ(d.cy, 1.64);
+    EXPECT_DOUBLE_EQ(d.k1, -0.268152);
+    EXPECT_DOUBLE_EQ(d.k2, 0.113388);
+    EXPECT_DOUBLE_EQ(d.p1, 0.0000416544);
+    EXPECT_DOUBLE_EQ(d.p2, 0.0000176536);
+    EXPECT_DOUBLE_EQ(d.k3, -0.0339561);
+    // The raw string is kept too, trimmed.
+    ASSERT_TRUE(xmp.dewarp_data.has_value());
+    EXPECT_EQ(xmp.dewarp_data->front(), '2');
+}
+
+TEST(Xmp, ParsesDewarpDataWithoutDate) {
+    // Some firmware omits the date part; the coefficient list is the whole value.
+    const XmpReference xmp = parse_xmp_reference(attribute_packet(
+        "drone-dji:DewarpData=\"1000,1000,0,0,0.1,0.2,0.3,0.4,0.5\""));
+    ASSERT_TRUE(xmp.dewarp.has_value());
+    EXPECT_DOUBLE_EQ(xmp.dewarp->fx, 1000.0);
+    EXPECT_DOUBLE_EQ(xmp.dewarp->k1, 0.1);
+    EXPECT_DOUBLE_EQ(xmp.dewarp->p1, 0.3);
+    EXPECT_DOUBLE_EQ(xmp.dewarp->p2, 0.4);
+    EXPECT_DOUBLE_EQ(xmp.dewarp->k3, 0.5);
+}
+
+TEST(Xmp, MalformedDewarpDataIsIgnored) {
+    // Fewer than nine numbers, a non-numeric token, and an empty list all yield
+    // no typed calibration (the raw string may still be recorded).
+    for (const std::string& value :
+         {std::string("2018-09-04;1,2,3,4,5,6,7,8"),
+          std::string("2018-09-04;1,2,3,4,5,6,7,8,notanumber"),
+          std::string("2018-09-04;")}) {
+        const XmpReference xmp = parse_xmp_reference(
+            attribute_packet("drone-dji:DewarpData=\"" + value + "\""));
+        EXPECT_FALSE(xmp.dewarp.has_value()) << value;
+    }
+}
+
+TEST(Xmp, ParsesCalibratedFocalAndOpticalCentreAndFlag) {
+    const XmpReference xmp = parse_xmp_reference(attribute_packet(
+        "drone-dji:CalibratedFocalLength=\"3666.666504\" "
+        "drone-dji:CalibratedOpticalCenterX=\"2736.000000\" "
+        "drone-dji:CalibratedOpticalCenterY=\"1824.000000\" "
+        "drone-dji:DewarpFlag=\"0\""));
+    ASSERT_TRUE(xmp.calibrated_focal_length.has_value());
+    EXPECT_DOUBLE_EQ(*xmp.calibrated_focal_length, 3666.666504);
+    ASSERT_TRUE(xmp.calibrated_optical_center_x.has_value());
+    EXPECT_DOUBLE_EQ(*xmp.calibrated_optical_center_x, 2736.0);
+    ASSERT_TRUE(xmp.calibrated_optical_center_y.has_value());
+    EXPECT_DOUBLE_EQ(*xmp.calibrated_optical_center_y, 1824.0);
+    ASSERT_TRUE(xmp.dewarp_flag.has_value());
+    EXPECT_EQ(*xmp.dewarp_flag, 0);
 }
 
 TEST(Xmp, MalformedPacketDoesNotThrow) {
@@ -840,6 +919,175 @@ TEST(Xmp, ExifGpsIsPrimary) {
     // cam_a1 has no GPS altitude, so the z placeholder is NaN.
     EXPECT_TRUE(std::isnan(reference.location->z()));
     remove_file(path);
+}
+
+/// The example DewarpData a Phantom 4 RTK writes, as test constants.
+constexpr const char* kDewarpData =
+    " 2018-09-04;3670.280000000000,3664.660000000000,2.680000000000,1.640000000000,"
+    "-0.268152000000,0.113388000000,0.000041654400,0.000017653600,-0.033956100000";
+
+TEST(Xmp, AddPhotosAppliesDewarpCalibrationWhenEnabled) {
+    const std::string packet = attribute_packet(
+        std::string("drone-dji:DewarpData=\"") + kDewarpData + "\"");
+    const std::string path = temp_path(".jpg");
+    write_bytes(path, jpeg_with_packet(read_bytes(fixture("cam_b1.jpg")), packet));
+
+    Document document = document_with_chunk();
+    run_add_photos_with_calibration(document, path, /*load_xmp_calibration=*/true);
+    Chunk& chunk = *document.active_chunk();
+    ASSERT_EQ(chunk.sensors().size(), 1U);
+    const Calibration& c = chunk.sensors().front().calibration;
+    const ImageInfo info = read_image_info(path);
+    EXPECT_EQ(c.width, info.width);
+    EXPECT_EQ(c.height, info.height);
+    // f = fy, b1 = fx - fy, principal point offsets direct, radial direct.
+    EXPECT_DOUBLE_EQ(c.f, 3664.66);
+    EXPECT_DOUBLE_EQ(c.b1, 3670.28 - 3664.66);
+    EXPECT_DOUBLE_EQ(c.cx, 2.68);
+    EXPECT_DOUBLE_EQ(c.cy, 1.64);
+    EXPECT_DOUBLE_EQ(c.k1, -0.268152);
+    EXPECT_DOUBLE_EQ(c.k2, 0.113388);
+    EXPECT_DOUBLE_EQ(c.k3, -0.0339561);
+    // The tangential terms are SWAPPED: engine p1 = OpenCV p2, engine p2 = OpenCV p1.
+    EXPECT_DOUBLE_EQ(c.p1, 0.0000176536);
+    EXPECT_DOUBLE_EQ(c.p2, 0.0000416544);
+    remove_file(path);
+}
+
+TEST(Xmp, AddPhotosKeepsExifCalibrationWhenDisabled) {
+    const std::string packet = attribute_packet(
+        std::string("drone-dji:DewarpData=\"") + kDewarpData + "\"");
+    const std::string path = temp_path(".jpg");
+    write_bytes(path, jpeg_with_packet(read_bytes(fixture("cam_b1.jpg")), packet));
+
+    Document document = document_with_chunk();
+    run_add_photos_with_calibration(document, path, /*load_xmp_calibration=*/false);
+    const Calibration& c = document.active_chunk()->sensors().front().calibration;
+    // The EXIF-seeded calibration: a focal length but no distortion, and a
+    // principal point at the image centre.
+    EXPECT_GT(c.f, 0.0);
+    EXPECT_NE(c.f, 3664.66);
+    EXPECT_DOUBLE_EQ(c.cx, 0.0);
+    EXPECT_DOUBLE_EQ(c.cy, 0.0);
+    EXPECT_DOUBLE_EQ(c.k1, 0.0);
+    EXPECT_DOUBLE_EQ(c.p1, 0.0);
+    EXPECT_DOUBLE_EQ(c.p2, 0.0);
+    remove_file(path);
+}
+
+TEST(Xmp, AddPhotosDewarpFlagOneKeepsFocalButZeroesDistortion) {
+    // DewarpFlag=1 means the camera already undistorted the JPEG: the focal and
+    // principal point still describe the image, but the distortion must not be
+    // applied.
+    const std::string packet = attribute_packet(
+        std::string("drone-dji:DewarpData=\"") + kDewarpData +
+        "\" drone-dji:CalibratedFocalLength=\"3666.666504\" "
+        "drone-dji:CalibratedOpticalCenterX=\"100.0\" "
+        "drone-dji:CalibratedOpticalCenterY=\"75.0\" drone-dji:DewarpFlag=\"1\"");
+    const std::string path = temp_path(".jpg");
+    write_bytes(path, jpeg_with_packet(read_bytes(fixture("cam_b1.jpg")), packet));
+
+    Document document = document_with_chunk();
+    run_add_photos_with_calibration(document, path, /*load_xmp_calibration=*/true);
+    const Calibration& c = document.active_chunk()->sensors().front().calibration;
+    const ImageInfo info = read_image_info(path);
+    EXPECT_DOUBLE_EQ(c.f, 3666.666504);
+    // The optical centre is absolute; the engine stores the offset from centre.
+    EXPECT_DOUBLE_EQ(c.cx, 100.0 - static_cast<double>(info.width) / 2.0);
+    EXPECT_DOUBLE_EQ(c.cy, 75.0 - static_cast<double>(info.height) / 2.0);
+    EXPECT_DOUBLE_EQ(c.k1, 0.0);
+    EXPECT_DOUBLE_EQ(c.k2, 0.0);
+    EXPECT_DOUBLE_EQ(c.k3, 0.0);
+    EXPECT_DOUBLE_EQ(c.p1, 0.0);
+    EXPECT_DOUBLE_EQ(c.p2, 0.0);
+    remove_file(path);
+}
+
+TEST(Xmp, AddPhotosCalibratedFocalOnlyGivesZeroDistortion) {
+    // No DewarpData, only CalibratedFocalLength and the optical centre.
+    const std::string packet = attribute_packet(
+        "drone-dji:CalibratedFocalLength=\"3666.666504\" "
+        "drone-dji:CalibratedOpticalCenterX=\"100.0\" "
+        "drone-dji:CalibratedOpticalCenterY=\"75.0\"");
+    const std::string path = temp_path(".jpg");
+    write_bytes(path, jpeg_with_packet(read_bytes(fixture("cam_b1.jpg")), packet));
+
+    Document document = document_with_chunk();
+    run_add_photos_with_calibration(document, path, /*load_xmp_calibration=*/true);
+    const Calibration& c = document.active_chunk()->sensors().front().calibration;
+    const ImageInfo info = read_image_info(path);
+    EXPECT_DOUBLE_EQ(c.f, 3666.666504);
+    EXPECT_DOUBLE_EQ(c.cx, 100.0 - static_cast<double>(info.width) / 2.0);
+    EXPECT_DOUBLE_EQ(c.cy, 75.0 - static_cast<double>(info.height) / 2.0);
+    EXPECT_DOUBLE_EQ(c.k1, 0.0);
+    EXPECT_DOUBLE_EQ(c.p1, 0.0);
+    remove_file(path);
+}
+
+TEST(Xmp, AddPhotosWithoutXmpCalibrationKeepsExifSeed) {
+    // The option is on but the packet carries no lens calibration: the sensor
+    // keeps the EXIF-seeded focal length.
+    const std::string packet = attribute_packet("drone-dji:GpsLatitude=\"45.1\"");
+    const std::string path = temp_path(".jpg");
+    write_bytes(path, jpeg_with_packet(read_bytes(fixture("cam_b1.jpg")), packet));
+
+    Document document = document_with_chunk();
+    run_add_photos_with_calibration(document, path, /*load_xmp_calibration=*/true);
+    const Calibration& c = document.active_chunk()->sensors().front().calibration;
+    EXPECT_GT(c.f, 0.0);
+    EXPECT_DOUBLE_EQ(c.cx, 0.0);
+    EXPECT_DOUBLE_EQ(c.k1, 0.0);
+    remove_file(path);
+}
+
+/// An independent OpenCV pinhole + Brown-Conrady projection, written out here so
+/// the engine's mapped calibration is checked against the convention the DJI
+/// coefficients are defined in, not against the engine's own model.
+Eigen::Vector2d opencv_project(const XmpDewarpCalibration& d, int width, int height, double x,
+                               double y) {
+    const double r2 = x * x + y * y;
+    const double radial = 1.0 + d.k1 * r2 + d.k2 * r2 * r2 + d.k3 * r2 * r2 * r2;
+    const double xd = x * radial + 2.0 * d.p1 * x * y + d.p2 * (r2 + 2.0 * x * x);
+    const double yd = y * radial + d.p1 * (r2 + 2.0 * y * y) + 2.0 * d.p2 * x * y;
+    return Eigen::Vector2d(static_cast<double>(width) / 2.0 + d.cx + xd * d.fx,
+                           static_cast<double>(height) / 2.0 + d.cy + yd * d.fy);
+}
+
+TEST(Xmp, MappedCalibrationMatchesOpenCvProjection) {
+    // The engine's Calibration, built from the same DewarpData, must project a
+    // camera-frame point to the same pixel an independent OpenCV projection
+    // does. This pins the p1/p2 swap and the f/b1 split.
+    const XmpReference xmp = parse_xmp_reference(
+        attribute_packet(std::string("drone-dji:DewarpData=\"") + kDewarpData + "\""));
+    ASSERT_TRUE(xmp.dewarp.has_value());
+    const XmpDewarpCalibration& d = *xmp.dewarp;
+
+    const int width = 5472;
+    const int height = 3648;
+    // The engine mapping, written out here (the task's helper is internal).
+    Calibration c = Calibration::initial(CameraType::Frame, width, height, d.fy);
+    c.cx = d.cx;
+    c.cy = d.cy;
+    c.b1 = d.fx - d.fy;
+    c.k1 = d.k1;
+    c.k2 = d.k2;
+    c.k3 = d.k3;
+    c.p1 = d.p2;
+    c.p2 = d.p1;
+
+    // A handful of off-axis points, including one with a strong tangential
+    // contribution so a wrong p1/p2 mapping would show.
+    const std::array<std::array<double, 2>, 4> points = {
+        std::array<double, 2>{0.0, 0.0}, std::array<double, 2>{0.3, -0.2},
+        std::array<double, 2>{-0.5, 0.4}, std::array<double, 2>{0.1, 0.6}};
+    for (const auto& xy : points) {
+        const double x = xy[0];
+        const double y = xy[1];
+        const Eigen::Vector2d expected = opencv_project(d, width, height, x, y);
+        const Eigen::Vector2d actual = c.project(Eigen::Vector3d(x, y, 1.0));
+        EXPECT_NEAR(actual.x(), expected.x(), 1e-6) << "x at (" << x << ", " << y << ")";
+        EXPECT_NEAR(actual.y(), expected.y(), 1e-6) << "y at (" << x << ", " << y << ")";
+    }
 }
 
 }  // namespace

@@ -37,6 +37,20 @@
 // adjustment milestone refines all of it later.
 //
 // ---------------------------------------------------------------------------
+// XMP lens calibration
+// ---------------------------------------------------------------------------
+// When `load_xmp_calibration` is set and a photo's XMP carries a DJI factory
+// calibration (`DewarpData`, or at least `CalibratedFocalLength`), the sensor's
+// INITIAL calibration is taken from it instead of the EXIF focal length: the
+// focal length, principal point and Brown-Conrady distortion, mapped to the
+// engine's model (see calibration_from_dewarp in the .cpp for the p1/p2 swap).
+// Photos of one sensor share the first photo's values; a disagreement keeps the
+// first and logs a warning. `DewarpFlag=1` (the camera already undistorted the
+// JPEG) keeps the focal length and principal point but zeroes the distortion.
+// The option is off by default, so a non-DJI photo and a DJI photo imported
+// without it keep the EXIF-seeded calibration above.
+//
+// ---------------------------------------------------------------------------
 // Undo
 // ---------------------------------------------------------------------------
 // Like every other task, AddPhotos edits the chunk in place and its changes are

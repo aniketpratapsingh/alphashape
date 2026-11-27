@@ -116,6 +116,18 @@ void warn_orientation_skipped(const char* reason) {
     });
 }
 
+/// Warn once per process when two photos of one sensor carry different XMP
+/// calibrations. The first photo's values are used; the condition is per
+/// sensor, so a plain log line per file would flood the console.
+void warn_calibration_disagrees() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        log(LogLevel::Warn)
+            << "AddPhotos: photos of one sensor carry different XMP lens calibrations; "
+               "using the first photo's values";
+    });
+}
+
 /// Derive the pixel pitch in micrometres, corrected for a JPEG that was scaled
 /// after the EXIF was written.
 ///
@@ -161,6 +173,95 @@ double initial_focal_pixels(const ExifData& exif, int width, int height,
         return *exif.focal_length_35mm * std::hypot(w, h) / std::hypot(36.0, 24.0);
     }
     return kDefaultFocalFactor * static_cast<double>(std::max(width, height));
+}
+
+/// Map a DJI `DewarpData` coefficient list to the engine's Calibration.
+///
+/// The engine's forward model (calibration.hpp) is
+///     xd = x (1 + k1 r^2 + k2 r^4 + k3 r^6) + p1 (r^2 + 2 x^2) + 2 p2 x y
+///     yd = y (1 + k1 r^2 + k2 r^4 + k3 r^6) + p2 (r^2 + 2 y^2) + 2 p1 x y
+/// while OpenCV's is
+///     xd = x (1 + ...) + 2 p1 x y + p2 (r^2 + 2 x^2)
+///     yd = y (1 + ...) + p1 (r^2 + 2 y^2) + 2 p2 x y
+/// so the engine's p1 is OpenCV's p2 and vice versa: the two are SWAPPED. The
+/// radial terms and the principal-point offsets map directly. The focal is
+/// fy, with the aspect difference carried in b1 = fx - fy (the engine's
+/// u = W/2 + cx + x'(f + b1) + y' b2, v = H/2 + cy + y' f).
+///
+/// Returns nullopt when the data cannot describe a real image (a non-positive
+/// focal length).
+std::optional<Calibration> calibration_from_dewarp(const XmpDewarpCalibration& dewarp,
+                                                   int width, int height) {
+    if (!(dewarp.fx > 0.0) || !(dewarp.fy > 0.0)) {
+        return std::nullopt;
+    }
+    Calibration calibration = Calibration::initial(CameraType::Frame, width, height, dewarp.fy);
+    calibration.cx = dewarp.cx;
+    calibration.cy = dewarp.cy;
+    calibration.b1 = dewarp.fx - dewarp.fy;
+    calibration.k1 = dewarp.k1;
+    calibration.k2 = dewarp.k2;
+    calibration.k3 = dewarp.k3;
+    calibration.p1 = dewarp.p2;  // OpenCV p2 -> engine p1
+    calibration.p2 = dewarp.p1;  // OpenCV p1 -> engine p2
+    return calibration;
+}
+
+/// A zero-distortion calibration from a focal length in pixels and the
+/// principal point, given as absolute image coordinates when available.
+Calibration calibration_from_focal(double focal_pixels, const XmpReference& xmp, int width,
+                                   int height) {
+    Calibration calibration =
+        Calibration::initial(CameraType::Frame, width, height, focal_pixels);
+    if (xmp.calibrated_optical_center_x.has_value()) {
+        calibration.cx = *xmp.calibrated_optical_center_x - static_cast<double>(width) / 2.0;
+    }
+    if (xmp.calibrated_optical_center_y.has_value()) {
+        calibration.cy = *xmp.calibrated_optical_center_y - static_cast<double>(height) / 2.0;
+    }
+    return calibration;
+}
+
+/// The initial calibration a photo's XMP asks for, or nullopt when the packet
+/// carries no usable lens calibration.
+///
+/// `DewarpFlag = 1` means the camera already undistorted the JPEG, so the
+/// distortion coefficients must NOT be applied: the focal length and principal
+/// point still describe the image, but the lens is treated as distortion-free.
+/// In that case the calibrated focal length (and optical centre) is preferred,
+/// falling back to the DewarpData focal. With the flag clear (or absent) the
+/// full DewarpData model is used; a packet with only CalibratedFocalLength
+/// yields a zero-distortion calibration at that focal.
+std::optional<Calibration> calibration_from_xmp(const XmpReference& xmp, int width, int height) {
+    const bool already_undistorted = xmp.dewarp_flag.has_value() && *xmp.dewarp_flag == 1;
+    if (already_undistorted) {
+        if (xmp.calibrated_focal_length.has_value() && *xmp.calibrated_focal_length > 0.0) {
+            return calibration_from_focal(*xmp.calibrated_focal_length, xmp, width, height);
+        }
+        if (xmp.dewarp.has_value()) {
+            std::optional<Calibration> calibration =
+                calibration_from_dewarp(*xmp.dewarp, width, height);
+            if (calibration.has_value()) {
+                calibration->k1 = 0.0;
+                calibration->k2 = 0.0;
+                calibration->k3 = 0.0;
+                calibration->p1 = 0.0;
+                calibration->p2 = 0.0;
+            }
+            return calibration;
+        }
+        return std::nullopt;
+    }
+    if (xmp.dewarp.has_value()) {
+        if (std::optional<Calibration> calibration =
+                calibration_from_dewarp(*xmp.dewarp, width, height)) {
+            return calibration;
+        }
+    }
+    if (xmp.calibrated_focal_length.has_value() && *xmp.calibrated_focal_length > 0.0) {
+        return calibration_from_focal(*xmp.calibrated_focal_length, xmp, width, height);
+    }
+    return std::nullopt;
 }
 
 #if defined(ALPHASHAPE_USE_PROJ)
@@ -217,6 +318,9 @@ struct PendingCamera {
     bool needs_sensor = false;
     std::size_t sensor_index = 0;  ///< index into known_keys == final sensor index
     std::string serial;
+    /// The XMP lens calibration this photo asks for, when load_xmp_calibration
+    /// is on and the packet carries one. Applied to the sensor once, below.
+    std::optional<Calibration> xmp_calibration;
 };
 
 std::int32_t next_camera_id(const Chunk& chunk) {
@@ -358,8 +462,12 @@ void AddPhotosTask::declare_params(Params& params) const {
                     "Store the XMP gimbal (or flight) yaw/pitch/roll as the camera "
                     "reference orientation."});
     params.declare({"load_xmp_calibration", ParamType::Bool, false,
-                    "Reserved for XMP lens calibration (DewarpData). Accepted but not yet "
-                    "applied."});
+                    "Seed each sensor's initial calibration from the DJI factory lens "
+                    "calibration in the photo's XMP (DewarpData: focal length, principal "
+                    "point and Brown-Conrady distortion). When the camera already "
+                    "undistorted the JPEG (DewarpFlag=1) only the focal length and "
+                    "principal point are used. Photos of one sensor share the first "
+                    "photo's values."});
     params.declare({"group_by_folder", ParamType::Bool, false,
                     "Create one camera group per source directory, labelled with the "
                     "directory name and typed as a folder group."});
@@ -388,8 +496,6 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
     const bool strip_extensions = params.get_bool("strip_extensions");
     const bool load_xmp_accuracy = params.get_bool("load_xmp_accuracy");
     const bool load_xmp_orientation = params.get_bool("load_xmp_orientation");
-    // Declared so the schema and Python front end accept it; DewarpData is not
-    // applied yet (see the parameter description and the PR notes).
     const bool load_xmp_calibration = params.get_bool("load_xmp_calibration");
     const bool group_by_folder = params.get_bool("group_by_folder");
     const bool recursive = params.get_bool("recursive");
@@ -460,6 +566,11 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
     for (const Sensor& sensor : chunk->sensors()) {
         known_keys.push_back(key_of(sensor));
     }
+    // The first XMP lens calibration seen for each sensor, parallel to
+    // known_keys. Only a sensor created in THIS call takes it (an existing
+    // sensor already has its initial calibration); photos of one sensor share
+    // the values, and a disagreement keeps the first and warns.
+    std::vector<std::optional<Calibration>> sensor_xmp_calibration(known_keys.size());
 
     std::int32_t camera_id = next_camera_id(*chunk);
     std::int32_t frame_id = next_frame_id(*chunk);
@@ -507,6 +618,7 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
             } else {
                 item.sensor_index = known_keys.size();
                 known_keys.push_back(item.key);
+                sensor_xmp_calibration.emplace_back();
                 item.needs_sensor = true;
                 item.sensor.label = sensor_label(item.key.model, item.key.focal_length_mm);
                 item.sensor.type = CameraType::Frame;
@@ -593,12 +705,23 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
                 }
             }
 
-            // load_xmp_calibration is accepted for forward compatibility. DJI
-            // DewarpData mixes a capture date, an image size and a coefficient
-            // list whose exact layout varies by firmware, and this task always
-            // seeds a sensor calibration from EXIF focal length, so applying it
-            // here would be a guess. It is parsed into XmpReference::dewarp_data
-            // but not written to the sensor.
+            // The DJI factory lens calibration, when the packet carries one and
+            // the option is on. It is recorded per photo here and applied to the
+            // sensor once, in the commit phase, so a sensor created by this call
+            // takes the first photo's values and a later photo that disagrees
+            // only warns. A sensor that already existed keeps its calibration.
+            if (load_xmp_calibration) {
+                item.xmp_calibration = calibration_from_xmp(xmp, info.width, info.height);
+                if (item.xmp_calibration.has_value() && item.sensor_index >= fixed_count) {
+                    std::optional<Calibration>& first =
+                        sensor_xmp_calibration[item.sensor_index];
+                    if (!first.has_value()) {
+                        first = item.xmp_calibration;
+                    } else if (!first->same_model(*item.xmp_calibration)) {
+                        warn_calibration_disagrees();
+                    }
+                }
+            }
 
             item.frame = std::make_shared<Frame>(path, info.width, info.height);
             item.frame->set_id(frame_id++);
@@ -626,6 +749,22 @@ void AddPhotosTask::apply(Document& document, Params& params, const Progress& pr
 
     for (PendingCamera& item : pending) {
         if (item.needs_sensor) {
+            // A sensor created by this call takes the first XMP lens
+            // calibration its photos carried, when the option is on. The
+            // EXIF-seeded calibration stays otherwise.
+            if (const std::optional<Calibration>& xmp_calibration =
+                    sensor_xmp_calibration[item.sensor_index]) {
+                item.sensor.calibration = *xmp_calibration;
+                // Keep the reported pixel pitch consistent with the applied
+                // focal: when EXIF gave a focal length in mm but no pitch, the
+                // calibrated focal in pixels recovers it. A pitch EXIF already
+                // supplied is left alone.
+                if (item.sensor.pixel_size_um == 0.0 && item.sensor.focal_length_mm > 0.0 &&
+                    xmp_calibration->f > 0.0) {
+                    item.sensor.pixel_size_um =
+                        item.sensor.focal_length_mm * 1000.0 / xmp_calibration->f;
+                }
+            }
             chunk->sensors().push_back(std::move(item.sensor));
         } else if (chunk->sensors()[item.sensor_index].serial != item.serial) {
             chunk->sensors()[item.sensor_index].serial.clear();  // mixed bodies

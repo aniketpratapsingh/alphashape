@@ -522,7 +522,7 @@ TEST_F(UpdateGuiTest, UnsafeAssetNamesAreRefusedBeforeAnyFileIsWritten) {
 TEST_F(UpdateGuiTest, PreferencesPersistAutoCheckAndChannel) {
     QSettings settings(scratch("prefs-settings.ini"), QSettings::IniFormat);
     UpdateChecker checker(settings, std::make_unique<FakeSource>());
-    PreferencesDialog dialog(checker);
+    PreferencesDialog dialog(checker, settings);
 
     ASSERT_NE(dialog.auto_check(), nullptr);
     EXPECT_TRUE(dialog.auto_check()->isChecked());
@@ -547,4 +547,21 @@ TEST_F(UpdateGuiTest, PreferencesPersistAutoCheckAndChannel) {
                      [&]() { requested = true; });
     dialog.check_now()->click();
     EXPECT_TRUE(requested);
+}
+
+TEST_F(UpdateGuiTest, PreferencesPersistLoadXmpCalibration) {
+    QSettings settings(scratch("prefs-photos-settings.ini"), QSettings::IniFormat);
+    UpdateChecker checker(settings, std::make_unique<FakeSource>());
+    PreferencesDialog dialog(checker, settings);
+
+    ASSERT_NE(dialog.load_xmp_calibration(), nullptr);
+    // Off by default: the EXIF focal length seeds the sensor unless the user
+    // opts in.
+    EXPECT_FALSE(dialog.load_xmp_calibration()->isChecked());
+    dialog.load_xmp_calibration()->setChecked(true);
+    EXPECT_TRUE(settings.value("photos/load_xmp_calibration", false).toBool());
+
+    // A fresh dialog reads the stored value back.
+    PreferencesDialog reopened(checker, settings);
+    EXPECT_TRUE(reopened.load_xmp_calibration()->isChecked());
 }

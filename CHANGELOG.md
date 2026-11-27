@@ -905,6 +905,19 @@ All notable changes to alphashape are recorded here. The format follows
   cloud and DEM of already well-calibrated blocks worse. For a DJI drone,
   loading the calibration recorded in the photos (Preferences) is the better
   fix; use `fit_intrinsics` when no good calibration is available.
+- **Add Photos' "load XMP calibration" option did nothing.** The option was
+  accepted but never applied, so a DJI Phantom 4 RTK block was seeded from the
+  EXIF 35 mm-equivalent focal length with zero lens distortion. Because the
+  alignment keeps the intrinsics fixed, the block bent by tens of metres (a
+  georeference RMS of 36.6 m on a real 214-photo block); setting the factory
+  calibration by hand brought it to 1.55 m. The option now reads the DJI
+  factory calibration from the photo's XMP (`DewarpData`: focal length,
+  principal point and Brown-Conrady distortion) and seeds each sensor's initial
+  calibration from it, once per sensor. When the camera already undistorted the
+  JPEG (`DewarpFlag=1`) only the focal length and principal point are used. The
+  option is off by default and is exposed as a checkbox in Preferences; the
+  EXIF focal length still seeds a sensor when it is off or the photo carries no
+  calibration.
 - **Straight colour steps along block boundaries in a large orthomosaic.** A
   block decided the seam in its overlap margin and then discarded that decision,
   so the next block re-optimised the overlap and could switch camera exactly on
