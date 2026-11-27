@@ -461,13 +461,14 @@ void AddPhotosTask::declare_params(Params& params) const {
     params.declare({"load_xmp_orientation", ParamType::Bool, false,
                     "Store the XMP gimbal (or flight) yaw/pitch/roll as the camera "
                     "reference orientation."});
-    params.declare({"load_xmp_calibration", ParamType::Bool, false,
+    params.declare({"load_xmp_calibration", ParamType::Bool, true,
                     "Seed each sensor's initial calibration from the DJI factory lens "
                     "calibration in the photo's XMP (DewarpData: focal length, principal "
                     "point and Brown-Conrady distortion). When the camera already "
                     "undistorted the JPEG (DewarpFlag=1) only the focal length and "
                     "principal point are used. Photos of one sensor share the first "
-                    "photo's values."});
+                    "photo's values. On by default; a photo without that XMP keeps the "
+                    "EXIF-seeded calibration."});
     params.declare({"group_by_folder", ParamType::Bool, false,
                     "Create one camera group per source directory, labelled with the "
                     "directory name and typed as a folder group."});

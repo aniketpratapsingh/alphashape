@@ -47,8 +47,10 @@
 // Photos of one sensor share the first photo's values; a disagreement keeps the
 // first and logs a warning. `DewarpFlag=1` (the camera already undistorted the
 // JPEG) keeps the focal length and principal point but zeroes the distortion.
-// The option is off by default, so a non-DJI photo and a DJI photo imported
-// without it keep the EXIF-seeded calibration above.
+// The option is on by default: a DJI factory calibration is a far better seed
+// than a focal length with zero distortion, and a strong-distortion lens seeded
+// without it bends the aligned block. A photo without that XMP, or a DJI photo
+// imported with the option off, keeps the EXIF-seeded calibration above.
 //
 // ---------------------------------------------------------------------------
 // Undo

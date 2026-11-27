@@ -80,6 +80,14 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Changed
 
+- **Add Photos now loads the DJI factory lens calibration by default.** The
+  "load XMP calibration" option (Preferences, and the AddPhotos
+  `load_xmp_calibration` parameter) is now on unless turned off. A DJI photo's
+  `DewarpData` seeds its sensor with the factory focal length, principal point
+  and distortion instead of the EXIF focal length with zero distortion, which
+  bent a strong-distortion block by tens of metres. Photos without that XMP are
+  unaffected. A user who already saved the Preferences option keeps their
+  choice.
 - **The ground-control accuracy gate reads the shipped configuration.** The
   real-block leave-one-out check now gates on `camera_rtk_engine_defaults`:
   camera RTK references plus the surveyed GCPs with the lens model left to
@@ -915,8 +923,8 @@ All notable changes to alphashape are recorded here. The format follows
   are registered, with guards that revert a diverging lens. It is off by
   default: on the quality benches, refining during alignment made the dense
   cloud and DEM of already well-calibrated blocks worse. For a DJI drone,
-  loading the calibration recorded in the photos (Preferences) is the better
-  fix; use `fit_intrinsics` when no good calibration is available.
+  loading the calibration recorded in the photos (now the default) is the
+  better fix; use `fit_intrinsics` when no good calibration is available.
 - **Add Photos' "load XMP calibration" option did nothing.** The option was
   accepted but never applied, so a DJI Phantom 4 RTK block was seeded from the
   EXIF 35 mm-equivalent focal length with zero lens distortion. Because the
@@ -927,9 +935,9 @@ All notable changes to alphashape are recorded here. The format follows
   principal point and Brown-Conrady distortion) and seeds each sensor's initial
   calibration from it, once per sensor. When the camera already undistorted the
   JPEG (`DewarpFlag=1`) only the focal length and principal point are used. The
-  option is off by default and is exposed as a checkbox in Preferences; the
-  EXIF focal length still seeds a sensor when it is off or the photo carries no
-  calibration.
+  option is on by default (see Changed) and is exposed as a checkbox in
+  Preferences; the EXIF focal length still seeds a sensor when it is off or the
+  photo carries no calibration.
 - **Straight colour steps along block boundaries in a large orthomosaic.** A
   block decided the seam in its overlap margin and then discarded that decision,
   so the next block re-optimised the overlap and could switch camera exactly on

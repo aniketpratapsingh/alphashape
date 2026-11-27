@@ -555,13 +555,13 @@ TEST_F(UpdateGuiTest, PreferencesPersistLoadXmpCalibration) {
     PreferencesDialog dialog(checker, settings);
 
     ASSERT_NE(dialog.load_xmp_calibration(), nullptr);
-    // Off by default: the EXIF focal length seeds the sensor unless the user
-    // opts in.
-    EXPECT_FALSE(dialog.load_xmp_calibration()->isChecked());
-    dialog.load_xmp_calibration()->setChecked(true);
-    EXPECT_TRUE(settings.value("photos/load_xmp_calibration", false).toBool());
+    // On by default: the DJI factory calibration seeds the sensor unless the
+    // user opts out.
+    EXPECT_TRUE(dialog.load_xmp_calibration()->isChecked());
+    dialog.load_xmp_calibration()->setChecked(false);
+    EXPECT_FALSE(settings.value("photos/load_xmp_calibration", true).toBool());
 
     // A fresh dialog reads the stored value back.
     PreferencesDialog reopened(checker, settings);
-    EXPECT_TRUE(reopened.load_xmp_calibration()->isChecked());
+    EXPECT_FALSE(reopened.load_xmp_calibration()->isChecked());
 }

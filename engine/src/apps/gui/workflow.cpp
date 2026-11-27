@@ -453,11 +453,11 @@ bool WorkflowController::run(const std::string& task) {
             Params values = make_params(builtin_registry().require(task));
             values.set("filenames", ParamValue(std::move(names)));
             // The Add Photos import options live in Preferences; the schema
-            // default (off) applies when the user has never set them.
+            // default (on) applies when the user has never set them.
             values.set("load_xmp_calibration",
                        ParamValue{app_.settings()
                                       .value(QStringLiteral("photos/load_xmp_calibration"),
-                                             false)
+                                             true)
                                       .toBool()});
             params = std::move(values);
         } else if (params_handler_) {
