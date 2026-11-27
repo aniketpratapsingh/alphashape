@@ -83,13 +83,14 @@ struct BuilderOptions {
     std::size_t global_ba_every = 1;
     std::uint64_t seed = 0x5eed;
 
-    /// Self-calibration during the global bundle adjustments. When true (the
-    /// default) the builder refines each sensor's focal length, principal point
-    /// and low-order radial/tangential distortion once enough of that sensor's
-    /// cameras are registered; see the schedule in structure_builder.cpp. When
-    /// false every intrinsic stays at its input value, the pre-self-calibration
-    /// behaviour.
-    bool fit_intrinsics = true;
+    /// Self-calibration during the global bundle adjustments. When true the
+    /// builder refines each sensor's focal length, principal point and
+    /// low-order radial/tangential distortion once enough of that sensor's
+    /// cameras are registered; see the schedule in structure_builder.cpp. Off by
+    /// default: on the quality benches (a calibrated aerial block, a terrestrial
+    /// block) refining during alignment made the dense products measurably
+    /// worse, so it is an opt-in for an input calibration known to be wrong.
+    bool fit_intrinsics = false;
     /// Minimum number of registered cameras of one sensor before its intrinsics
     /// are freed at all. Below this the sensor's calibration is held fixed, so a
     /// handful of views cannot drag the lens off its EXIF seed. Ten is the low

@@ -751,8 +751,8 @@ TEST(AlignCamerasGeo, ContinueOnGeoreferencedChunkIsStable) {
 //
 // The calgrid fixture is a 12-view calibration network whose true lens is
 // f = 500, k1 = -0.08, k2 = 0.02, cx = 3, cy = -2, while the EXIF seed is
-// f = 475 with zero distortion. Twelve cameras clear the default
-// min_cameras_for_intrinsics (10), so AlignCameras refines the lens and writes
+// f = 475 with zero distortion. With fit_intrinsics on, twelve cameras clear the
+// default min_cameras_for_intrinsics (10), so AlignCameras refines the lens and writes
 // it back to the sensor's ADJUSTED calibration. This is the end-to-end proof
 // that the fix reaches the chunk, not just the builder.
 
@@ -762,7 +762,9 @@ TEST(AlignCamerasSelfCalibration, RefinesAndWritesBackTheLens) {
     const Calibration seed = document.active_chunk()->sensors()[0].calibration;
     ASSERT_NEAR(seed.f, 475.0, 1e-9) << "the fixture's EXIF must start f at 475";
 
-    run_align_cameras(document);
+    Params params = make_params(builtin_registry().require("AlignCameras"));
+    params.set("fit_intrinsics", true);
+    run_task(builtin_registry(), document, "AlignCameras", params);
     const Chunk& chunk = *document.active_chunk();
     ASSERT_EQ(chunk.cameras().size(), 12U);
     for (const Camera& camera : chunk.cameras()) {
@@ -784,16 +786,16 @@ TEST(AlignCamerasSelfCalibration, RefinesAndWritesBackTheLens) {
 }
 
 // ---------------------------------------------------------------------------
-// 13. fit_intrinsics=false keeps the seed lens
+// 13. By default (fit_intrinsics off) the seed lens is kept
 // ---------------------------------------------------------------------------
 
-TEST(AlignCamerasSelfCalibration, FitIntrinsicsFalseKeepsSeedLens) {
+TEST(AlignCamerasSelfCalibration, DefaultKeepsSeedLens) {
     Document document = make_document(calgrid_files());
     run_match_photos(document);
     const Calibration seed = document.active_chunk()->sensors()[0].calibration;
 
     Params params = make_params(builtin_registry().require("AlignCameras"));
-    params.set("fit_intrinsics", false);
+    ASSERT_FALSE(params.get_bool("fit_intrinsics")) << "self-calibration must be opt-in";
     run_task(builtin_registry(), document, "AlignCameras", params);
 
     const Calibration& cal = document.active_chunk()->sensors()[0].calibration;

@@ -751,6 +751,7 @@ TEST(StructureBuilder, SelfCalibrationRecoversLensOnNadirBlock) {
     // far before the lens is corrected, which is the regime the real fix targets.
     const GtScene scene = make_nadir_block(101, 0.2, /*grid=*/5, /*n_points=*/300);
     BuilderOptions options;
+    options.fit_intrinsics = true;
     options.min_cameras_for_intrinsics = 8;
     options.full_intrinsics_cameras = 10;
 
@@ -795,6 +796,7 @@ TEST(StructureBuilder, SelfCalibrationRespectsFixedParams) {
     }
     scene.input.sensors.push_back(BuilderSensor{0, {"f"}});
     BuilderOptions options;
+    options.fit_intrinsics = true;
     options.min_cameras_for_intrinsics = 8;
     options.full_intrinsics_cameras = 1000;  // only f and k1 free
 

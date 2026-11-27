@@ -69,10 +69,12 @@ sfm::AbsolutePose transform_to_pose(const Transform& transform) {
 void AlignCamerasTask::declare_params(Params& params) const {
     params.declare({"reset_alignment", ParamType::Bool, false,
                     "Discard the existing alignment and realign every camera from scratch."});
-    params.declare({"fit_intrinsics", ParamType::Bool, true,
+    params.declare({"fit_intrinsics", ParamType::Bool, false,
                     "Refine each sensor's focal length, principal point and lens distortion "
-                    "during alignment (self-calibration). Turn off to keep the input "
-                    "calibration fixed."});
+                    "during alignment (self-calibration). Use it when the input calibration "
+                    "is known to be wrong, e.g. a strong-distortion lens seeded from EXIF "
+                    "with zero distortion; otherwise keep it off and refine with Optimize "
+                    "Cameras after alignment."});
 }
 
 std::vector<Stage> AlignCamerasTask::stages() const {
