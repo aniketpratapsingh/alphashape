@@ -87,16 +87,23 @@ All notable changes to alphashape are recorded here. The format follows
   it kept only ~21 of the up to 82 cameras a block needs, and the raster block
   order changed the camera set completely at every row wrap. The run now decodes
   each JPEG at 1/2, 1/4 or 1/8 of its stored resolution (libjpeg DCT scaling)
-  when the output cell is coarser than the photograph's own ground pixel, so a
+  when the output cell is at least 4x the photograph's own ground pixel, so a
   frame costs 1/d^2 of the memory and the cache holds d^2 times as many; the
   geometry is unchanged because it is computed from the calibration, not the
-  decoded pixels. Blocks are now visited left-to-right, then right-to-left on the
-  next row, so consecutive blocks are always neighbours and the cache keeps the
-  frames the next block needs. In mosaic blending the seams can fall differently
-  from earlier versions (they are still continuous across every block border,
-  pinned against whichever neighbour was visited first); average blending is
-  unchanged. A native-resolution ortho still decodes full frames, but its mosaic
-  seams are subject to the same order change. The run logs the chosen scale
+  decoded pixels. The 4x threshold keeps a decoded pixel at most half an output
+  cell: a decoded pixel about the size of the cell is blurred twice (the DCT
+  downscale, then the rectifier's bilinear read at an arbitrary phase) and the
+  ortho softens, so a 5 cm ortho over 2.4 cm photos now decodes at full
+  resolution while a 10 cm ortho over 2.4 cm photos decodes at 1/2. Blocks are
+  now visited left-to-right, then right-to-left on the next row, so consecutive
+  blocks are always neighbours and the cache keeps the frames the next block
+  needs; within a block the frames already cached are fetched first, so the
+  decodes it pays for evict frames it is done with rather than ones it is about
+  to read. In mosaic blending the seams can fall differently from earlier
+  versions (they are still continuous across every block border, pinned against
+  whichever neighbour was visited first); average blending is unchanged. A
+  native-resolution ortho still decodes full frames, but its mosaic seams are
+  subject to the same order change. The run logs the chosen scale
   ("decoding photographs at 1/N scale").
 - **Add Photos now loads the DJI factory lens calibration by default.** The
   "load XMP calibration" option (Preferences, and the AddPhotos

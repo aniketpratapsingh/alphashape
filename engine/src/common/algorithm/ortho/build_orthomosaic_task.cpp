@@ -981,6 +981,11 @@ public:
     /// The byte capacity this cache was sized to.
     std::uint64_t budget_bytes() const { return budget_; }
 
+    /// True when `slot` is already decoded and resident. Lets a block fetch the
+    /// frames it already holds before the ones it must decode, so the decodes
+    /// do not evict frames the block is about to read (see the block loop).
+    bool contains(std::size_t slot) const { return index_.find(slot) != index_.end(); }
+
     /// Mark `slot` most-recently-used when it is already cached, so the frames a
     /// following block will need survive the decodes this one does not share.
     /// A miss stays a miss: touching must not decode anything early, or a
@@ -1822,10 +1827,15 @@ int choose_decode_denominator(double cell_metres, double finest_ground_pixel) {
         !std::isfinite(finest_ground_pixel)) {
         return 1;
     }
+    // Keep a 2x margin: a decoded pixel is at most HALF an output cell. A
+    // decoded pixel about the size of the cell is blurred twice (the DCT
+    // downscale, then the rectifier's bilinear read at an arbitrary phase), so
+    // the ortho softens; the margin leaves the bilinear read room to interpolate
+    // without losing detail.
     const double ratio = cell_metres / finest_ground_pixel;
     int denom = 1;
     for (const int candidate : {2, 4, 8}) {
-        if (static_cast<double>(candidate) <= ratio) {
+        if (2.0 * static_cast<double>(candidate) <= ratio) {
             denom = candidate;
         }
     }
@@ -2352,14 +2362,18 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     const HeightRange heights = surface_height_range(surface, surface_nodata);
 
     // -- decode scale --------------------------------------------------------
-    // When the output cell is coarser than the photographs' own ground pixel,
-    // decoding every frame at full resolution is wasted work and wasted cache:
-    // a 5 cm ortho over 2.4 cm photos needs no more than a 1/2 decode, and the
-    // cache then holds 4x as many frames. The denominator is chosen ONCE for the
-    // run from the finest ground pixel any camera resolves (see
-    // finest_ground_pixel_metres), so every frame is decoded at the same scale
-    // and the geometry (which divides by it) is uniform. A native-resolution
-    // output yields 1, leaving the default run byte-identical.
+    // When the output cell is much coarser than the photographs' own ground
+    // pixel, decoding every frame at full resolution is wasted work and wasted
+    // cache: a 10 cm ortho over 2.4 cm photos needs no more than a 1/2 decode,
+    // and the cache then holds 4x as many frames. The rule keeps a 2x margin --
+    // a decoded pixel is at most HALF an output cell -- because a decoded pixel
+    // about the size of the cell is blurred twice (the DCT downscale, then the
+    // rectifier's bilinear read at an arbitrary phase) and the ortho softens.
+    // The denominator is chosen ONCE for the run from the finest ground pixel
+    // any camera resolves (see finest_ground_pixel_metres), so every frame is
+    // decoded at the same scale and the geometry (which divides by it) is
+    // uniform. A native-resolution output yields 1, leaving the default run
+    // byte-identical.
     //
     // The height the estimate measures from is a high PERCENTILE of the valid
     // surface samples, not the single highest one: one spike (a crane, a DEM
@@ -2867,9 +2881,31 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             }
         }
 
-        std::vector<ortho::OrthoTile> tiles;
-        tiles.reserve(block_cameras.size());
+        // Decode and rectify the cameras in a "cached first" order. When a block
+        // needs more frames than the cache holds, an LRU fed a cyclic sequence
+        // larger than itself misses on every access, so consecutive blocks get
+        // almost no reuse. Fetching the frames already resident first means the
+        // decodes this block pays for evict frames that are already done with,
+        // not ones the block is about to read. The OUTPUT does not depend on
+        // this order: each tile is assigned to its camera's position k, so the
+        // label a tile carries and its place in `tiles` are exactly what they
+        // were in block_cameras order.
+        std::vector<std::size_t> fetch_order;
+        fetch_order.reserve(block_cameras.size());
         for (std::size_t k = 0; k < block_cameras.size(); ++k) {
+            if (photos.contains(block_cameras[k])) {
+                fetch_order.push_back(k);
+            }
+        }
+        for (std::size_t k = 0; k < block_cameras.size(); ++k) {
+            if (!photos.contains(block_cameras[k])) {
+                fetch_order.push_back(k);
+            }
+        }
+
+        std::vector<ortho::OrthoTile> tiles(block_cameras.size());
+        std::size_t rectified = 0;
+        for (const std::size_t k : fetch_order) {
             if (progress.is_cancelled()) {
                 throw Error("BuildOrthomosaic cancelled");
             }
@@ -2894,10 +2930,10 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                 };
                 camera.plane_centre = plane_centres[block_cameras[k]];
             }
-            tiles.push_back(ortho::orthorectify(
+            tiles[k] = ortho::orthorectify(
                 surface, surface_nodata, window, camera, static_cast<int>(k),
                 occlusion_tolerance, true, &surface_range,
-                plan.block_cells > 0 ? &cell_lattice : nullptr, support));
+                plan.block_cells > 0 ? &cell_lattice : nullptr, support);
             // Apply the camera's precomputed correction to the tile just
             // rectified, BEFORE the seam labeller reads it. The model is a
             // whole-flight constant (see estimate_camera_gains /
@@ -2908,13 +2944,14 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             // stage: a seam chosen on uncorrected colour is chosen for the
             // wrong reason.
             if (options.colour == ColourMode::Gain) {
-                ortho::apply_gain(tiles.back(), gains[block_cameras[k]]);
+                ortho::apply_gain(tiles[k], gains[block_cameras[k]]);
             } else if (options.colour == ColourMode::Affine) {
-                ortho::apply_colour(tiles.back(), colours[block_cameras[k]]);
+                ortho::apply_colour(tiles[k], colours[block_cameras[k]]);
             }
+            ++rectified;
             progress.update("rectify",
                             (static_cast<double>(block_index) +
-                             static_cast<double>(k + 1) /
+                             static_cast<double>(rectified) /
                                  static_cast<double>(block_cameras.size())) /
                                 static_cast<double>(total_blocks));
         }
