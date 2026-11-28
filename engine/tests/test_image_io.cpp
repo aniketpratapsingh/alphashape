@@ -372,6 +372,104 @@ TEST(ImageIO, CameraJpegsDecodeAtExpectedSize) {
     }
 }
 
+TEST(ImageIO, ScaledJpegDecodeHasCeilDimensions) {
+    // DCT scaling produces ceil(w/d) x ceil(h/d). The 200x150 camera fixture
+    // divides evenly by 2 and 4 but not by 8 (150/8 = 18.75 -> 19), so it pins
+    // the ceiling on the height.
+    const Image full = read_image(fixture("cam_a1.jpg"));
+    ASSERT_EQ(full.width(), 200);
+    ASSERT_EQ(full.height(), 150);
+    for (const int denom : {2, 4, 8}) {
+        const ScaledImage scaled = read_image_scaled(fixture("cam_a1.jpg"), denom);
+        EXPECT_EQ(scaled.denom, denom) << "denom " << denom;
+        EXPECT_EQ(scaled.image.width(), (200 + denom - 1) / denom) << "denom " << denom;
+        EXPECT_EQ(scaled.image.height(), (150 + denom - 1) / denom) << "denom " << denom;
+        EXPECT_EQ(scaled.image.channels(), 3) << "denom " << denom;
+    }
+}
+
+TEST(ImageIO, ScaledJpegDecodeMatchesBoxDownsample) {
+    // A DCT-scaled decode is not a box average, but on the smooth ramp fixture
+    // it must agree with one closely: the low-frequency content is what both
+    // keep. This is the property the ortho relies on -- a 1/2 decode is a fair
+    // stand-in for the full frame at half the resolution.
+    const Image full = read_image(fixture("baseline.jpg"));
+    ASSERT_EQ(full.width(), 64);
+    ASSERT_EQ(full.height(), 48);
+    constexpr int kDenom = 2;
+    const ScaledImage scaled = read_image_scaled(fixture("baseline.jpg"), kDenom);
+    ASSERT_EQ(scaled.denom, kDenom);
+    ASSERT_EQ(scaled.image.width(), 32);
+    ASSERT_EQ(scaled.image.height(), 24);
+
+    double sum_abs = 0.0;
+    int count = 0;
+    for (int oy = 0; oy < scaled.image.height(); ++oy) {
+        for (int ox = 0; ox < scaled.image.width(); ++ox) {
+            for (int c = 0; c < 3; ++c) {
+                int box = 0;
+                for (int dy = 0; dy < kDenom; ++dy) {
+                    for (int dx = 0; dx < kDenom; ++dx) {
+                        box += full.at(ox * kDenom + dx, oy * kDenom + dy, c);
+                    }
+                }
+                const double mean = static_cast<double>(box) / (kDenom * kDenom);
+                sum_abs += std::abs(static_cast<double>(scaled.image.at(ox, oy, c)) - mean);
+                ++count;
+            }
+        }
+    }
+    const double mean_abs = sum_abs / static_cast<double>(count);
+    EXPECT_LT(mean_abs, 6.0) << "1/2 DCT decode should track a box downsample on a smooth ramp";
+}
+
+TEST(ImageIO, ScaledDecodeOfNonJpegBoxDownsamples) {
+    // A PNG has no DCT scaling, so read_image_scaled decodes it in full and box
+    // downsamples. The result must be the exact box mean (no lossy step), and
+    // the reported denominator is the one applied.
+    const Image full = read_image(fixture("rgb.png"));
+    ASSERT_GT(full.width(), 4);
+    ASSERT_GT(full.height(), 4);
+    constexpr int kDenom = 2;
+    const ScaledImage scaled = read_image_scaled(fixture("rgb.png"), kDenom);
+    EXPECT_EQ(scaled.denom, kDenom);
+    EXPECT_EQ(scaled.image.channels(), full.channels());
+    EXPECT_EQ(scaled.image.width(), (full.width() + kDenom - 1) / kDenom);
+    EXPECT_EQ(scaled.image.height(), (full.height() + kDenom - 1) / kDenom);
+    for (int oy = 0; oy < scaled.image.height(); ++oy) {
+        for (int ox = 0; ox < scaled.image.width(); ++ox) {
+            for (int c = 0; c < full.channels(); ++c) {
+                int sum = 0;
+                int n = 0;
+                for (int dy = 0; dy < kDenom; ++dy) {
+                    for (int dx = 0; dx < kDenom; ++dx) {
+                        const int x = ox * kDenom + dx;
+                        const int y = oy * kDenom + dy;
+                        if (x < full.width() && y < full.height()) {
+                            sum += full.at(x, y, c);
+                            ++n;
+                        }
+                    }
+                }
+                const int expected = (sum + n / 2) / n;
+                EXPECT_EQ(static_cast<int>(scaled.image.at(ox, oy, c)), expected)
+                    << "at (" << ox << "," << oy << ") channel " << c;
+            }
+        }
+    }
+}
+
+TEST(ImageIO, ScaledDecodeClampsUnsupportedDenominator) {
+    // Only 1/2/4/8 are DCT ratios; anything else falls back to full resolution
+    // and reports denom 1, so a caller dividing by the returned value is right.
+    for (const int denom : {0, 1, 3, 5, 16, -2}) {
+        const ScaledImage scaled = read_image_scaled(fixture("baseline.jpg"), denom);
+        EXPECT_EQ(scaled.denom, 1) << "denom " << denom;
+        EXPECT_EQ(scaled.image.width(), 64) << "denom " << denom;
+        EXPECT_EQ(scaled.image.height(), 48) << "denom " << denom;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Detection by magic bytes
 // ---------------------------------------------------------------------------

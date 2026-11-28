@@ -52,6 +52,10 @@ std::vector<std::uint8_t> read_file_prefix(const std::string& path, std::size_t 
 
 ImageInfo jpeg_info(const std::uint8_t* data, std::size_t size);
 Image jpeg_decode(const std::uint8_t* data, std::size_t size);
+/// Decode at 1/`denom` of the stored resolution using libjpeg's DCT scaling.
+/// `denom` must be 1, 2, 4 or 8; any other value decodes at full resolution.
+/// The output dimensions are ceil(width/denom) x ceil(height/denom).
+Image jpeg_decode_scaled(const std::uint8_t* data, std::size_t size, int denom);
 
 ImageInfo png_info(const std::uint8_t* data, std::size_t size);
 Image png_decode(const std::uint8_t* data, std::size_t size);

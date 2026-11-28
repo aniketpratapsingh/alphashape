@@ -80,6 +80,20 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Changed
 
+- **Build Orthomosaic decodes photographs at the output's resolution and visits
+  blocks in a serpentine order.** On a 214-photo DJI block (20 MP, ~2.4 cm ground
+  pixel) at a 5 cm cell, the run took 3.3 hours and decoded every photograph
+  about 26 times: the photo cache held full-resolution frames (~60 MB each), so
+  it kept only ~21 of the up to 82 cameras a block needs, and the raster block
+  order changed the camera set completely at every row wrap. The run now decodes
+  each JPEG at 1/2, 1/4 or 1/8 of its stored resolution (libjpeg DCT scaling)
+  when the output cell is coarser than the photograph's own ground pixel, so a
+  frame costs 1/d^2 of the memory and the cache holds d^2 times as many; the
+  geometry is unchanged because it is computed from the calibration, not the
+  decoded pixels. Blocks are now visited left-to-right, then right-to-left on the
+  next row, so consecutive blocks are always neighbours and the cache keeps the
+  frames the next block needs. A native-resolution ortho is unchanged. The run
+  logs the chosen scale ("decoding photographs at 1/N scale").
 - **Add Photos now loads the DJI factory lens calibration by default.** The
   "load XMP calibration" option (Preferences, and the AddPhotos
   `load_xmp_calibration` parameter) is now on unless turned off. A DJI photo's

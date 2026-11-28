@@ -638,6 +638,87 @@ TEST(Ortho, GrazingViewIsNotColoured) {
 
 // -- 2c. the stretch is measured against the local surface normal ------------
 
+TEST(Ortho, ScaledDecodeMatchesFullDecodeOnACoarseGrid) {
+    // A photograph decoded at 1/2 (image_scale = 2) must rectify to the same
+    // product as the full frame (image_scale = 1) when the output grid is
+    // coarser than the photo pixel: the reduced decode carries the same
+    // low-frequency colour, and the geometry (footprint, valid mask) is
+    // identical because it is computed from the calibration, not the image.
+    //
+    // The fixture's 480x360 photos at 60 m / f=500 resolve ~0.12 m; a 0.5 m
+    // output cell is ~4x coarser, so a 1/2 decode loses nothing the grid can
+    // show. The valid masks must match exactly; the colours within a small MAD.
+    const Scene scene = make_scene();
+    const OrthoCamera& full_camera = scene.cameras.front();
+    const Image& full_image = scene.images.front();
+
+    // A 1/2 decode of the same frame, box-downsampled (the non-JPEG path of
+    // read_image_scaled, which is exact and needs no fixture file).
+    const int half_w = (full_image.width() + 1) / 2;
+    const int half_h = (full_image.height() + 1) / 2;
+    Image half_image(half_w, half_h, full_image.channels());
+    for (int oy = 0; oy < half_h; ++oy) {
+        for (int ox = 0; ox < half_w; ++ox) {
+            for (int c = 0; c < full_image.channels(); ++c) {
+                int sum = 0;
+                int n = 0;
+                for (int dy = 0; dy < 2; ++dy) {
+                    for (int dx = 0; dx < 2; ++dx) {
+                        const int x = ox * 2 + dx;
+                        const int y = oy * 2 + dy;
+                        if (x < full_image.width() && y < full_image.height()) {
+                            sum += full_image.at(x, y, c);
+                            ++n;
+                        }
+                    }
+                }
+                half_image.at(ox, oy, c) = static_cast<std::uint8_t>((sum + n / 2) / n);
+            }
+        }
+    }
+
+    OrthoCamera scaled_camera = full_camera;
+    scaled_camera.image = &half_image;
+    scaled_camera.image_scale = 2.0;
+
+    // A 4x-coarser output grid over the same extent.
+    RasterGrid coarse = scene.grid;
+    coarse.pixel_size_x *= 4.0;
+    coarse.pixel_size_y *= 4.0;
+    coarse.width = (scene.grid.width + 3) / 4;
+    coarse.height = (scene.grid.height + 3) / 4;
+
+    const OrthoTile full_tile =
+        orthorectify(scene.dem, scene.nodata, coarse, full_camera, 0, 0.1, /*crop=*/false);
+    const OrthoTile scaled_tile =
+        orthorectify(scene.dem, scene.nodata, coarse, scaled_camera, 0, 0.1, /*crop=*/false);
+
+    ASSERT_EQ(full_tile.width, scaled_tile.width);
+    ASSERT_EQ(full_tile.height, scaled_tile.height);
+    ASSERT_EQ(full_tile.valid.size(), scaled_tile.valid.size());
+    // The valid mask is geometry, computed from the calibration: it must be
+    // identical, not merely close.
+    EXPECT_EQ(full_tile.valid, scaled_tile.valid)
+        << "the valid mask is geometry and must not depend on the decode scale";
+
+    double sum_abs = 0.0;
+    std::size_t compared = 0;
+    for (std::size_t i = 0; i < full_tile.valid.size(); ++i) {
+        if (full_tile.valid[i] == 0) {
+            continue;
+        }
+        for (int c = 0; c < 3; ++c) {
+            sum_abs += std::abs(static_cast<double>(full_tile.rgb[i * 3 + static_cast<std::size_t>(c)]) -
+                                static_cast<double>(scaled_tile.rgb[i * 3 + static_cast<std::size_t>(c)]));
+            ++compared;
+        }
+    }
+    ASSERT_GT(compared, 0U) << "the camera must colour some cells";
+    const double mad = sum_abs / static_cast<double>(compared);
+    std::printf("[Ortho.ScaledDecode] compared=%zu mad=%.3f\n", compared, mad);
+    EXPECT_LT(mad, 4.0) << "a 1/2 decode on a 4x-coarser grid must match the full decode";
+}
+
 TEST(Ortho, SteepSurfaceIsNotColouredFromAStretchedView) {
     // The "stretched roof with moire" at a block edge is a NEAR-NADIR view
     // hitting a STEEP (or wrongly interpolated) surface at a grazing incidence.

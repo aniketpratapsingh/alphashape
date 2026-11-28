@@ -36,6 +36,7 @@
 #include <gtest/gtest.h>
 
 #include "base/platform/temp.hpp"
+#include "base/platform/memory.hpp"
 #include "base/utils/error.hpp"
 #include "base/platform/env.hpp"
 #include "base/utils/log.hpp"
@@ -3411,6 +3412,106 @@ TEST(ExportOrthomosaic, ReprojectionKeepsEveryColour) {
     std::printf("[ExportOrthomosaic.Reprojection] checked=%zu invented=%zu cells=%dx%d\n",
                 checked, invented, out.grid.width, out.grid.height);
     std::filesystem::remove(path);
+}
+
+// ---------------------------------------------------------------------------
+// Decode scale: the run decodes photographs at the output's resolution
+// ---------------------------------------------------------------------------
+
+TEST(OrthoDecodeScale, DenominatorFollowsTheOutputCell) {
+    // The rule: the largest power of two in {1,2,4,8} that the output cell can
+    // resolve, i.e. d <= cell / finest_ground_pixel. A native-resolution output
+    // (cell == the photo's own ground pixel) must stay at 1, so the default run
+    // is unchanged.
+    constexpr double kPhotoPixel = 0.024;  // 2.4 cm, the measured DJI case
+    EXPECT_EQ(ortho::choose_decode_denominator(kPhotoPixel, kPhotoPixel), 1)
+        << "native resolution must not scale";
+    EXPECT_EQ(ortho::choose_decode_denominator(0.05, kPhotoPixel), 2)
+        << "5 cm over 2.4 cm photos: 2.08x, so 1/2";
+    EXPECT_EQ(ortho::choose_decode_denominator(4.2 * kPhotoPixel, kPhotoPixel), 4)
+        << "4.2x the photo pixel: 1/4";
+    EXPECT_EQ(ortho::choose_decode_denominator(20.0 * kPhotoPixel, kPhotoPixel), 8)
+        << "20x the photo pixel: capped at 1/8";
+    // Just under a power of two must not round up.
+    EXPECT_EQ(ortho::choose_decode_denominator(1.99 * kPhotoPixel, kPhotoPixel), 1);
+    EXPECT_EQ(ortho::choose_decode_denominator(3.99 * kPhotoPixel, kPhotoPixel), 2);
+    // Non-finite or non-positive inputs are the safe answer: full resolution.
+    EXPECT_EQ(ortho::choose_decode_denominator(std::numeric_limits<double>::quiet_NaN(),
+                                               kPhotoPixel),
+              1);
+    EXPECT_EQ(ortho::choose_decode_denominator(0.05,
+                                               std::numeric_limits<double>::infinity()),
+              1);
+    EXPECT_EQ(ortho::choose_decode_denominator(0.0, kPhotoPixel), 1);
+    EXPECT_EQ(ortho::choose_decode_denominator(0.05, 0.0), 1);
+}
+
+TEST(OrthoDecodeScale, NativeResolutionRunLogsNoScaling) {
+    // A run at the photographs' own resolution must not decode scaled: the
+    // INFO line is emitted only when d > 1, and the product is the full-res one.
+    OrthoSetup& s = setup();
+    ScopedLogCapture capture;
+    const Orthomosaic ortho = run_ortho(s, block_params("average", 0.0, 0, false, false));
+    ASSERT_FALSE(ortho.empty());
+    const std::string info = capture.text(LogLevel::Info);
+    EXPECT_EQ(info.find("decoding photographs at 1/"), std::string::npos)
+        << "a native-resolution run must not scale the decode:\n"
+        << info;
+}
+
+TEST(OrthoDecodeScale, CoarseRunDecodesScaledAndLogsIt) {
+    // A 1 m ortho over the fixture's ~0.12 m photos is ~8x coarser, so the run
+    // decodes at 1/8 and says so. The product must still be produced (the
+    // geometry is unchanged; only the colour read is scaled).
+    OrthoSetup& s = setup();
+    ScopedLogCapture capture;
+    const Orthomosaic ortho = run_ortho(s, block_params("average", 1.0, 0, false, false));
+    ASSERT_FALSE(ortho.empty());
+    const std::string info = capture.text(LogLevel::Info);
+    EXPECT_NE(info.find("decoding photographs at 1/"), std::string::npos)
+        << "a coarse run must decode scaled:\n"
+        << info;
+    EXPECT_NE(info.find("finest photo ground pixel"), std::string::npos) << info;
+}
+
+TEST(OrthoDecodeScale, SerpentineOrderMatchesTheWholeGrid) {
+    // The serpentine block walk must produce the SAME product as the unblocked
+    // whole-grid run, which is order-independent: each block writes only its own
+    // interior, and the seam pinning is expressed in visit order. Average
+    // blending is per-cell, so the two must agree byte for byte. A 512-cell block
+    // splits the 960x720 grid into 2x2 blocks, the smallest layout where the row
+    // direction flips.
+    OrthoSetup& s = setup();
+    const Orthomosaic whole = run_ortho(s, block_params("average", 0.125, 0, false, false));
+    ASSERT_FALSE(whole.empty());
+    const Orthomosaic blocked = run_ortho(s, block_params("average", 0.125, 512, false, false));
+    ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
+    EXPECT_EQ(blocked.labels, whole.labels);
+    EXPECT_EQ(blocked.raster.data, whole.raster.data)
+        << "serpentine order must be byte-identical to the whole-grid product";
+}
+
+TEST(OrthoDecodeScale, MultiBlockDecodeCountStaysNearTheCameraCount) {
+    // With a cache that fits a block, the serpentine order keeps consecutive
+    // blocks' camera sets overlapping, so the number of decodes stays close to
+    // the camera count instead of one per (block, camera). The fixture has 12
+    // cameras; a 2x2 block layout must not decode more than a small multiple.
+    if (platform::memory_budget_bytes() == 0) {
+        GTEST_SKIP() << "no memory budget on this platform: the cache is one frame";
+    }
+    OrthoSetup& s = setup();
+    ScopedLogCapture capture;
+    const Orthomosaic ortho = run_ortho(s, block_params("average", 0.125, 512, false, false));
+    ASSERT_FALSE(ortho.empty());
+    const std::string info = capture.text(LogLevel::Info);
+    const std::size_t at = info.find("photographs decoded ");
+    ASSERT_NE(at, std::string::npos) << "the decode accounting line must be present:\n" << info;
+    // "photographs decoded " is 20 characters; the count follows it.
+    const std::size_t decoded = std::strtoul(info.c_str() + at + 20, nullptr, 10);
+    const std::size_t cameras = s.document.active_chunk()->cameras().size();
+    std::printf("[OrthoDecodeScale.MultiBlock] decoded=%zu cameras=%zu\n", decoded, cameras);
+    EXPECT_LE(decoded, 2 * cameras)
+        << "serpentine order should keep decodes near the camera count, not per block";
 }
 
 }  // namespace

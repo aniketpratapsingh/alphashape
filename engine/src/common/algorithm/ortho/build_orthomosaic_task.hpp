@@ -212,6 +212,14 @@ struct OrthoBlockPlan {
 /// for a non-positive block side.
 int block_margin_cells(int block_cells, int pyramid_levels);
 
+/// The decode denominator a run uses: the largest power of two in {1,2,4,8} that
+/// the output cell can resolve, i.e. d <= cell_metres / finest_ground_pixel.
+/// A native-resolution output (cell == the photo's own ground pixel) yields 1,
+/// so the default run is unchanged; a 5 cm ortho over 2.4 cm photos yields 2.
+/// Anything non-finite or non-positive yields 1 (full resolution), the safe
+/// answer. Exposed so the selection rule can be unit-tested without a flight.
+int choose_decode_denominator(double cell_metres, double finest_ground_pixel);
+
 /// The predicted peak of one block, in bytes:
 /// max(window stages + assembled output raster/labels (8 B per OUTPUT cell),
 ///     assembled-grid fill_holes)

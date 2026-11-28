@@ -126,7 +126,7 @@ ImageInfo jpeg_info(const std::uint8_t* data, std::size_t size) {
     return info;
 }
 
-Image jpeg_decode(const std::uint8_t* data, std::size_t size) {
+Image jpeg_decode_scaled(const std::uint8_t* data, std::size_t size, int denom) {
     const std::unique_ptr<JpegState> state(new JpegState());
     if (setjmp(state->err.jump) != 0) {
         throw ProjectIOError("JPEG: " + std::string(state->err.message));
@@ -136,6 +136,16 @@ Image jpeg_decode(const std::uint8_t* data, std::size_t size) {
     jpeg_decompress_struct& cinfo = state->cinfo;
     const bool grey = cinfo.jpeg_color_space == JCS_GRAYSCALE;
     cinfo.out_color_space = grey ? JCS_GRAYSCALE : JCS_RGB;
+    // DCT scaling: libjpeg decodes only the low-frequency coefficients it needs
+    // for a 1/denom image, so a 1/8 decode reads roughly 1/64 of the work of a
+    // full one. The scale must be set after the header is read and before
+    // jpeg_start_decompress, which is where libjpeg fixes the output size. Only
+    // the power-of-two ratios are guaranteed by every libjpeg build; anything
+    // else is clamped to 1 (full resolution) rather than silently mis-scaled.
+    if (denom == 2 || denom == 4 || denom == 8) {
+        cinfo.scale_num = 1;
+        cinfo.scale_denom = static_cast<unsigned int>(denom);
+    }
     jpeg_start_decompress(&cinfo);
 
     const int width = static_cast<int>(cinfo.output_width);
@@ -173,6 +183,10 @@ Image jpeg_decode(const std::uint8_t* data, std::size_t size) {
     Image result(width, height, components);
     std::memcpy(result.data(), state->pixels.data(), state->pixels.size());
     return result;
+}
+
+Image jpeg_decode(const std::uint8_t* data, std::size_t size) {
+    return jpeg_decode_scaled(data, size, 1);
 }
 
 }  // namespace alphashape::image_detail

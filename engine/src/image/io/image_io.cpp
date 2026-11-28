@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <string>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "base/utils/error.hpp"
@@ -61,6 +62,39 @@ ImageFormat detect_from_bytes(const std::vector<std::uint8_t>& bytes) {
 /// signature and the six-byte "Exif\0\0" a JPEG APP1 would start with; nothing
 /// here needs more.
 constexpr std::size_t kSignatureBytes = 8;
+
+/// Box-downsample `src` by an integer factor: each output pixel is the mean of
+/// the `denom` x `denom` source block it covers, with the last row/column of
+/// blocks clipped to the image. Output dimensions are ceil(w/denom) x
+/// ceil(h/denom), matching libjpeg's DCT-scaled size so a JPEG and a
+/// box-downsampled PNG of the same source land on the same grid.
+Image box_downsample(const Image& src, int denom) {
+    const int out_w = (src.width() + denom - 1) / denom;
+    const int out_h = (src.height() + denom - 1) / denom;
+    const int channels = src.channels();
+    Image out(out_w, out_h, channels);
+    for (int oy = 0; oy < out_h; ++oy) {
+        const int y0 = oy * denom;
+        const int y1 = std::min(src.height(), y0 + denom);
+        for (int ox = 0; ox < out_w; ++ox) {
+            const int x0 = ox * denom;
+            const int x1 = std::min(src.width(), x0 + denom);
+            const int count = (x1 - x0) * (y1 - y0);
+            for (int c = 0; c < channels; ++c) {
+                int sum = 0;
+                for (int y = y0; y < y1; ++y) {
+                    for (int x = x0; x < x1; ++x) {
+                        sum += src.at(x, y, c);
+                    }
+                }
+                // Round to nearest so the mean does not drift dark.
+                out.at(ox, oy, c) =
+                    static_cast<std::uint8_t>((sum + count / 2) / count);
+            }
+        }
+    }
+    return out;
+}
 
 }  // namespace
 
@@ -129,6 +163,43 @@ Image read_image(const std::string& path) {
             break;
     }
     throw ProjectIOError("'" + path + "': unrecognised image format");
+}
+
+ScaledImage read_image_scaled(const std::string& path, int denom) {
+    // Only the power-of-two ratios are universally supported by libjpeg's DCT
+    // scaling; anything else falls back to full resolution so the caller's
+    // geometry (which divides by the returned denom) stays correct.
+    if (denom != 2 && denom != 4 && denom != 8) {
+        denom = 1;
+    }
+    const std::vector<std::uint8_t> bytes = image_detail::read_file_bytes(path);
+    const ImageFormat format = detect_from_bytes(bytes);
+    if (format == ImageFormat::Jpeg) {
+        return ScaledImage{image_detail::jpeg_decode_scaled(bytes.data(), bytes.size(), denom),
+                           denom};
+    }
+    // Every other format decodes in full; the box downsample still shrinks the
+    // resident frame by denom^2, which is what the photo cache is bounded by.
+    // Decode from the bytes already read rather than re-opening the file.
+    Image full;
+    switch (format) {
+        case ImageFormat::Png:
+            full = image_detail::png_decode(bytes.data(), bytes.size());
+            break;
+        case ImageFormat::Tiff:
+            full = image_detail::tiff_decode(path);
+            break;
+        case ImageFormat::Pnm:
+            full = read_pnm(path);
+            break;
+        case ImageFormat::Jpeg:
+        case ImageFormat::Unknown:
+            throw ProjectIOError("'" + path + "': unrecognised image format");
+    }
+    if (denom == 1) {
+        return ScaledImage{std::move(full), 1};
+    }
+    return ScaledImage{box_downsample(full, denom), denom};
 }
 
 std::vector<std::uint8_t> encode_png(const Image& image) {
