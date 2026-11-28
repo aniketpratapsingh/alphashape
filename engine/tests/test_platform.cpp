@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -35,6 +36,7 @@
 #include "base/platform/console.hpp"
 #include "base/platform/dynamic_library.hpp"
 #include "base/platform/env.hpp"
+#include "base/platform/memory.hpp"
 #include "base/platform/paths.hpp"
 #include "base/platform/process.hpp"
 #include "base/platform/temp.hpp"
@@ -665,6 +667,87 @@ TEST(Platform, ModulePathOfAnAddressInThisImage) {
 
     // A null anchor is a caller bug, not a crash.
     EXPECT_EQ(plat::module_path(nullptr), "");
+}
+
+// ---------------------------------------------------------------------------
+// Memory introspection
+// ---------------------------------------------------------------------------
+
+TEST(Platform, AvailablePhysicalMemoryIsPlausible) {
+    // Every CI platform can report it, and it can never exceed the machine's
+    // total. A busy runner may report very little, so only the bounds are
+    // asserted, not a fraction.
+    const std::uint64_t total = plat::total_physical_memory_bytes();
+    const std::uint64_t available = plat::available_physical_memory_bytes();
+    ASSERT_GT(total, 0U) << "the platform cannot report total physical memory";
+    EXPECT_GT(available, 0U) << "the platform cannot report available physical memory";
+    EXPECT_LE(available, total) << "available " << available << " > total " << total;
+}
+
+TEST(Platform, CurrentResidentSetIsBelowThePeak) {
+    // The current RSS is a real figure and can never exceed the process-wide
+    // high-water mark. Equality is allowed: a process that has only grown since
+    // start has current == peak.
+    const std::uint64_t current = plat::current_resident_set_bytes();
+    const std::uint64_t peak = plat::peak_resident_set_bytes();
+    ASSERT_GT(current, 0U) << "the platform cannot report the resident set size";
+    ASSERT_GT(peak, 0U) << "the platform cannot report the peak resident set size";
+    EXPECT_LE(current, peak) << "current " << current << " > peak " << peak;
+}
+
+TEST(Platform, MemoryBudgetWithoutOverrideStaysWithinTheDocumentedBounds) {
+    // With no override the budget is at most 60 % of total and at least the
+    // documented floor. The environment is restored afterwards so a later test
+    // sees the same machine.
+    const std::string previous = plat::get_env("ALPHASHAPE_MEMORY_BUDGET_MB");
+    plat::set_env("ALPHASHAPE_MEMORY_BUDGET_MB", "");
+    const std::uint64_t total = plat::total_physical_memory_bytes();
+    const std::uint64_t budget = plat::memory_budget_bytes();
+    plat::set_env("ALPHASHAPE_MEMORY_BUDGET_MB", previous);
+
+    ASSERT_GT(total, 0U);
+    const std::uint64_t ceiling =
+        static_cast<std::uint64_t>(static_cast<double>(total) * plat::kTaskMemoryBudgetFraction);
+    EXPECT_LE(budget, ceiling) << "budget " << budget << " > 60 % of total " << ceiling;
+    EXPECT_GE(budget, plat::memory_budget_floor_bytes(total))
+        << "budget " << budget << " is below the documented floor";
+}
+
+TEST(Platform, MemoryBudgetOverrideWinsExactly) {
+    const std::string previous = plat::get_env("ALPHASHAPE_MEMORY_BUDGET_MB");
+    plat::set_env("ALPHASHAPE_MEMORY_BUDGET_MB", "1234");
+    EXPECT_EQ(plat::memory_budget_bytes(), 1234ULL * 1024ULL * 1024ULL);
+    plat::set_env("ALPHASHAPE_MEMORY_BUDGET_MB", previous);
+}
+
+TEST(Platform, CombineMemoryBudgetRules) {
+    constexpr std::uint64_t kGib = 1024ULL * 1024ULL * 1024ULL;
+    constexpr std::uint64_t kTotal = 16ULL * kGib;
+
+    // Nothing known: no limit.
+    EXPECT_EQ(plat::combine_memory_budget(0, 0, 0), 0U);
+
+    // Availability unknown: the old rule, 60 % of total.
+    EXPECT_EQ(plat::combine_memory_budget(kTotal, 0, 0),
+              static_cast<std::uint64_t>(0.60 * static_cast<double>(kTotal)));
+
+    // Plenty available: still capped by 60 % of total.
+    EXPECT_EQ(plat::combine_memory_budget(kTotal, 15ULL * kGib, 1ULL * kGib),
+              static_cast<std::uint64_t>(0.60 * static_cast<double>(kTotal)));
+
+    // A busy machine: 0.85 x (3 GiB free + 1 GiB own) = 3.4 GiB.
+    EXPECT_EQ(plat::combine_memory_budget(kTotal, 3ULL * kGib, 1ULL * kGib),
+              static_cast<std::uint64_t>(0.85 * static_cast<double>(4ULL * kGib)));
+
+    // Very busy: the floor, min(1 GiB, 0.6 x total) = 1 GiB.
+    EXPECT_EQ(plat::combine_memory_budget(kTotal, kGib / 10ULL, 0U),
+              plat::memory_budget_floor_bytes(kTotal));
+    EXPECT_EQ(plat::memory_budget_floor_bytes(kTotal), kGib);
+
+    // A small machine's floor is 60 % of its total, not a whole GiB.
+    constexpr std::uint64_t kSmall = kGib / 2ULL;
+    EXPECT_EQ(plat::memory_budget_floor_bytes(kSmall),
+              static_cast<std::uint64_t>(0.60 * static_cast<double>(kSmall)));
 }
 
 }  // namespace

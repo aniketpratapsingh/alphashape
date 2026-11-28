@@ -658,8 +658,8 @@ void require_output_fits(const RasterGrid& target, int channels, std::size_t byt
                          std::to_string(target.width) + "x" +
                          std::to_string(target.height) + " cells = " +
                          platform::format_gb(static_cast<double>(bytes)) +
-                         ", which does not fit this machine's budget of " +
-                         platform::format_gb(static_cast<double>(budget)) +
+                         ", which does not fit this machine's " +
+                         platform::describe_memory_budget() +
                          "; choose a coarser resolution");
     }
 }
