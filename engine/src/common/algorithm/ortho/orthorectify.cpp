@@ -629,8 +629,12 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
     const Image& image = *camera.image;
     // The sensor frame is the FULL-resolution size; the decoded image may be a
     // reduced decode (image_scale > 1), so its own dimensions are not the sensor
-    // size. Every geometric test below uses iw/ih.
-    const auto [iw, ih] = sensor_dimensions(camera);
+    // size. Every geometric test below uses iw/ih. Plain doubles, not a
+    // structured binding: the OpenMP loop below captures them, and Clang does
+    // not yet allow capturing a structured binding.
+    const std::pair<double, double> sensor = sensor_dimensions(camera);
+    const double iw = sensor.first;
+    const double ih = sensor.second;
     const double max_height =
         surface_range != nullptr ? surface_range->highest : dem_max(dem, dem_nodata);
 
