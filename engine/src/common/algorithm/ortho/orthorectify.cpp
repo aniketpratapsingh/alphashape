@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace alphashape::ortho {
@@ -159,14 +160,38 @@ bool cell_supported(const std::vector<std::uint8_t>& support, const RasterGrid& 
 /// mask (or no OrthoSupport at all) reads "every valid cell supported".
 const std::vector<std::uint8_t> kEmptySupport;
 
+/// The camera's FULL-resolution sensor dimensions. The calibration carries them
+/// and is authoritative; a camera whose calibration lacks them (width/height 0)
+/// falls back to the decoded image's own size times image_scale, which is the
+/// same frame. Returns (0, 0) when neither is known.
+std::pair<double, double> sensor_dimensions(const OrthoCamera& camera) {
+    if (camera.calibration.width > 0 && camera.calibration.height > 0) {
+        return {static_cast<double>(camera.calibration.width),
+                static_cast<double>(camera.calibration.height)};
+    }
+    if (camera.image != nullptr && !camera.image->empty()) {
+        const double scale = camera.image_scale > 0.0 ? camera.image_scale : 1.0;
+        return {static_cast<double>(camera.image->width()) * scale,
+                static_cast<double>(camera.image->height()) * scale};
+    }
+    return {0.0, 0.0};
+}
+
 /// Bilinear colour sample of an 8-bit 1- or 3-channel image at continuous pixel
 /// coordinates (0.5, 0.5) = centre of the top-left pixel. Edges clamp.
-void sample_rgb(const Image& image, double u, double v, std::uint8_t out[3]) {
+///
+/// `scale` is full-resolution pixels per decoded pixel (OrthoCamera::image_scale):
+/// the coordinates are in the FULL-resolution sensor frame, so they are divided
+/// by it before the read. With the 0.5 = centre convention that division is
+/// exact: a full-resolution coordinate u maps to the decoded coordinate u/scale,
+/// because decoded pixel j (the mean of full-resolution pixels [j*scale,
+/// (j+1)*scale)) has its centre at full-resolution u = (j + 0.5) * scale.
+void sample_rgb(const Image& image, double u, double v, double scale, std::uint8_t out[3]) {
     const int w = image.width();
     const int h = image.height();
     const int ch = image.channels();
-    const double xc = u - 0.5;
-    const double yc = v - 0.5;
+    const double xc = u / scale - 0.5;
+    const double yc = v / scale - 0.5;
     const int x0 = static_cast<int>(std::floor(xc));
     const int y0 = static_cast<int>(std::floor(yc));
     const double fx = xc - static_cast<double>(x0);
@@ -270,8 +295,8 @@ void reset_occlusion_sample_count() {
     g_occlusion_samples.store(0, std::memory_order_relaxed);
 }
 
-void SurfaceSample::sample_colour(const Image& image, std::uint8_t out[3]) const {
-    sample_rgb(image, u, v, out);
+void SurfaceSample::sample_colour(const Image& image, double scale, std::uint8_t out[3]) const {
+    sample_rgb(image, u, v, scale, out);
 }
 
 bool project_surface_point(const GeoRaster<float>& dem, float dem_nodata,
@@ -281,17 +306,11 @@ bool project_surface_point(const GeoRaster<float>& dem, float dem_nodata,
     if (dem.empty()) {
         return false;
     }
-    // The pixel is bounded by the IMAGE when one is attached and by the
-    // calibration's sensor dimensions otherwise. A caller that only needs the
-    // geometry (the colour-model sampler does, before it decides whether to
-    // decode anything) therefore does not have to decode a photograph to ask
-    // "would this camera see this point?".
-    const double iw = camera.image != nullptr && !camera.image->empty()
-                          ? static_cast<double>(camera.image->width())
-                          : static_cast<double>(camera.calibration.width);
-    const double ih = camera.image != nullptr && !camera.image->empty()
-                          ? static_cast<double>(camera.image->height())
-                          : static_cast<double>(camera.calibration.height);
+    // The pixel is bounded by the FULL-resolution sensor dimensions, which the
+    // calibration carries. The decoded photograph may be a reduced
+    // (1/image_scale) decode, so its own width()/height() are NOT the sensor
+    // size; the geometry must stay in full-resolution coordinates.
+    const auto [iw, ih] = sensor_dimensions(camera);
     if (!(iw > 0.0) || !(ih > 0.0)) {
         return false;
     }
@@ -384,16 +403,14 @@ TileBounds camera_footprint_bounds(
     full.y0 = 0;
     full.width = out_grid.width;
     full.height = out_grid.height;
-    // The sensor geometry comes from the decoded photograph when there is one;
-    // the calibration carries the same dimensions, so a caller estimating the
-    // footprint before decoding (the memory guard) can pass a camera with no
-    // image and still get a bound.
-    const int image_width = camera.image != nullptr && !camera.image->empty()
-                                ? camera.image->width()
-                                : camera.calibration.width;
-    const int image_height = camera.image != nullptr && !camera.image->empty()
-                                 ? camera.image->height()
-                                 : camera.calibration.height;
+    // The sensor geometry is the FULL-resolution frame, taken from the
+    // calibration (or the decoded image times image_scale when the calibration
+    // lacks it). The decoded photograph may be a reduced decode (image_scale >
+    // 1), so its own width()/height() are not the sensor size; the footprint
+    // must be bounded in full-resolution coordinates.
+    const auto [image_width_d, image_height_d] = sensor_dimensions(camera);
+    const int image_width = static_cast<int>(std::lround(image_width_d));
+    const int image_height = static_cast<int>(std::lround(image_height_d));
     if (image_width <= 0 || image_height <= 0 || out_grid.width <= 0 ||
         out_grid.height <= 0 || !(highest_height >= lowest_height)) {
         return full;
@@ -610,8 +627,14 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
     double params[kCalibrationParamCount];
     calibration_params(camera.calibration, params);
     const Image& image = *camera.image;
-    const double iw = static_cast<double>(image.width());
-    const double ih = static_cast<double>(image.height());
+    // The sensor frame is the FULL-resolution size; the decoded image may be a
+    // reduced decode (image_scale > 1), so its own dimensions are not the sensor
+    // size. Every geometric test below uses iw/ih. Plain doubles, not a
+    // structured binding: the OpenMP loop below captures them, and Clang does
+    // not yet allow capturing a structured binding.
+    const std::pair<double, double> sensor = sensor_dimensions(camera);
+    const double iw = sensor.first;
+    const double ih = sensor.second;
     const double max_height =
         surface_range != nullptr ? surface_range->highest : dem_max(dem, dem_nodata);
 
@@ -641,7 +664,7 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
     const double step =
         0.5 * std::max(dem.grid.pixel_size_x, dem.grid.pixel_size_y) *
         (metric_march ? std::max(mx, my) : 1.0);
-    const double min_dim = static_cast<double>(std::min(image.width(), image.height()));
+    const double min_dim = std::min(iw, ih);
     const double taper_span = 0.1 * min_dim;
     const double epsilon = 1e-6;
 
@@ -793,7 +816,7 @@ OrthoTile orthorectify(const GeoRaster<float>& dem, float dem_nodata,
 
             // -- colour -----------------------------------------------------
             std::uint8_t rgb[3];
-            sample_rgb(image, u, v, rgb);
+            sample_rgb(image, u, v, camera.image_scale, rgb);
             const std::size_t cell =
                 static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
                 static_cast<std::size_t>(col);

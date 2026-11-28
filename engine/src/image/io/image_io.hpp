@@ -71,6 +71,27 @@ ImageInfo read_image_info(const std::string& path);
 /// Full decode, honouring the contract documented at the top of this file.
 Image read_image(const std::string& path);
 
+/// A decode at reduced resolution, plus the denominator actually applied.
+struct ScaledImage {
+    Image image;
+    /// Full-resolution pixels per decoded pixel: 1 means the image is at full
+    /// resolution. The caller divides full-resolution coordinates by this to
+    /// reach the decoded pixel grid.
+    int denom = 1;
+};
+
+/// Decode `path` at 1/`denom` of its stored resolution, for a caller whose
+/// output is coarser than the photograph and does not need every pixel.
+///
+/// JPEG uses libjpeg's DCT scaling, so a 1/8 decode reads roughly 1/64 of the
+/// coefficients and is proportionally cheaper. Every other format is decoded
+/// in full and box-downsampled by `denom` (the decode cost is unchanged, but
+/// the resident frame is 1/denom^2 of the bytes). `denom` is clamped to the
+/// power-of-two set {1, 2, 4, 8}; the returned `denom` is the one applied, so
+/// a caller that asked for an unsupported ratio learns the real scale. The
+/// decoded dimensions are ceil(width/denom) x ceil(height/denom).
+ScaledImage read_image_scaled(const std::string& path, int denom);
+
 /// ---------------------------------------------------------------------------
 /// Encode contract
 /// ---------------------------------------------------------------------------

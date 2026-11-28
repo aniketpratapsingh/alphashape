@@ -36,6 +36,7 @@
 #include <gtest/gtest.h>
 
 #include "base/platform/temp.hpp"
+#include "base/platform/memory.hpp"
 #include "base/utils/error.hpp"
 #include "base/platform/env.hpp"
 #include "base/utils/log.hpp"
@@ -3411,6 +3412,169 @@ TEST(ExportOrthomosaic, ReprojectionKeepsEveryColour) {
     std::printf("[ExportOrthomosaic.Reprojection] checked=%zu invented=%zu cells=%dx%d\n",
                 checked, invented, out.grid.width, out.grid.height);
     std::filesystem::remove(path);
+}
+
+// ---------------------------------------------------------------------------
+// Decode scale: the run decodes photographs at the output's resolution
+// ---------------------------------------------------------------------------
+
+TEST(OrthoDecodeScale, DenominatorFollowsTheOutputCell) {
+    // The rule: the largest power of two in {1,2,4,8} that keeps a decoded pixel
+    // at most a QUARTER of an output cell, i.e. 4 * d <= cell / finest_ground_pixel.
+    // The margin stops the DCT downscale and the rectifier's bilinear read from
+    // blurring the ortho twice; the quality benchmark showed a measurable
+    // softening even at a half-cell pixel, so the margin is a quarter cell. A
+    // native-resolution output (cell == the photo's own ground pixel) must stay
+    // at 1, so the default run is unchanged.
+    constexpr double kPhotoPixel = 0.024;  // 2.4 cm, the measured DJI case
+    EXPECT_EQ(ortho::choose_decode_denominator(kPhotoPixel, kPhotoPixel), 1)
+        << "native resolution must not scale";
+    EXPECT_EQ(ortho::choose_decode_denominator(2.08 * kPhotoPixel, kPhotoPixel), 1)
+        << "2.08x the photo pixel: a 1/2 decode would leave a pixel at half a "
+           "cell, but the margin needs 4x, so no scaling";
+    EXPECT_EQ(ortho::choose_decode_denominator(4.2 * kPhotoPixel, kPhotoPixel), 1)
+        << "4.2x the photo pixel: still under the 4x margin, so no scaling";
+    EXPECT_EQ(ortho::choose_decode_denominator(8.5 * kPhotoPixel, kPhotoPixel), 2)
+        << "8.5x the photo pixel: 1/2";
+    EXPECT_EQ(ortho::choose_decode_denominator(17.0 * kPhotoPixel, kPhotoPixel), 4)
+        << "17x the photo pixel: 1/4";
+    EXPECT_EQ(ortho::choose_decode_denominator(40.0 * kPhotoPixel, kPhotoPixel), 8)
+        << "40x the photo pixel: capped at 1/8";
+    // Just under the margin must not round up.
+    EXPECT_EQ(ortho::choose_decode_denominator(7.99 * kPhotoPixel, kPhotoPixel), 1);
+    EXPECT_EQ(ortho::choose_decode_denominator(15.99 * kPhotoPixel, kPhotoPixel), 2);
+    // Non-finite or non-positive inputs are the safe answer: full resolution.
+    EXPECT_EQ(ortho::choose_decode_denominator(std::numeric_limits<double>::quiet_NaN(),
+                                               kPhotoPixel),
+              1);
+    EXPECT_EQ(ortho::choose_decode_denominator(0.05,
+                                               std::numeric_limits<double>::infinity()),
+              1);
+    EXPECT_EQ(ortho::choose_decode_denominator(0.0, kPhotoPixel), 1);
+    EXPECT_EQ(ortho::choose_decode_denominator(0.05, 0.0), 1);
+}
+
+TEST(OrthoDecodeScale, SurfaceHeightPercentileIgnoresASingleSpike) {
+    // The decode-scale estimate measures from a high percentile of the valid
+    // surface samples, not the single highest one: one spike (a crane, a DEM
+    // noise outlier) must not drag the "finest ground pixel" down and silently
+    // disable the scaled decode for the whole run.
+    GeoRaster<float> surface;
+    surface.grid.width = 100;
+    surface.grid.height = 100;
+    surface.grid.pixel_size_x = 1.0;
+    surface.grid.pixel_size_y = 1.0;
+    surface.data.assign(100 * 100, 10.0f);
+    surface.data[0] = 60.0f;  // one spike
+    constexpr float kNodata = -9999.0f;
+    const double p99 = ortho::surface_height_percentile(surface, kNodata, 0.99);
+    EXPECT_DOUBLE_EQ(p99, 10.0)
+        << "one spike in 10,000 samples must not move the 99th percentile";
+    // The single highest sample is still 60, which is what the old code used.
+    EXPECT_FLOAT_EQ(*std::max_element(surface.data.begin(), surface.data.end()), 60.0f);
+}
+
+TEST(OrthoDecodeScale, SurfaceHeightPercentileSkipsNodataAndNaN) {
+    // Nodata and NaN samples are skipped, so a surface that is mostly nodata
+    // still reports the percentile of its valid samples.
+    GeoRaster<float> surface;
+    surface.grid.width = 10;
+    surface.grid.height = 10;
+    surface.grid.pixel_size_x = 1.0;
+    surface.grid.pixel_size_y = 1.0;
+    constexpr float kNodata = -9999.0f;
+    surface.data.assign(100, kNodata);
+    surface.data[0] = std::numeric_limits<float>::quiet_NaN();
+    for (int i = 1; i <= 10; ++i) {
+        surface.data[static_cast<std::size_t>(i)] = 5.0f;
+    }
+    EXPECT_DOUBLE_EQ(ortho::surface_height_percentile(surface, kNodata, 0.99), 5.0);
+}
+
+TEST(OrthoDecodeScale, SurfaceHeightPercentileIsNaNWhenAllNodata) {
+    // No valid sample: the percentile is NaN, and the caller then falls back to
+    // the surface's highest sample (or to "no scaling" when that is invalid too).
+    GeoRaster<float> surface;
+    surface.grid.width = 4;
+    surface.grid.height = 4;
+    surface.grid.pixel_size_x = 1.0;
+    surface.grid.pixel_size_y = 1.0;
+    constexpr float kNodata = -9999.0f;
+    surface.data.assign(16, kNodata);
+    surface.data[3] = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_TRUE(std::isnan(ortho::surface_height_percentile(surface, kNodata, 0.99)));
+}
+
+TEST(OrthoDecodeScale, NativeResolutionRunLogsNoScaling) {
+    // A run at the photographs' own resolution must not decode scaled: the
+    // INFO line is emitted only when d > 1, and the product is the full-res one.
+    OrthoSetup& s = setup();
+    ScopedLogCapture capture;
+    const Orthomosaic ortho = run_ortho(s, block_params("average", 0.0, 0, false, false));
+    ASSERT_FALSE(ortho.empty());
+    const std::string info = capture.text(LogLevel::Info);
+    EXPECT_EQ(info.find("decoding photographs at 1/"), std::string::npos)
+        << "a native-resolution run must not scale the decode:\n"
+        << info;
+}
+
+TEST(OrthoDecodeScale, CoarseRunDecodesScaledAndLogsIt) {
+    // A 1 m ortho over the fixture's ~0.10-0.12 m photos (60 m altitude, 500 px
+    // focal) is ~8-10x coarser, so the run decodes at 1/2 (the 4x margin needs a
+    // ratio of at least 8 for d = 2) and says so. The product must still be
+    // produced (the geometry is unchanged; only the colour read is scaled).
+    OrthoSetup& s = setup();
+    ScopedLogCapture capture;
+    const Orthomosaic ortho = run_ortho(s, block_params("average", 1.0, 0, false, false));
+    ASSERT_FALSE(ortho.empty());
+    const std::string info = capture.text(LogLevel::Info);
+    EXPECT_NE(info.find("decoding photographs at 1/"), std::string::npos)
+        << "a coarse run must decode scaled:\n"
+        << info;
+    EXPECT_NE(info.find("finest photo ground pixel"), std::string::npos) << info;
+}
+
+TEST(OrthoDecodeScale, SerpentineOrderMatchesTheWholeGrid) {
+    // The serpentine block walk must produce the SAME product as the unblocked
+    // whole-grid run under AVERAGE blending, where the order cannot matter:
+    // average blending is per-cell, so the two must agree byte for byte. (Mosaic
+    // blending is NOT order-independent: a seam inside the overlap is pinned
+    // from whichever neighbour was visited first, so on odd rows the serpentine
+    // walk can put seams in different places than the raster order. This test
+    // deliberately uses average blending for that reason.) A 512-cell block
+    // splits the 960x720 grid into 2x2 blocks, the smallest layout where the row
+    // direction flips.
+    OrthoSetup& s = setup();
+    const Orthomosaic whole = run_ortho(s, block_params("average", 0.125, 0, false, false));
+    ASSERT_FALSE(whole.empty());
+    const Orthomosaic blocked = run_ortho(s, block_params("average", 0.125, 512, false, false));
+    ASSERT_EQ(blocked.raster.grid, whole.raster.grid);
+    EXPECT_EQ(blocked.labels, whole.labels);
+    EXPECT_EQ(blocked.raster.data, whole.raster.data)
+        << "serpentine order must be byte-identical to the whole-grid product";
+}
+
+TEST(OrthoDecodeScale, MultiBlockDecodeCountStaysNearTheCameraCount) {
+    // With a cache that fits a block, the serpentine order keeps consecutive
+    // blocks' camera sets overlapping, so the number of decodes stays close to
+    // the camera count instead of one per (block, camera). The fixture has 12
+    // cameras; a 2x2 block layout must not decode more than a small multiple.
+    if (platform::memory_budget_bytes() == 0) {
+        GTEST_SKIP() << "no memory budget on this platform: the cache is one frame";
+    }
+    OrthoSetup& s = setup();
+    ScopedLogCapture capture;
+    const Orthomosaic ortho = run_ortho(s, block_params("average", 0.125, 512, false, false));
+    ASSERT_FALSE(ortho.empty());
+    const std::string info = capture.text(LogLevel::Info);
+    const std::size_t at = info.find("photographs decoded ");
+    ASSERT_NE(at, std::string::npos) << "the decode accounting line must be present:\n" << info;
+    // "photographs decoded " is 20 characters; the count follows it.
+    const std::size_t decoded = std::strtoul(info.c_str() + at + 20, nullptr, 10);
+    const std::size_t cameras = s.document.active_chunk()->cameras().size();
+    std::printf("[OrthoDecodeScale.MultiBlock] decoded=%zu cameras=%zu\n", decoded, cameras);
+    EXPECT_LE(decoded, 2 * cameras)
+        << "serpentine order should keep decodes near the camera count, not per block";
 }
 
 }  // namespace

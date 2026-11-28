@@ -875,6 +875,39 @@ double largest_photograph_cells(const std::vector<CameraEntry>& cameras) {
     return largest;
 }
 
+/// The finest ground pixel any camera resolves, in metres: the smallest
+/// (camera height above the surface) / focal length over the flight. The height
+/// is measured from a HIGH surface height (the conservative choice: a camera
+/// over a hilltop is lower above the ground than over the valley, so its pixel
+/// is finer), and the minimum is taken over the cameras so the estimate never
+/// overstates the detail the photographs carry. Returns 0 when nothing is
+/// finite, which the caller treats as "no scaling".
+///
+/// `high_surface` is a high PERCENTILE of the valid surface samples (see
+/// surface_height_percentile), not the single highest sample. A percentile is
+/// conservative like the maximum -- it still measures from near the top of the
+/// terrain, so the estimate does not overstate the detail -- but it is not
+/// hostage to one outlier: a crane, a mast or a DEM noise spike would otherwise
+/// make the "finest ground pixel" tiny and silently disable the scaled decode
+/// for the whole run.
+double finest_ground_pixel_metres(const std::vector<CameraEntry>& cameras,
+                                  const std::vector<Eigen::Vector3d>& plane_centres,
+                                  double high_surface) {
+    double finest = std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i < cameras.size(); ++i) {
+        const double f = cameras[i].calibration.f;
+        const double height = plane_centres[i].z() - high_surface;
+        if (!(f > 0.0) || !std::isfinite(f) || !std::isfinite(height) || !(height > 0.0)) {
+            continue;
+        }
+        const double ground_pixel = height / f;
+        if (std::isfinite(ground_pixel) && ground_pixel > 0.0) {
+            finest = std::min(finest, ground_pixel);
+        }
+    }
+    return std::isfinite(finest) ? finest : 0.0;
+}
+
 /// An LRU cache of decoded photographs, bounded by BYTES.
 ///
 /// A block decodes every camera that reaches it; consecutive blocks share most
@@ -886,7 +919,12 @@ double largest_photograph_cells(const std::vector<CameraEntry>& cameras) {
 /// still works: it stays the only entry).
 class PhotoCache {
 public:
-    explicit PhotoCache(std::uint64_t budget_bytes) : budget_(budget_bytes) {}
+    /// `decode_denom` is the run's decode scale (1 = full resolution): every
+    /// frame is decoded at 1/decode_denom, so a frame costs 1/denom^2 of the
+    /// bytes and the cache holds denom^2 times as many. Film cameras are always
+    /// decoded at full resolution (their resample needs the scan's own pixels).
+    explicit PhotoCache(std::uint64_t budget_bytes, int decode_denom = 1)
+        : budget_(budget_bytes), decode_denom_(decode_denom > 0 ? decode_denom : 1) {}
 
     /// The decoded photograph for `slot`, decoding (and caching) it on a miss.
     /// Returns an empty image when the file cannot be read; the caller turns
@@ -900,7 +938,16 @@ public:
             return entries_[found->second].image;
         }
         ++misses_;
-        Image image = read_image(entry.image_path);
+        // A film camera's scan is resampled into the film-normalised frame, a
+        // per-pixel warp that needs the scan's own resolution, so it is never
+        // decoded scaled.
+        const int denom = entry.film.enabled ? 1 : decode_denom_;
+        Image image;
+        if (denom > 1) {
+            image = std::move(read_image_scaled(entry.image_path, denom).image);
+        } else {
+            image = read_image(entry.image_path);
+        }
         if (image.empty()) {
             static const Image kEmpty;
             return kEmpty;
@@ -921,12 +968,23 @@ public:
         return entries_.back().image;
     }
 
+    /// The OrthoCamera::image_scale for `entry`: the denominator the frame was
+    /// decoded at (1 for a film camera, whose scan is always full resolution).
+    double image_scale(const CameraEntry& entry) const {
+        return entry.film.enabled ? 1.0 : static_cast<double>(decode_denom_);
+    }
+
     /// Photographs actually decoded, i.e. the decodes a run paid for.
     std::size_t misses() const { return misses_; }
     /// Cache lookups served without a decode.
     std::size_t hits() const { return hits_; }
     /// The byte capacity this cache was sized to.
     std::uint64_t budget_bytes() const { return budget_; }
+
+    /// True when `slot` is already decoded and resident. Lets a block fetch the
+    /// frames it already holds before the ones it must decode, so the decodes
+    /// do not evict frames the block is about to read (see the block loop).
+    bool contains(std::size_t slot) const { return index_.find(slot) != index_.end(); }
 
     /// Mark `slot` most-recently-used when it is already cached, so the frames a
     /// following block will need survive the decodes this one does not share.
@@ -969,6 +1027,7 @@ private:
     }
 
     std::uint64_t budget_ = 0;  ///< 0 = unbounded (the whole-grid path)
+    int decode_denom_ = 1;      ///< 1 = full resolution; see the constructor
     std::uint64_t used_ = 0;
     std::uint64_t clock_ = 0;
     std::size_t hits_ = 0;
@@ -1037,6 +1096,7 @@ std::vector<std::array<double, 3>> estimate_camera_gains(
         camera.R = entry.R;
         camera.t = entry.t;
         camera.image = &image;
+        camera.image_scale = photos.image_scale(entry);
         camera.plane_metres_per_unit = metres_per_unit;
         if (to_local) {
             camera.plane_to_local = to_local;
@@ -1356,9 +1416,10 @@ std::vector<ortho::CameraColour> estimate_camera_colours(
                              " has an unreadable image");
         }
         colour[k].resize(pixels[k].size());
+        const double image_scale = photos.image_scale(entry);
         for (std::size_t i = 0; i < pixels[k].size(); ++i) {
             std::uint8_t rgb[3] = {0, 0, 0};
-            pixels[k][i].sample_colour(image, rgb);
+            pixels[k][i].sample_colour(image, image_scale, rgb);
             colour[k][i] = {static_cast<float>(rgb[0]) * (1.0F / 255.0F),
                             static_cast<float>(rgb[1]) * (1.0F / 255.0F),
                             static_cast<float>(rgb[2]) * (1.0F / 255.0F)};
@@ -1760,6 +1821,59 @@ std::optional<Eigen::Vector3d> march_to_surface(const SurfaceHeight& height,
 }
 
 }  // namespace
+
+int choose_decode_denominator(double cell_metres, double finest_ground_pixel) {
+    if (!(cell_metres > 0.0) || !(finest_ground_pixel > 0.0) || !std::isfinite(cell_metres) ||
+        !std::isfinite(finest_ground_pixel)) {
+        return 1;
+    }
+    // Keep a 4x margin: a decoded pixel is at most a QUARTER of an output cell.
+    // A decoded pixel about the size of the cell is blurred twice (the DCT
+    // downscale, then the rectifier's bilinear read at an arbitrary phase), so
+    // the ortho softens; the margin leaves the bilinear read room to interpolate
+    // without losing detail. The quality benchmark showed a measurable softening
+    // even at a half-cell pixel, so the margin is a quarter cell.
+    const double ratio = cell_metres / finest_ground_pixel;
+    int denom = 1;
+    for (const int candidate : {2, 4, 8}) {
+        if (4.0 * static_cast<double>(candidate) <= ratio) {
+            denom = candidate;
+        }
+    }
+    return denom;
+}
+
+double surface_height_percentile(const GeoRaster<float>& surface, float nodata,
+                                 double fraction) {
+    if (!(fraction >= 0.0) || !(fraction <= 1.0) || !std::isfinite(fraction)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    // Bound the work on a large DEM: take every k-th cell so at most ~1e6
+    // samples are collected. A stride of 1 (a small raster) keeps every cell.
+    constexpr std::size_t kMaxSamples = 1000000;
+    const std::size_t cells = surface.data.size();
+    const std::size_t stride = cells > kMaxSamples ? (cells + kMaxSamples - 1) / kMaxSamples : 1;
+    std::vector<double> samples;
+    samples.reserve(cells / stride + 1);
+    for (std::size_t i = 0; i < cells; i += stride) {
+        const float h = surface.data[i];
+        if (h == nodata || std::isnan(h)) {
+            continue;
+        }
+        samples.push_back(static_cast<double>(h));
+    }
+    if (samples.empty()) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    // The index of the requested percentile in the sorted order. Clamp so a
+    // fraction of 1.0 lands on the last sample rather than one past it.
+    const std::size_t rank = static_cast<std::size_t>(
+        std::min<double>(fraction * static_cast<double>(samples.size() - 1),
+                         static_cast<double>(samples.size() - 1)));
+    std::nth_element(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(rank),
+                     samples.end());
+    return samples[rank];
+}
 
 double median_ground_sample_distance(const std::vector<FootprintCamera>& cameras,
                                      const SurfaceHeight& height, double stride_metres,
@@ -2248,6 +2362,50 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     const double photo_cells = largest_photograph_cells(cameras);
     const HeightRange heights = surface_height_range(surface, surface_nodata);
 
+    // -- decode scale --------------------------------------------------------
+    // When the output cell is much coarser than the photographs' own ground
+    // pixel, decoding every frame at full resolution is wasted work and wasted
+    // cache: a 20 cm ortho over 2.4 cm photos needs no more than a 1/2 decode,
+    // and the cache then holds 4x as many frames. The rule keeps a 4x margin --
+    // a decoded pixel is at most a QUARTER of an output cell -- because a
+    // decoded pixel about the size of the cell is blurred twice (the DCT
+    // downscale, then the rectifier's bilinear read at an arbitrary phase) and
+    // the ortho softens; the quality benchmark showed a measurable softening
+    // even at a half-cell pixel, so the margin is a quarter cell.
+    // The denominator is chosen ONCE for the run from the finest ground pixel
+    // any camera resolves (see finest_ground_pixel_metres), so every frame is
+    // decoded at the same scale and the geometry (which divides by it) is
+    // uniform. A native-resolution output yields 1, leaving the default run
+    // byte-identical.
+    //
+    // The height the estimate measures from is a high PERCENTILE of the valid
+    // surface samples, not the single highest one: one spike (a crane, a DEM
+    // noise outlier) would otherwise make the finest ground pixel tiny and
+    // silently disable the scaled decode for the whole run. A non-finite
+    // percentile (a surface with no valid sample) falls back to the highest
+    // sample, and an invalid range to 0 ("no scaling").
+    const double surface_high = ortho::surface_height_percentile(surface, surface_nodata, 0.99);
+    const double finest_ground_pixel = finest_ground_pixel_metres(
+        cameras, plane_centres,
+        std::isfinite(surface_high) ? surface_high : (heights.valid() ? heights.highest : 0.0));
+    // The cell is in plane units; convert to metres for the comparison. A
+    // Geographic plane carries degrees, so the ratio would be meaningless
+    // without the frame's metres-per-unit.
+    const auto cell_metres_for = [&frame](const RasterGrid& g) {
+        const Eigen::Vector2d mpu =
+            frame.metres_per_plane_unit(g.pixel_center(0, g.height / 2).y());
+        return std::max(g.pixel_size_x * mpu.x(), g.pixel_size_y * mpu.y());
+    };
+    // The denominator is fixed from the FINAL grid, which the memory guard may
+    // still coarsen; the guard's own estimate uses the same denominator so the
+    // plan and the run agree. It is recomputed after the guard settles the grid.
+    int decode_denom = 1;
+    // The per-frame cost the plan charges: the full-resolution pixel count
+    // divided by denom^2, i.e. what one decoded frame actually occupies.
+    const auto scaled_photo_cells = [&photo_cells](int denom) {
+        return photo_cells / (static_cast<double>(denom) * static_cast<double>(denom));
+    };
+
     // -- the DEM's support mask ----------------------------------------------
     // The DEM still records its support mask (1 = measured or interpolated
     // inside the measured area, 0 = extrapolated beyond it); it is kept in the
@@ -2277,8 +2435,13 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             predicted_footprint_cells(cameras, candidate_grid, heights, frame);
         const std::uint64_t cells = static_cast<std::uint64_t>(candidate_grid.width) *
                                     static_cast<std::uint64_t>(candidate_grid.height);
-        return estimate_peak_bytes(cells, footprint_cells, !frame.is_local(), photo_cells,
-                                   options.ghosting_filter, options.seam_min_region > 0);
+        // The candidate grid's own cell decides the decode scale, so the
+        // estimate reflects the frames the run would actually hold.
+        const int denom =
+            ortho::choose_decode_denominator(cell_metres_for(candidate_grid), finest_ground_pixel);
+        return estimate_peak_bytes(cells, footprint_cells, !frame.is_local(),
+                                   scaled_photo_cells(denom), options.ghosting_filter,
+                                   options.seam_min_region > 0);
     };
     const auto grid_at = [&surface](double cell) {
         return ortho_grid_for(surface.grid, cell);
@@ -2294,7 +2457,9 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         input.grid_width = candidate_grid.width;
         input.grid_height = candidate_grid.height;
         input.footprint_cells = predicted_footprint_cells(cameras, candidate_grid, heights, frame);
-        input.photo_cells = photo_cells;
+        const int denom =
+            ortho::choose_decode_denominator(cell_metres_for(candidate_grid), finest_ground_pixel);
+        input.photo_cells = scaled_photo_cells(denom);
         input.camera_count = static_cast<int>(cameras.size());
         input.has_node_map = !frame.is_local();
         input.fill_holes = options.fill_holes;
@@ -2416,11 +2581,14 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     //
     // The layout is re-planned on the FINAL grid (the guard above may have
     // coarsened it) so the estimate and the margin match what actually runs.
+    // The decode scale is fixed here, from the final cell, and every frame the
+    // run decodes uses it.
+    decode_denom = ortho::choose_decode_denominator(cell_metres_for(grid), finest_ground_pixel);
     OrthoBlockPlanInput plan_input;
     plan_input.grid_width = grid.width;
     plan_input.grid_height = grid.height;
     plan_input.footprint_cells = predicted_footprint_cells(cameras, grid, heights, frame);
-    plan_input.photo_cells = photo_cells;
+    plan_input.photo_cells = scaled_photo_cells(decode_denom);
     plan_input.camera_count = static_cast<int>(cameras.size());
     plan_input.has_node_map = !frame.is_local();
     plan_input.fill_holes = options.fill_holes;
@@ -2479,7 +2647,13 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         camera_slot.emplace(cameras[i].camera_id, i);
     }
 
-    PhotoCache photos(plan.photo_cache_bytes);
+    PhotoCache photos(plan.photo_cache_bytes, decode_denom);
+    if (decode_denom > 1 && Log::enabled(LogLevel::Info)) {
+        log(LogLevel::Info) << "BuildOrthomosaic: decoding photographs at 1/" << decode_denom
+                            << " scale (output cell " << format_number(cell_metres_for(grid))
+                            << " m, finest photo ground pixel "
+                            << format_number(finest_ground_pixel) << " m)";
+    }
 
     // -- per-camera colour correction -----------------------------------------
     // Solved ONCE over the whole flight, before any block runs, so every block
@@ -2620,429 +2794,502 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     std::size_t ghost_speckles_removed = 0;
     std::size_t seam_regions_removed = 0;
 
-    for (int br = 0; br < rows; ++br) {
-        for (int bc = 0; bc < columns; ++bc, ++block_index) {
+    // Serpentine block order: row 0 left->right, row 1 right->left, and so on.
+    // Consecutive blocks are then always horizontal neighbours, so the camera
+    // set changes by one column at a time instead of completely at every row
+    // wrap -- which is what lets the photo cache keep the frames the next block
+    // needs. Each block still writes only its own interior, and the seam pinning
+    // below is expressed in terms of the blocks already visited, not of a fixed
+    // raster index, so the seams stay continuous across every block border. In
+    // MOSAIC blending, though, the seam paths on odd rows can differ from the
+    // old raster order: a seam inside the overlap is pinned from whichever
+    // neighbour was visited first, and on an odd row that is now the RIGHT
+    // neighbour instead of the left. The result is equally valid but not
+    // byte-identical to the raster-order product. Average blending and anything
+    // not seam-dependent are unchanged.
+    //
+    // `visit` is the block's position in the order the loop visits them; the
+    // pinning and the "next block" prefetch both read it.
+    const auto block_at = [columns](int index) {
+        const int br = index / columns;
+        const int pos = index % columns;
+        const int bc = (br % 2 == 0) ? pos : (columns - 1 - pos);
+        return std::pair<int, int>{br, bc};
+    };
+    // The inverse: the visit position of block (br, bc). Used by the seam
+    // pinning, which must know whether a cell's block has already been visited.
+    const auto visit_index_of = [columns](int br, int bc) {
+        return br * columns + ((br % 2 == 0) ? bc : (columns - 1 - bc));
+    };
+    for (int visit = 0; visit < total_blocks; ++visit, ++block_index) {
+        const auto [br, bc] = block_at(visit);
+        if (progress.is_cancelled()) {
+            throw Error("BuildOrthomosaic cancelled");
+        }
+        const int side = plan.block_cells > 0 ? plan.block_cells : std::max(grid.width, grid.height);
+        const int bx0 = bc * side;
+        const int by0 = br * side;
+        const int bx1 = std::min(grid.width, bx0 + side);
+        const int by1 = std::min(grid.height, by0 + side);
+        if (bx0 >= bx1 || by0 >= by1) {
+            continue;
+        }
+        const int margin = plan.block_cells > 0 ? plan.margin_cells : 0;
+        const BlockWindow block_window = window_grid_for(bx0, by0, bx1, by1, margin);
+        const RasterGrid& window = block_window.grid;
+        const int wx0 = block_window.x0;
+        const int wy0 = block_window.y0;
+
+        // Per-block plane->local map: the node lattice follows the block, so
+        // a large output never carries the whole-grid map (20 B/cell).
+        if (block_lattice.has_value()) {
+            block_lattice->col_offset = wx0;
+            block_lattice->row_offset = wy0;
+        }
+        cell_lattice.col_offset = wx0;
+        cell_lattice.row_offset = wy0;
+        const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> to_local =
+            make_plane_to_local(frame, window, surface, surface_nodata, fallback_height,
+                                block_lattice.has_value() ? &*block_lattice : nullptr);
+        const Eigen::Vector2d metres_per_unit = frame.metres_per_plane_unit(
+            window.pixel_center(0, window.height / 2).y());
+
+        // Cameras whose footprint reaches this window. Skipping the others
+        // is what makes a block cheap: their tiles would be empty anyway.
+        const std::vector<std::size_t> block_cameras =
+            cameras_reaching(window, to_local, metres_per_unit);
+
+        // Keep the frames the NEXT block will want (serpentine order: the
+        // block to the right, or -- at a row end -- the block directly below
+        // the one just finished) near the head of the LRU, so this block's
+        // decodes evict frames that are already done with rather than ones
+        // the run is about to need again.
+        //
+        // The footprint probe reuses THIS block's plane->local map rather
+        // than building the next window's: a prefetch is only an ordering
+        // hint, so a map clamped to the neighbouring grid is close enough,
+        // and building a second block-sized node map (20 B/cell, the largest
+        // single object in the plan) beside this one would cost exactly the
+        // memory the blocking exists to save.
+        if (photos.budget_bytes() != 0 && visit + 1 < total_blocks) {
+            const auto [next_br, next_bc] = block_at(visit + 1);
+            const int nx0 = next_bc * side;
+            const int ny0 = next_br * side;
+            const BlockWindow next_window =
+                window_grid_for(nx0, ny0, std::min(grid.width, nx0 + side),
+                                std::min(grid.height, ny0 + side), margin);
+            for (const std::size_t slot :
+                 cameras_reaching(next_window.grid, to_local, metres_per_unit)) {
+                photos.touch(slot);
+            }
+        }
+
+        // Decode and rectify the cameras in a "cached first" order. When a block
+        // needs more frames than the cache holds, an LRU fed a cyclic sequence
+        // larger than itself misses on every access, so consecutive blocks get
+        // almost no reuse. Fetching the frames already resident first means the
+        // decodes this block pays for evict frames that are already done with,
+        // not ones the block is about to read. The OUTPUT does not depend on
+        // this order: each tile is assigned to its camera's position k, so the
+        // label a tile carries and its place in `tiles` are exactly what they
+        // were in block_cameras order.
+        std::vector<std::size_t> fetch_order;
+        fetch_order.reserve(block_cameras.size());
+        for (std::size_t k = 0; k < block_cameras.size(); ++k) {
+            if (photos.contains(block_cameras[k])) {
+                fetch_order.push_back(k);
+            }
+        }
+        for (std::size_t k = 0; k < block_cameras.size(); ++k) {
+            if (!photos.contains(block_cameras[k])) {
+                fetch_order.push_back(k);
+            }
+        }
+
+        std::vector<ortho::OrthoTile> tiles(block_cameras.size());
+        std::size_t rectified = 0;
+        for (const std::size_t k : fetch_order) {
             if (progress.is_cancelled()) {
                 throw Error("BuildOrthomosaic cancelled");
             }
-            const int side = plan.block_cells > 0 ? plan.block_cells : std::max(grid.width, grid.height);
-            const int bx0 = bc * side;
-            const int by0 = br * side;
-            const int bx1 = std::min(grid.width, bx0 + side);
-            const int by1 = std::min(grid.height, by0 + side);
-            if (bx0 >= bx1 || by0 >= by1) {
-                continue;
+            const CameraEntry& entry = cameras[block_cameras[k]];
+            const Image& image = photos.get(block_cameras[k], entry);
+            if (image.empty()) {
+                throw ValueError("BuildOrthomosaic: camera " +
+                                 std::to_string(entry.camera_id) +
+                                 " has an unreadable image");
             }
-            const int margin = plan.block_cells > 0 ? plan.margin_cells : 0;
-            const BlockWindow block_window = window_grid_for(bx0, by0, bx1, by1, margin);
-            const RasterGrid& window = block_window.grid;
-            const int wx0 = block_window.x0;
-            const int wy0 = block_window.y0;
-
-            // Per-block plane->local map: the node lattice follows the block, so
-            // a large output never carries the whole-grid map (20 B/cell).
-            if (block_lattice.has_value()) {
-                block_lattice->col_offset = wx0;
-                block_lattice->row_offset = wy0;
+            ortho::OrthoCamera camera;
+            camera.calibration = entry.calibration;
+            camera.R = entry.R;
+            camera.t = entry.t;
+            camera.image = &image;
+            camera.image_scale = photos.image_scale(entry);
+            camera.plane_metres_per_unit = metres_per_unit;
+            if (to_local) {
+                camera.plane_to_local = to_local;
+                camera.local_to_plane = [&frame](const Eigen::Vector3d& p) {
+                    return frame.to_plane(p);
+                };
+                camera.plane_centre = plane_centres[block_cameras[k]];
             }
-            cell_lattice.col_offset = wx0;
-            cell_lattice.row_offset = wy0;
-            const std::function<Eigen::Vector3d(const Eigen::Vector3d&)> to_local =
-                make_plane_to_local(frame, window, surface, surface_nodata, fallback_height,
-                                    block_lattice.has_value() ? &*block_lattice : nullptr);
-            const Eigen::Vector2d metres_per_unit = frame.metres_per_plane_unit(
-                window.pixel_center(0, window.height / 2).y());
+            tiles[k] = ortho::orthorectify(
+                surface, surface_nodata, window, camera, static_cast<int>(k),
+                occlusion_tolerance, true, &surface_range,
+                plan.block_cells > 0 ? &cell_lattice : nullptr, support);
+            // Apply the camera's precomputed correction to the tile just
+            // rectified, BEFORE the seam labeller reads it. The model is a
+            // whole-flight constant (see estimate_camera_gains /
+            // estimate_camera_colours), so a block and the whole grid apply
+            // exactly the same coefficients and no block border disagrees.
+            // Applying here rather than after the blend is what makes the
+            // seam cost see corrected colours, which is the point of the
+            // stage: a seam chosen on uncorrected colour is chosen for the
+            // wrong reason.
+            if (options.colour == ColourMode::Gain) {
+                ortho::apply_gain(tiles[k], gains[block_cameras[k]]);
+            } else if (options.colour == ColourMode::Affine) {
+                ortho::apply_colour(tiles[k], colours[block_cameras[k]]);
+            }
+            ++rectified;
+            progress.update("rectify",
+                            (static_cast<double>(block_index) +
+                             static_cast<double>(rectified) /
+                                 static_cast<double>(block_cameras.size())) /
+                                static_cast<double>(total_blocks));
+        }
 
-            // Cameras whose footprint reaches this window. Skipping the others
-            // is what makes a block cheap: their tiles would be empty anyway.
-            const std::vector<std::size_t> block_cameras =
-                cameras_reaching(window, to_local, metres_per_unit);
-
-            // Keep the frames the NEXT block will want (raster order: the block
-            // to the right, or the first block of the next row) near the head of
-            // the LRU, so this block's decodes evict frames that are already done
-            // with rather than ones the run is about to need again.
-            //
-            // The footprint probe reuses THIS block's plane->local map rather
-            // than building the next window's: a prefetch is only an ordering
-            // hint, so a map clamped to the neighbouring grid is close enough,
-            // and building a second block-sized node map (20 B/cell, the largest
-            // single object in the plan) beside this one would cost exactly the
-            // memory the blocking exists to save.
-            if (photos.budget_bytes() != 0) {
-                int next_bc = bc + 1;
-                int next_br = br;
-                if (next_bc >= columns) {
-                    next_bc = 0;
-                    ++next_br;
+        // -- multi-view ghosting filter ----------------------------------
+        // Built AFTER rectification and the colour correction, so the
+        // consensus compares the same corrected colours the seam labeller
+        // and the blender see. The masks live until this block's blend.
+        std::vector<std::vector<std::uint8_t>> deviant_masks;
+        if (options.ghosting_filter) {
+            const ortho::GhostOptions ghost_options;
+            deviant_masks =
+                ortho::detect_ghosts(window.width, window.height, tiles, ghost_options);
+            for (const auto& mask : deviant_masks) {
+                for (const std::uint8_t value : mask) {
+                    ghost_deviant_cells += value != 0 ? 1U : 0U;
                 }
-                if (next_br < rows) {
-                    const int nx0 = next_bc * side;
-                    const int ny0 = next_br * side;
-                    const BlockWindow next_window =
-                        window_grid_for(nx0, ny0, std::min(grid.width, nx0 + side),
-                                        std::min(grid.height, ny0 + side), margin);
-                    for (const std::size_t slot :
-                         cameras_reaching(next_window.grid, to_local, metres_per_unit)) {
-                        photos.touch(slot);
+            }
+        }
+
+        // -- seam continuity ---------------------------------------------
+        // Blocks run in serpentine order, so a cell is already decided when
+        // its block was visited earlier in that order. Those labels are
+        // pinned: the margin keeps the seam paths continuous across a block
+        // border instead of letting the neighbouring block re-decide the
+        // overlap.
+        //
+        // Only an INNER BAND of the overlap is pinned, not the whole margin.
+        // What continuity needs is the cell just outside the border: this
+        // block's first output column is decided against its left neighbour,
+        // so pinning one band of margin beside the block carries the earlier
+        // block's decision across. The rest of the margin is at the WINDOW
+        // edge, where a cell sees only half its neighbourhood, so anything
+        // decided there is a boundary artefact; leaving it free keeps the
+        // optimiser's context intact, and those cells are never written to
+        // the output (only this block's own region is copied out).
+        std::vector<std::int32_t> seed;
+        std::vector<std::uint8_t> frozen;
+        // `result.labels` is allocated at the first block's interior copy,
+        // which runs AFTER this pin loop, so on the very first block it is
+        // still empty. There is nothing to inherit then (no earlier block has
+        // run), so the pin pass is skipped entirely rather than reading an
+        // empty vector.
+        if (plan.block_cells > 0 && !result.labels.empty()) {
+            const std::size_t window_cells =
+                static_cast<std::size_t>(window.width) * static_cast<std::size_t>(window.height);
+            seed.assign(window_cells, -1);
+            frozen.assign(window_cells, 0);
+            // The pinned band around a decided region: keep it to the part of
+            // the margin the seam optimiser itself operates over, so its own
+            // multi-scale pass still has free cells to work in.
+            const int pin_band = std::max(1, ortho::pyramid_support_cells(plan.levels));
+            // The band of this block's own region that an earlier block's
+            // margin decided. It must cover the blend's read reach on BOTH
+            // sides of the border: the blend at this block's first cell reads
+            // `pin_band` cells to its right, and the earlier block's blend at
+            // its last cell read `pin_band` cells to its left, so the shared
+            // band is one support plus a small slack.
+            const int shared_band = pin_band + 2;
+            for (int row = 0; row < window.height; ++row) {
+                for (int col = 0; col < window.width; ++col) {
+                    const int gx = wx0 + col;
+                    const int gy = wy0 + row;
+                    // A cell is decided already when it lies in an earlier
+                    // block's own region (within the band the optimiser reads
+                    // across the border), OR in the band of an earlier block's
+                    // margin that this block now shares. The second case is
+                    // what keeps a seam continuous: the earlier block decided
+                    // that band with full context and recorded it provisionally
+                    // (see the copy-out below), so this block must honour it
+                    // rather than re-optimise the overlap and cut the camera
+                    // transition at the border.
+                    //
+                    // "Earlier" is in VISIT order, not raster order: under the
+                    // serpentine walk a block's right neighbour may be visited
+                    // before it (on an odd row), so the shared band is the
+                    // side(s) whose block was already visited.
+                    const int cell_block_col = gx / side;
+                    const int cell_block_row = gy / side;
+                    const int cell_visit = visit_index_of(cell_block_row, cell_block_col);
+                    const bool earlier_block = cell_visit < visit;
+                    const bool own_region = cell_visit == visit;
+                    // Distance to this block's own region, in cells. An earlier
+                    // block's cells are pinned only within the band nearest it;
+                    // beyond that the optimiser is free again so it can carry a
+                    // seam across the border rather than inherit wherever the
+                    // previous window's edge happened to put one.
+                    const int dx = std::max(0, std::max(bx0 - gx, gx - (bx1 - 1)));
+                    const int dy = std::max(0, std::max(by0 - gy, gy - (by1 - 1)));
+                    bool pin_here = false;
+                    if (earlier_block) {
+                        pin_here = std::max(dx, dy) <= pin_band;
+                    } else if (own_region) {
+                        // The shared band is the part of this block's own
+                        // region that an already-visited neighbour's margin
+                        // decided: the first `shared_band` columns when the
+                        // left neighbour was visited earlier, the last
+                        // `shared_band` columns when the right neighbour was,
+                        // and the first `shared_band` rows when the block
+                        // above was (the block below is never visited first
+                        // in a row-major serpentine walk).
+                        const bool left_earlier =
+                            bc > 0 && visit_index_of(br, bc - 1) < visit;
+                        const bool right_earlier =
+                            bc + 1 < columns && visit_index_of(br, bc + 1) < visit;
+                        const bool above_earlier =
+                            br > 0 && visit_index_of(br - 1, bc) < visit;
+                        pin_here = (left_earlier && gx < bx0 + shared_band) ||
+                                   (right_earlier && gx >= bx1 - shared_band) ||
+                                   (above_earlier && gy < by0 + shared_band);
                     }
-                }
-            }
-
-            std::vector<ortho::OrthoTile> tiles;
-            tiles.reserve(block_cameras.size());
-            for (std::size_t k = 0; k < block_cameras.size(); ++k) {
-                if (progress.is_cancelled()) {
-                    throw Error("BuildOrthomosaic cancelled");
-                }
-                const CameraEntry& entry = cameras[block_cameras[k]];
-                const Image& image = photos.get(block_cameras[k], entry);
-                if (image.empty()) {
-                    throw ValueError("BuildOrthomosaic: camera " +
-                                     std::to_string(entry.camera_id) +
-                                     " has an unreadable image");
-                }
-                ortho::OrthoCamera camera;
-                camera.calibration = entry.calibration;
-                camera.R = entry.R;
-                camera.t = entry.t;
-                camera.image = &image;
-                camera.plane_metres_per_unit = metres_per_unit;
-                if (to_local) {
-                    camera.plane_to_local = to_local;
-                    camera.local_to_plane = [&frame](const Eigen::Vector3d& p) {
-                        return frame.to_plane(p);
-                    };
-                    camera.plane_centre = plane_centres[block_cameras[k]];
-                }
-                tiles.push_back(ortho::orthorectify(
-                    surface, surface_nodata, window, camera, static_cast<int>(k),
-                    occlusion_tolerance, true, &surface_range,
-                    plan.block_cells > 0 ? &cell_lattice : nullptr, support));
-                // Apply the camera's precomputed correction to the tile just
-                // rectified, BEFORE the seam labeller reads it. The model is a
-                // whole-flight constant (see estimate_camera_gains /
-                // estimate_camera_colours), so a block and the whole grid apply
-                // exactly the same coefficients and no block border disagrees.
-                // Applying here rather than after the blend is what makes the
-                // seam cost see corrected colours, which is the point of the
-                // stage: a seam chosen on uncorrected colour is chosen for the
-                // wrong reason.
-                if (options.colour == ColourMode::Gain) {
-                    ortho::apply_gain(tiles.back(), gains[block_cameras[k]]);
-                } else if (options.colour == ColourMode::Affine) {
-                    ortho::apply_colour(tiles.back(), colours[block_cameras[k]]);
-                }
-                progress.update("rectify",
-                                (static_cast<double>(block_index) +
-                                 static_cast<double>(k + 1) /
-                                     static_cast<double>(block_cameras.size())) /
-                                    static_cast<double>(total_blocks));
-            }
-
-            // -- multi-view ghosting filter ----------------------------------
-            // Built AFTER rectification and the colour correction, so the
-            // consensus compares the same corrected colours the seam labeller
-            // and the blender see. The masks live until this block's blend.
-            std::vector<std::vector<std::uint8_t>> deviant_masks;
-            if (options.ghosting_filter) {
-                const ortho::GhostOptions ghost_options;
-                deviant_masks =
-                    ortho::detect_ghosts(window.width, window.height, tiles, ghost_options);
-                for (const auto& mask : deviant_masks) {
-                    for (const std::uint8_t value : mask) {
-                        ghost_deviant_cells += value != 0 ? 1U : 0U;
-                    }
-                }
-            }
-
-            // -- seam continuity ---------------------------------------------
-            // Blocks run in raster order, so every cell above this block or to
-            // its left is already decided. Those labels are pinned: the margin
-            // keeps the seam paths continuous across a block border instead of
-            // letting the neighbouring block re-decide the overlap.
-            //
-            // Only an INNER BAND of the overlap is pinned, not the whole margin.
-            // What continuity needs is the cell just outside the border: this
-            // block's first output column is decided against its left neighbour,
-            // so pinning one band of margin beside the block carries the earlier
-            // block's decision across. The rest of the margin is at the WINDOW
-            // edge, where a cell sees only half its neighbourhood, so anything
-            // decided there is a boundary artefact; leaving it free keeps the
-            // optimiser's context intact, and those cells are never written to
-            // the output (only this block's own region is copied out).
-            std::vector<std::int32_t> seed;
-            std::vector<std::uint8_t> frozen;
-            // `result.labels` is allocated at the first block's interior copy,
-            // which runs AFTER this pin loop, so on the very first block it is
-            // still empty. There is nothing to inherit then (no earlier block has
-            // run), so the pin pass is skipped entirely rather than reading an
-            // empty vector.
-            if (plan.block_cells > 0 && !result.labels.empty()) {
-                const std::size_t window_cells =
-                    static_cast<std::size_t>(window.width) * static_cast<std::size_t>(window.height);
-                seed.assign(window_cells, -1);
-                frozen.assign(window_cells, 0);
-                // The pinned band around a decided region: keep it to the part of
-                // the margin the seam optimiser itself operates over, so its own
-                // multi-scale pass still has free cells to work in.
-                const int pin_band = std::max(1, ortho::pyramid_support_cells(plan.levels));
-                // The band of this block's own region that the previous block's
-                // margin decided. It must cover the blend's read reach on BOTH
-                // sides of the border: the blend at this block's first cell reads
-                // `pin_band` cells to its right, and the previous block's blend at
-                // its last cell read `pin_band` cells to its left, so the shared
-                // band is one support plus a small slack.
-                const int shared_band = pin_band + 2;
-                for (int row = 0; row < window.height; ++row) {
-                    for (int col = 0; col < window.width; ++col) {
-                        const int gx = wx0 + col;
-                        const int gy = wy0 + row;
-                        // A cell is decided already when it lies in an earlier
-                        // block's own region (within the band the optimiser reads
-                        // across the border), OR in the band of an earlier block's
-                        // margin that this block now shares. The second case is
-                        // what keeps a seam continuous: the earlier block decided
-                        // that band with full context and recorded it provisionally
-                        // (see the copy-out below), so this block must honour it
-                        // rather than re-optimise the overlap and cut the camera
-                        // transition at the border.
-                        //
-                        // The shared band is L-shaped: the first `pin_band` columns
-                        // of this block's own region (gx < bx0 + pin_band) and its
-                        // first `pin_band` rows (gy < by0 + pin_band). Those are
-                        // exactly the cells the previous block's right/bottom margin
-                        // decided and this block's own region borders. The rest of
-                        // the margin is at the WINDOW edge, where a cell sees only
-                        // half its neighbourhood, so anything decided there is a
-                        // boundary artefact; leaving it free keeps the optimiser's
-                        // context intact, and those cells are never written to the
-                        // output.
-                        const int cell_block_col = gx / side;
-                        const int cell_block_row = gy / side;
-                        const int cell_index = cell_block_row * columns + cell_block_col;
-                        const bool earlier_block = cell_index < block_index;
-                        const bool own_region = cell_index == block_index;
-                        // Distance to this block's own region, in cells. An earlier
-                        // block's cells are pinned only within the band nearest it;
-                        // beyond that the optimiser is free again so it can carry a
-                        // seam across the border rather than inherit wherever the
-                        // previous window's edge happened to put one.
-                        const int dx = std::max(0, std::max(bx0 - gx, gx - (bx1 - 1)));
-                        const int dy = std::max(0, std::max(by0 - gy, gy - (by1 - 1)));
-                        bool pin_here = false;
-                        if (earlier_block) {
-                            pin_here = std::max(dx, dy) <= pin_band;
-                        } else if (own_region) {
-                            pin_here = gx < bx0 + shared_band || gy < by0 + shared_band;
-                        }
-                        if (!pin_here) {
-                            continue;
-                        }
-                        const std::size_t wc = static_cast<std::size_t>(row) *
-                                                   static_cast<std::size_t>(window.width) +
-                                               static_cast<std::size_t>(col);
-                        const std::int32_t camera_id =
-                            result.labels[static_cast<std::size_t>(gy) *
-                                              static_cast<std::size_t>(grid.width) +
-                                          static_cast<std::size_t>(gx)];
-                        // Only a cell an earlier block actually decided is a pin.
-                        // An earlier block's own region is always decided (>= -1);
-                        // a shared-band cell of this block's own region is decided
-                        // only where an earlier block recorded a provisional camera
-                        // (>= 0). The untouched sentinel is not a pin, so this block
-                        // optimises those cells normally.
-                        const bool decided =
-                            earlier_block ? camera_id >= -1 : camera_id >= 0;
-                        if (!decided) {
-                            continue;
-                        }
-                        std::int32_t tile_index = -1;
-                        if (camera_id >= 0) {
-                            const auto it = camera_slot.find(camera_id);
-                            if (it == camera_slot.end()) {
-                                continue;
-                            }
-                            const auto tile_it = std::find(block_cameras.begin(),
-                                                           block_cameras.end(), it->second);
-                            if (tile_it == block_cameras.end()) {
-                                continue;
-                            }
-                            tile_index = static_cast<std::int32_t>(
-                                std::distance(block_cameras.begin(), tile_it));
-                            // Only pin a camera that this window's tile actually
-                            // covers the cell with. A decision made on the whole
-                            // window the earlier block had is not automatically
-                            // renderable here (the window clip and the visibility
-                            // test can differ at the very edge), and a pin the
-                            // labeller would drop is better not applied at all.
-                            const ortho::OrthoTile& tile =
-                                tiles[static_cast<std::size_t>(tile_index)];
-                            if (!tile.contains(col, row) ||
-                                tile.valid[tile.index(col, row)] == 0) {
-                                continue;
-                            }
-                        }
-                        seed[wc] = tile_index;
-                        frozen[wc] = 1;
-                    }
-                }
-            }
-
-            std::vector<std::int32_t> labels;
-            ortho::SeamOptions seam_options;
-            seam_options.gradient_weight = options.seam_gradient_weight;
-            if (!options.refine_seamlines) {
-                seam_options.iterations = 0;
-            }
-            if (options.ghosting_filter) {
-                seam_options.avoid = &deviant_masks;
-            }
-            labels = ortho::assign_seams(window.width, window.height, tiles, seam_options,
-                                        frozen.empty() ? nullptr : &seed,
-                                        frozen.empty() ? nullptr : &frozen);
-
-            // Blocks run in raster order and the overlap is pinned, so every
-            // inherited cell must still carry the label the earlier block
-            // decided. A change here would be a seam restarting at a block
-            // border, which is exactly what the pin exists to prevent.
-            std::size_t pinned_cells = 0;
-            std::size_t pinned_changed = 0;
-            if (!frozen.empty()) {
-                for (std::size_t wc = 0; wc < frozen.size(); ++wc) {
-                    if (frozen[wc] == 0) {
+                    if (!pin_here) {
                         continue;
                     }
-                    ++pinned_cells;
-                    if (labels[wc] != seed[wc]) {
-                        // The pin is a hard constraint on a cell this window can
-                        // render, so this is an optimiser bug rather than a
-                        // legitimate drop. Restore the earlier block's decision:
-                        // the seam must not restart, and the cell is only in this
-                        // block's margin so its colour is not written either way.
-                        ++pinned_changed;
-                        labels[wc] = seed[wc];
+                    const std::size_t wc = static_cast<std::size_t>(row) *
+                                               static_cast<std::size_t>(window.width) +
+                                           static_cast<std::size_t>(col);
+                    const std::int32_t camera_id =
+                        result.labels[static_cast<std::size_t>(gy) *
+                                          static_cast<std::size_t>(grid.width) +
+                                      static_cast<std::size_t>(gx)];
+                    // Only a cell an earlier block actually decided is a pin.
+                    // An earlier block's own region is always decided (>= -1);
+                    // a shared-band cell of this block's own region is decided
+                    // only where an earlier block recorded a provisional camera
+                    // (>= 0). The untouched sentinel is not a pin, so this block
+                    // optimises those cells normally.
+                    const bool decided =
+                        earlier_block ? camera_id >= -1 : camera_id >= 0;
+                    if (!decided) {
+                        continue;
                     }
+                    std::int32_t tile_index = -1;
+                    if (camera_id >= 0) {
+                        const auto it = camera_slot.find(camera_id);
+                        if (it == camera_slot.end()) {
+                            continue;
+                        }
+                        const auto tile_it = std::find(block_cameras.begin(),
+                                                       block_cameras.end(), it->second);
+                        if (tile_it == block_cameras.end()) {
+                            continue;
+                        }
+                        tile_index = static_cast<std::int32_t>(
+                            std::distance(block_cameras.begin(), tile_it));
+                        // Only pin a camera that this window's tile actually
+                        // covers the cell with. A decision made on the whole
+                        // window the earlier block had is not automatically
+                        // renderable here (the window clip and the visibility
+                        // test can differ at the very edge), and a pin the
+                        // labeller would drop is better not applied at all.
+                        const ortho::OrthoTile& tile =
+                            tiles[static_cast<std::size_t>(tile_index)];
+                        if (!tile.contains(col, row) ||
+                            tile.valid[tile.index(col, row)] == 0) {
+                            continue;
+                        }
+                    }
+                    seed[wc] = tile_index;
+                    frozen[wc] = 1;
                 }
             }
-            if (pinned_changed != 0) {
-                log(LogLevel::Warn) << "BuildOrthomosaic: block " << block_index << " changed "
-                                    << pinned_changed << " of " << pinned_cells
-                                    << " inherited seam labels";
-            }
-            // A ghost cut out by the seam cost can leave a one-camera island
-            // of the wrong label where the object's edge meets the seam. The
-            // speckle pass relabels such islands to a neighbouring label that is
-            // valid at every cell; pinned margin cells are never touched.
-            if (options.ghosting_filter) {
-                const ortho::GhostOptions ghost_options;
-                ghost_speckles_removed += static_cast<std::size_t>(ortho::filter_label_speckles(
-                    window.width, window.height, tiles, labels,
-                    frozen.empty() ? nullptr : &frozen, ghost_options.min_component_cells,
-                    &deviant_masks));
-            }
-            // Topology polish: merge seam regions smaller than the requested
-            // size into a neighbouring label. Runs AFTER the ghosting pass (so
-            // it can also smooth the islands that pass leaves behind) and reuses
-            // the same pinned margin cells, which it never relabels. A null
-            // `deviant` scopes it to every island, not only ghosting artefacts.
-            if (options.seam_min_region > 0) {
-                // filter_label_speckles works on this window only, so a region can
-                // never be larger than its cell count: cap the bound (in 64-bit,
-                // so the width*height product cannot overflow the int parameter).
-                const std::int64_t window_cells =
-                    static_cast<std::int64_t>(window.width) *
-                    static_cast<std::int64_t>(window.height);
-                const int region_cap = static_cast<int>(
-                    std::min<std::int64_t>(options.seam_min_region, window_cells));
-                const std::size_t removed = static_cast<std::size_t>(ortho::filter_label_speckles(
-                    window.width, window.height, tiles, labels,
-                    frozen.empty() ? nullptr : &frozen, region_cap, nullptr));
-                seam_regions_removed += removed;
-                if (Log::enabled(LogLevel::Info)) {
-                    log(LogLevel::Info) << "BuildOrthomosaic: block " << block_index
-                                        << " merged " << removed << " small seam region(s)";
+        }
+
+        std::vector<std::int32_t> labels;
+        ortho::SeamOptions seam_options;
+        seam_options.gradient_weight = options.seam_gradient_weight;
+        if (!options.refine_seamlines) {
+            seam_options.iterations = 0;
+        }
+        if (options.ghosting_filter) {
+            seam_options.avoid = &deviant_masks;
+        }
+        labels = ortho::assign_seams(window.width, window.height, tiles, seam_options,
+                                    frozen.empty() ? nullptr : &seed,
+                                    frozen.empty() ? nullptr : &frozen);
+
+        // Blocks run in serpentine order and the overlap is pinned, so every
+        // inherited cell must still carry the label the earlier block
+        // decided. A change here would be a seam restarting at a block
+        // border, which is exactly what the pin exists to prevent.
+        std::size_t pinned_cells = 0;
+        std::size_t pinned_changed = 0;
+        if (!frozen.empty()) {
+            for (std::size_t wc = 0; wc < frozen.size(); ++wc) {
+                if (frozen[wc] == 0) {
+                    continue;
+                }
+                ++pinned_cells;
+                if (labels[wc] != seed[wc]) {
+                    // The pin is a hard constraint on a cell this window can
+                    // render, so this is an optimiser bug rather than a
+                    // legitimate drop. Restore the earlier block's decision:
+                    // the seam must not restart, and the cell is only in this
+                    // block's margin so its colour is not written either way.
+                    ++pinned_changed;
+                    labels[wc] = seed[wc];
                 }
             }
+        }
+        if (pinned_changed != 0) {
+            log(LogLevel::Warn) << "BuildOrthomosaic: block " << block_index << " changed "
+                                << pinned_changed << " of " << pinned_cells
+                                << " inherited seam labels";
+        }
+        // A ghost cut out by the seam cost can leave a one-camera island
+        // of the wrong label where the object's edge meets the seam. The
+        // speckle pass relabels such islands to a neighbouring label that is
+        // valid at every cell; pinned margin cells are never touched.
+        if (options.ghosting_filter) {
+            const ortho::GhostOptions ghost_options;
+            ghost_speckles_removed += static_cast<std::size_t>(ortho::filter_label_speckles(
+                window.width, window.height, tiles, labels,
+                frozen.empty() ? nullptr : &frozen, ghost_options.min_component_cells,
+                &deviant_masks));
+        }
+        // Topology polish: merge seam regions smaller than the requested
+        // size into a neighbouring label. Runs AFTER the ghosting pass (so
+        // it can also smooth the islands that pass leaves behind) and reuses
+        // the same pinned margin cells, which it never relabels. A null
+        // `deviant` scopes it to every island, not only ghosting artefacts.
+        if (options.seam_min_region > 0) {
+            // filter_label_speckles works on this window only, so a region can
+            // never be larger than its cell count: cap the bound (in 64-bit,
+            // so the width*height product cannot overflow the int parameter).
+            const std::int64_t window_cells =
+                static_cast<std::int64_t>(window.width) *
+                static_cast<std::int64_t>(window.height);
+            const int region_cap = static_cast<int>(
+                std::min<std::int64_t>(options.seam_min_region, window_cells));
+            const std::size_t removed = static_cast<std::size_t>(ortho::filter_label_speckles(
+                window.width, window.height, tiles, labels,
+                frozen.empty() ? nullptr : &frozen, region_cap, nullptr));
+            seam_regions_removed += removed;
             if (Log::enabled(LogLevel::Info)) {
-                log(LogLevel::Info) << "BuildOrthomosaic: block " << block_index << " pinned="
-                                    << pinned_cells << " conflicts=" << pinned_changed
-                                    << " cameras=" << block_cameras.size();
+                log(LogLevel::Info) << "BuildOrthomosaic: block " << block_index
+                                    << " merged " << removed << " small seam region(s)";
             }
-            progress.update("seamlines",
-                            static_cast<double>(block_index + 1) /
-                                static_cast<double>(total_blocks));
+        }
+        if (Log::enabled(LogLevel::Info)) {
+            log(LogLevel::Info) << "BuildOrthomosaic: block " << block_index << " pinned="
+                                << pinned_cells << " conflicts=" << pinned_changed
+                                << " cameras=" << block_cameras.size();
+        }
+        progress.update("seamlines",
+                        static_cast<double>(block_index + 1) /
+                            static_cast<double>(total_blocks));
 
-            const ortho::OrthoMosaic mosaic =
-                ortho::blend(window.width, window.height, tiles, labels, options.blending,
-                             plan.levels, options.ghosting_filter ? &deviant_masks : nullptr);
-            progress.update("blend", static_cast<double>(block_index + 1) /
-                                         static_cast<double>(total_blocks));
+        const ortho::OrthoMosaic mosaic =
+            ortho::blend(window.width, window.height, tiles, labels, options.blending,
+                         plan.levels, options.ghosting_filter ? &deviant_masks : nullptr);
+        progress.update("blend", static_cast<double>(block_index + 1) /
+                                     static_cast<double>(total_blocks));
 
-            // Copy the interior only: the margin exists to make the seams and
-            // the blend continuous, it is not part of this block's output.
-            if (result.raster.data.empty()) {
-                result.raster.data.assign(output_cells * 4U, 0);
-                result.labels.assign(output_cells, -1);
+        // Copy the interior only: the margin exists to make the seams and
+        // the blend continuous, it is not part of this block's output.
+        if (result.raster.data.empty()) {
+            result.raster.data.assign(output_cells * 4U, 0);
+            result.labels.assign(output_cells, -1);
+        }
+        for (int row = by0; row < by1; ++row) {
+            const std::size_t window_row =
+                static_cast<std::size_t>(row - wy0) * static_cast<std::size_t>(window.width);
+            const std::size_t output_row =
+                static_cast<std::size_t>(row) * static_cast<std::size_t>(grid.width);
+            for (int col = bx0; col < bx1; ++col) {
+                const std::size_t wc = window_row + static_cast<std::size_t>(col - wx0);
+                const std::size_t oc = output_row + static_cast<std::size_t>(col);
+                const std::int32_t label = mosaic.labels[wc];
+                result.labels[oc] =
+                    label >= 0 ? cameras[block_cameras[static_cast<std::size_t>(label)]]
+                                     .camera_id
+                               : -1;
+                result.raster.data[oc * 4 + 0] = mosaic.rgb[wc * 3 + 0];
+                result.raster.data[oc * 4 + 1] = mosaic.rgb[wc * 3 + 1];
+                result.raster.data[oc * 4 + 2] = mosaic.rgb[wc * 3 + 2];
+                result.raster.data[oc * 4 + 3] = mosaic.valid[wc] != 0 ? 255 : 0;
             }
-            for (int row = by0; row < by1; ++row) {
-                const std::size_t window_row =
-                    static_cast<std::size_t>(row - wy0) * static_cast<std::size_t>(window.width);
-                const std::size_t output_row =
-                    static_cast<std::size_t>(row) * static_cast<std::size_t>(grid.width);
-                for (int col = bx0; col < bx1; ++col) {
-                    const std::size_t wc = window_row + static_cast<std::size_t>(col - wx0);
-                    const std::size_t oc = output_row + static_cast<std::size_t>(col);
-                    const std::int32_t label = mosaic.labels[wc];
-                    result.labels[oc] =
-                        label >= 0 ? cameras[block_cameras[static_cast<std::size_t>(label)]]
-                                         .camera_id
-                                   : -1;
-                    result.raster.data[oc * 4 + 0] = mosaic.rgb[wc * 3 + 0];
-                    result.raster.data[oc * 4 + 1] = mosaic.rgb[wc * 3 + 1];
-                    result.raster.data[oc * 4 + 2] = mosaic.rgb[wc * 3 + 2];
-                    result.raster.data[oc * 4 + 3] = mosaic.valid[wc] != 0 ? 255 : 0;
+        }
+
+        // Record this block's seam decision in the margin it decided but does
+        // not own, for the neighbours that will be visited LATER (in the
+        // serpentine order) and will pin it: the right margin when the block
+        // to the right is still to come, the left margin when the block to
+        // the left is, and the bottom margin when the block below is. These
+        // cells belong to later blocks, which overwrite them when they run,
+        // so the final labels and colours are unchanged; the record only lets
+        // the next block pin the seam across the shared border instead of
+        // re-optimising the overlap and cutting the camera transition there.
+        // Only the band the next block pins is recorded, and only where this
+        // block actually decided a camera (a cell no camera covers is left at
+        // the sentinel, so the next block optimises it normally).
+        if (plan.block_cells > 0) {
+            // Record at least as far as the next block will pin (its shared
+            // band), so the record always covers the cells that block reads.
+            const int record_band =
+                std::max(1, ortho::pyramid_support_cells(plan.levels)) + 2;
+            const auto record = [&](int gx, int gy) {
+                if (gx < 0 || gy < 0 || gx >= grid.width || gy >= grid.height) {
+                    return;
                 }
-            }
-
-            // Record this block's seam decision in the margin it decided but does
-            // not own: the right margin (the columns the next block to the right
-            // will pin) and the bottom margin (the rows the block below will pin).
-            // These cells belong to later blocks, which overwrite them when they
-            // run, so the final labels and colours are unchanged; the record only
-            // lets the next block pin the seam across the shared border instead of
-            // re-optimising the overlap and cutting the camera transition there.
-            // Only the band the next block pins is recorded, and only where this
-            // block actually decided a camera (a cell no camera covers is left at
-            // the sentinel, so the next block optimises it normally).
-            if (plan.block_cells > 0) {
-                // Record at least as far as the next block will pin (its shared
-                // band), so the record always covers the cells that block reads.
-                const int record_band =
-                    std::max(1, ortho::pyramid_support_cells(plan.levels)) + 2;
-                const auto record = [&](int gx, int gy) {
-                    if (gx < 0 || gy < 0 || gx >= grid.width || gy >= grid.height) {
-                        return;
-                    }
-                    const std::size_t wc =
-                        static_cast<std::size_t>(gy - wy0) *
-                            static_cast<std::size_t>(window.width) +
-                        static_cast<std::size_t>(gx - wx0);
-                    const std::int32_t label = mosaic.labels[wc];
-                    if (label < 0) {
-                        return;  // nothing decided here; leave the sentinel
-                    }
-                    const std::size_t oc =
-                        static_cast<std::size_t>(gy) * static_cast<std::size_t>(grid.width) +
-                        static_cast<std::size_t>(gx);
-                    result.labels[oc] =
-                        cameras[block_cameras[static_cast<std::size_t>(label)]].camera_id;
-                };
+                const std::size_t wc =
+                    static_cast<std::size_t>(gy - wy0) *
+                        static_cast<std::size_t>(window.width) +
+                    static_cast<std::size_t>(gx - wx0);
+                const std::int32_t label = mosaic.labels[wc];
+                if (label < 0) {
+                    return;  // nothing decided here; leave the sentinel
+                }
+                const std::size_t oc =
+                    static_cast<std::size_t>(gy) * static_cast<std::size_t>(grid.width) +
+                    static_cast<std::size_t>(gx);
+                result.labels[oc] =
+                    cameras[block_cameras[static_cast<std::size_t>(label)]].camera_id;
+            };
+            const bool right_later =
+                bc + 1 < columns && visit_index_of(br, bc + 1) > visit;
+            const bool left_later = bc > 0 && visit_index_of(br, bc - 1) > visit;
+            const bool below_later = br + 1 < rows && visit_index_of(br + 1, bc) > visit;
+            if (right_later) {
                 for (int row = by0; row < by1; ++row) {
-                    for (int col = bx1; col < std::min(grid.width, bx1 + record_band); ++col) {
+                    for (int col = bx1; col < std::min(grid.width, bx1 + record_band);
+                         ++col) {
                         record(col, row);
                     }
                 }
+            }
+            if (left_later) {
+                for (int row = by0; row < by1; ++row) {
+                    for (int col = std::max(0, bx0 - record_band); col < bx0; ++col) {
+                        record(col, row);
+                    }
+                }
+            }
+            if (below_later) {
                 for (int row = by1; row < std::min(grid.height, by1 + record_band); ++row) {
                     for (int col = bx0; col < bx1; ++col) {
                         record(col, row);

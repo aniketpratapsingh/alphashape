@@ -63,7 +63,16 @@ struct OrthoCamera {
     Calibration calibration;                 ///< intrinsics (projection model)
     Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
     Eigen::Vector3d t = Eigen::Vector3d::Zero();
-    const Image* image = nullptr;            ///< full-resolution photograph
+    const Image* image = nullptr;            ///< photograph (possibly scaled)
+
+    /// Full-resolution pixels per decoded-image pixel: 1 when `image` is the
+    /// full-resolution photograph, 2/4/8 when it was decoded at 1/2, 1/4, 1/8
+    /// (see read_image_scaled). ALL geometry -- projection, footprint, taper,
+    /// in-image tests -- stays in full-resolution sensor coordinates taken from
+    /// `calibration`; only the pixel READ divides by this. A caller that decodes
+    /// a reduced frame must set it, or the colour is sampled from the wrong
+    /// place.
+    double image_scale = 1.0;
 
     /// Optional plane-frame -> chunk-local map (identity when empty).
     std::function<Eigen::Vector3d(const Eigen::Vector3d&)> plane_to_local;
@@ -239,8 +248,11 @@ struct SurfaceSample {
     double v = 0.0;
     double score = 0.0;  ///< cos(view vs vertical) * border taper, in (0, 1]
 
-    /// Colour of the photograph at (u, v), bilinear, edges clamped.
-    void sample_colour(const Image& image, std::uint8_t out[3]) const;
+    /// Colour of the photograph at (u, v), bilinear, edges clamped. `u`/`v` are
+    /// full-resolution sensor coordinates; `scale` is the camera's
+    /// OrthoCamera::image_scale (full-resolution pixels per decoded pixel), so
+    /// a reduced-resolution decode is read at the right place.
+    void sample_colour(const Image& image, double scale, std::uint8_t out[3]) const;
 };
 
 /// Project the plane-frame surface point `p` into `camera` and report where it

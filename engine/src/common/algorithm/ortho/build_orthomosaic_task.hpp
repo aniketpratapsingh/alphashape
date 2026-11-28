@@ -72,6 +72,33 @@ double median_ground_sample_distance(const std::vector<FootprintCamera>& cameras
                                      double lowest_surface_metres = std::numeric_limits<
                                          double>::quiet_NaN());
 
+/// The decode denominator a run uses: the largest power of two in {1,2,4,8} that
+/// keeps a decoded pixel at most a QUARTER of an output cell, i.e.
+/// 4 * d <= cell_metres / finest_ground_pixel. The margin matters because a
+/// decoded pixel about the size of the output cell is blurred twice -- once by
+/// the DCT downscale and again by the rectifier's bilinear read at an arbitrary
+/// phase -- which softens the ortho; the quality benchmark showed a measurable
+/// softening even at a half-cell pixel, so the margin is a quarter cell. A
+/// native-resolution output (cell == the photo's own ground pixel) yields 1, so
+/// the default run is unchanged; a 10 cm ortho over 2.4 cm photos yields 1, a
+/// 20 cm ortho over 2.4 cm photos yields 2, and a 40 cm ortho over 2.4 cm photos
+/// yields 4. Anything non-finite or non-positive yields 1 (full resolution), the
+/// safe answer. Exposed so the selection rule can be unit-tested without a
+/// flight.
+int choose_decode_denominator(double cell_metres, double finest_ground_pixel);
+
+/// A high percentile of a surface raster's valid samples, in the raster's own
+/// units. `fraction` is in [0, 1] (0.99 = the 99th percentile). Nodata and NaN
+/// samples are skipped. The samples are taken from a strided subsample of at
+/// most ~1,000,000 cells, so the cost is bounded on a large DEM, and the
+/// percentile is computed with std::nth_element on a copy (no full sort).
+///
+/// Returns NaN when the raster has no valid sample; the caller then falls back
+/// to the surface's own highest sample. Exposed so the decode-scale estimate can
+/// be unit-tested without a flight.
+double surface_height_percentile(const GeoRaster<float>& surface, float nodata,
+                                 double fraction);
+
 }  // namespace ortho
 
 /// Build the plane-frame -> chunk-local map the orthorectifier applies before
