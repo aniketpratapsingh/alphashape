@@ -80,6 +80,18 @@ double median_ground_sample_distance(const std::vector<FootprintCamera>& cameras
 /// answer. Exposed so the selection rule can be unit-tested without a flight.
 int choose_decode_denominator(double cell_metres, double finest_ground_pixel);
 
+/// A high percentile of a surface raster's valid samples, in the raster's own
+/// units. `fraction` is in [0, 1] (0.99 = the 99th percentile). Nodata and NaN
+/// samples are skipped. The samples are taken from a strided subsample of at
+/// most ~1,000,000 cells, so the cost is bounded on a large DEM, and the
+/// percentile is computed with std::nth_element on a copy (no full sort).
+///
+/// Returns NaN when the raster has no valid sample; the caller then falls back
+/// to the surface's own highest sample. Exposed so the decode-scale estimate can
+/// be unit-tested without a flight.
+double surface_height_percentile(const GeoRaster<float>& surface, float nodata,
+                                 double fraction);
+
 }  // namespace ortho
 
 /// Build the plane-frame -> chunk-local map the orthorectifier applies before

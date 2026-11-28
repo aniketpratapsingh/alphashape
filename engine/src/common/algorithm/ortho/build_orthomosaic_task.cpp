@@ -877,18 +877,26 @@ double largest_photograph_cells(const std::vector<CameraEntry>& cameras) {
 
 /// The finest ground pixel any camera resolves, in metres: the smallest
 /// (camera height above the surface) / focal length over the flight. The height
-/// is measured from the HIGHEST surface sample (the conservative choice: a
-/// camera over a hilltop is lower above the ground than over the valley, so its
-/// pixel is finer), and the minimum is taken over the cameras so the estimate
-/// never overstates the detail the photographs carry. Returns 0 when nothing is
+/// is measured from a HIGH surface height (the conservative choice: a camera
+/// over a hilltop is lower above the ground than over the valley, so its pixel
+/// is finer), and the minimum is taken over the cameras so the estimate never
+/// overstates the detail the photographs carry. Returns 0 when nothing is
 /// finite, which the caller treats as "no scaling".
+///
+/// `high_surface` is a high PERCENTILE of the valid surface samples (see
+/// surface_height_percentile), not the single highest sample. A percentile is
+/// conservative like the maximum -- it still measures from near the top of the
+/// terrain, so the estimate does not overstate the detail -- but it is not
+/// hostage to one outlier: a crane, a mast or a DEM noise spike would otherwise
+/// make the "finest ground pixel" tiny and silently disable the scaled decode
+/// for the whole run.
 double finest_ground_pixel_metres(const std::vector<CameraEntry>& cameras,
                                   const std::vector<Eigen::Vector3d>& plane_centres,
-                                  double highest_surface) {
+                                  double high_surface) {
     double finest = std::numeric_limits<double>::infinity();
     for (std::size_t i = 0; i < cameras.size(); ++i) {
         const double f = cameras[i].calibration.f;
-        const double height = plane_centres[i].z() - highest_surface;
+        const double height = plane_centres[i].z() - high_surface;
         if (!(f > 0.0) || !std::isfinite(f) || !std::isfinite(height) || !(height > 0.0)) {
             continue;
         }
@@ -1824,6 +1832,38 @@ int choose_decode_denominator(double cell_metres, double finest_ground_pixel) {
     return denom;
 }
 
+double surface_height_percentile(const GeoRaster<float>& surface, float nodata,
+                                 double fraction) {
+    if (!(fraction >= 0.0) || !(fraction <= 1.0) || !std::isfinite(fraction)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    // Bound the work on a large DEM: take every k-th cell so at most ~1e6
+    // samples are collected. A stride of 1 (a small raster) keeps every cell.
+    constexpr std::size_t kMaxSamples = 1000000;
+    const std::size_t cells = surface.data.size();
+    const std::size_t stride = cells > kMaxSamples ? (cells + kMaxSamples - 1) / kMaxSamples : 1;
+    std::vector<double> samples;
+    samples.reserve(cells / stride + 1);
+    for (std::size_t i = 0; i < cells; i += stride) {
+        const float h = surface.data[i];
+        if (h == nodata || std::isnan(h)) {
+            continue;
+        }
+        samples.push_back(static_cast<double>(h));
+    }
+    if (samples.empty()) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    // The index of the requested percentile in the sorted order. Clamp so a
+    // fraction of 1.0 lands on the last sample rather than one past it.
+    const std::size_t rank = static_cast<std::size_t>(
+        std::min<double>(fraction * static_cast<double>(samples.size() - 1),
+                         static_cast<double>(samples.size() - 1)));
+    std::nth_element(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(rank),
+                     samples.end());
+    return samples[rank];
+}
+
 double median_ground_sample_distance(const std::vector<FootprintCamera>& cameras,
                                      const SurfaceHeight& height, double stride_metres,
                                      double lowest_surface_metres) {
@@ -2320,9 +2360,17 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     // finest_ground_pixel_metres), so every frame is decoded at the same scale
     // and the geometry (which divides by it) is uniform. A native-resolution
     // output yields 1, leaving the default run byte-identical.
-    const double finest_ground_pixel =
-        finest_ground_pixel_metres(cameras, plane_centres,
-                                   heights.valid() ? heights.highest : 0.0);
+    //
+    // The height the estimate measures from is a high PERCENTILE of the valid
+    // surface samples, not the single highest one: one spike (a crane, a DEM
+    // noise outlier) would otherwise make the finest ground pixel tiny and
+    // silently disable the scaled decode for the whole run. A non-finite
+    // percentile (a surface with no valid sample) falls back to the highest
+    // sample, and an invalid range to 0 ("no scaling").
+    const double surface_high = ortho::surface_height_percentile(surface, surface_nodata, 0.99);
+    const double finest_ground_pixel = finest_ground_pixel_metres(
+        cameras, plane_centres,
+        std::isfinite(surface_high) ? surface_high : (heights.valid() ? heights.highest : 0.0));
     // The cell is in plane units; convert to metres for the comparison. A
     // Geographic plane carries degrees, so the ratio would be meaningless
     // without the frame's metres-per-unit.
@@ -2733,9 +2781,15 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     // Consecutive blocks are then always horizontal neighbours, so the camera
     // set changes by one column at a time instead of completely at every row
     // wrap -- which is what lets the photo cache keep the frames the next block
-    // needs. The output is unchanged: each block writes only its own interior,
-    // and the seam pinning below is expressed in terms of the blocks already
-    // visited, not of a fixed raster index.
+    // needs. Each block still writes only its own interior, and the seam pinning
+    // below is expressed in terms of the blocks already visited, not of a fixed
+    // raster index, so the seams stay continuous across every block border. In
+    // MOSAIC blending, though, the seam paths on odd rows can differ from the
+    // old raster order: a seam inside the overlap is pinned from whichever
+    // neighbour was visited first, and on an odd row that is now the RIGHT
+    // neighbour instead of the left. The result is equally valid but not
+    // byte-identical to the raster-order product. Average blending and anything
+    // not seam-dependent are unchanged.
     //
     // `visit` is the block's position in the order the loop visits them; the
     // pinning and the "next block" prefetch both read it.

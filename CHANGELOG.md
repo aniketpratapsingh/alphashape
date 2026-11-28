@@ -92,8 +92,12 @@ All notable changes to alphashape are recorded here. The format follows
   geometry is unchanged because it is computed from the calibration, not the
   decoded pixels. Blocks are now visited left-to-right, then right-to-left on the
   next row, so consecutive blocks are always neighbours and the cache keeps the
-  frames the next block needs. A native-resolution ortho is unchanged. The run
-  logs the chosen scale ("decoding photographs at 1/N scale").
+  frames the next block needs. In mosaic blending the seams can fall differently
+  from earlier versions (they are still continuous across every block border,
+  pinned against whichever neighbour was visited first); average blending is
+  unchanged. A native-resolution ortho still decodes full frames, but its mosaic
+  seams are subject to the same order change. The run logs the chosen scale
+  ("decoding photographs at 1/N scale").
 - **Add Photos now loads the DJI factory lens calibration by default.** The
   "load XMP calibration" option (Preferences, and the AddPhotos
   `load_xmp_calibration` parameter) is now on unless turned off. A DJI photo's

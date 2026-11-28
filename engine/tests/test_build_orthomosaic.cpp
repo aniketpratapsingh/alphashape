@@ -3446,6 +3446,57 @@ TEST(OrthoDecodeScale, DenominatorFollowsTheOutputCell) {
     EXPECT_EQ(ortho::choose_decode_denominator(0.05, 0.0), 1);
 }
 
+TEST(OrthoDecodeScale, SurfaceHeightPercentileIgnoresASingleSpike) {
+    // The decode-scale estimate measures from a high percentile of the valid
+    // surface samples, not the single highest one: one spike (a crane, a DEM
+    // noise outlier) must not drag the "finest ground pixel" down and silently
+    // disable the scaled decode for the whole run.
+    GeoRaster<float> surface;
+    surface.grid.width = 100;
+    surface.grid.height = 100;
+    surface.grid.pixel_size_x = 1.0;
+    surface.grid.pixel_size_y = 1.0;
+    surface.data.assign(100 * 100, 10.0f);
+    surface.data[0] = 60.0f;  // one spike
+    constexpr float kNodata = -9999.0f;
+    const double p99 = ortho::surface_height_percentile(surface, kNodata, 0.99);
+    EXPECT_DOUBLE_EQ(p99, 10.0)
+        << "one spike in 10,000 samples must not move the 99th percentile";
+    // The single highest sample is still 60, which is what the old code used.
+    EXPECT_FLOAT_EQ(*std::max_element(surface.data.begin(), surface.data.end()), 60.0f);
+}
+
+TEST(OrthoDecodeScale, SurfaceHeightPercentileSkipsNodataAndNaN) {
+    // Nodata and NaN samples are skipped, so a surface that is mostly nodata
+    // still reports the percentile of its valid samples.
+    GeoRaster<float> surface;
+    surface.grid.width = 10;
+    surface.grid.height = 10;
+    surface.grid.pixel_size_x = 1.0;
+    surface.grid.pixel_size_y = 1.0;
+    constexpr float kNodata = -9999.0f;
+    surface.data.assign(100, kNodata);
+    surface.data[0] = std::numeric_limits<float>::quiet_NaN();
+    for (int i = 1; i <= 10; ++i) {
+        surface.data[static_cast<std::size_t>(i)] = 5.0f;
+    }
+    EXPECT_DOUBLE_EQ(ortho::surface_height_percentile(surface, kNodata, 0.99), 5.0);
+}
+
+TEST(OrthoDecodeScale, SurfaceHeightPercentileIsNaNWhenAllNodata) {
+    // No valid sample: the percentile is NaN, and the caller then falls back to
+    // the surface's highest sample (or to "no scaling" when that is invalid too).
+    GeoRaster<float> surface;
+    surface.grid.width = 4;
+    surface.grid.height = 4;
+    surface.grid.pixel_size_x = 1.0;
+    surface.grid.pixel_size_y = 1.0;
+    constexpr float kNodata = -9999.0f;
+    surface.data.assign(16, kNodata);
+    surface.data[3] = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_TRUE(std::isnan(ortho::surface_height_percentile(surface, kNodata, 0.99)));
+}
+
 TEST(OrthoDecodeScale, NativeResolutionRunLogsNoScaling) {
     // A run at the photographs' own resolution must not decode scaled: the
     // INFO line is emitted only when d > 1, and the product is the full-res one.
@@ -3476,9 +3527,12 @@ TEST(OrthoDecodeScale, CoarseRunDecodesScaledAndLogsIt) {
 
 TEST(OrthoDecodeScale, SerpentineOrderMatchesTheWholeGrid) {
     // The serpentine block walk must produce the SAME product as the unblocked
-    // whole-grid run, which is order-independent: each block writes only its own
-    // interior, and the seam pinning is expressed in visit order. Average
-    // blending is per-cell, so the two must agree byte for byte. A 512-cell block
+    // whole-grid run under AVERAGE blending, where the order cannot matter:
+    // average blending is per-cell, so the two must agree byte for byte. (Mosaic
+    // blending is NOT order-independent: a seam inside the overlap is pinned
+    // from whichever neighbour was visited first, so on odd rows the serpentine
+    // walk can put seams in different places than the raster order. This test
+    // deliberately uses average blending for that reason.) A 512-cell block
     // splits the 960x720 grid into 2x2 blocks, the smallest layout where the row
     // direction flips.
     OrthoSetup& s = setup();
