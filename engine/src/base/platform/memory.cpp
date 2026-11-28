@@ -79,10 +79,21 @@ std::uint64_t available_physical_memory_bytes() {
     }
     return static_cast<std::uint64_t>(status.ullAvailPhys);
 #elif defined(__APPLE__)
-    // The VM statistics page counts are in the host page size. Free, inactive,
-    // purgeable and speculative pages are the ones the OS can hand out without
-    // swapping; compressed pages are deliberately NOT counted, because
-    // reclaiming them costs a decompression and is not "free" memory.
+    // The VM statistics page counts are in the host page size. What the OS can
+    // hand out without swapping is the free pages plus the file-backed pages
+    // (the file cache, which the kernel drops first) plus purgeable pages.
+    //
+    // free_count already INCLUDES speculative pages: XNU's host_statistics64
+    // reports them inside free_count, and the vm_stat tool prints "Pages free"
+    // as free_count - speculative_count. Adding speculative_count on top would
+    // double-count them.
+    //
+    // inactive_count is deliberately NOT counted: it holds anonymous pages that
+    // can only be reclaimed by compressing or swapping them, so they are not
+    // available without swapping. Compressed pages are likewise not counted,
+    // because reclaiming them costs a decompression and is not "free" memory.
+    //
+    // This approximates the system monitor's "free + cached files" figure.
     ::vm_size_t page_size = 0;
     if (::host_page_size(::mach_host_self(), &page_size) != KERN_SUCCESS) {
         return 0;
@@ -94,14 +105,10 @@ std::uint64_t available_physical_memory_bytes() {
         return 0;
     }
     const std::uint64_t pages = static_cast<std::uint64_t>(stats.free_count) +
-                                static_cast<std::uint64_t>(stats.inactive_count) +
-                                static_cast<std::uint64_t>(stats.purgeable_count) +
-                                static_cast<std::uint64_t>(stats.speculative_count);
-    // The page categories are meant to be disjoint, but the kernel header notes
-    // that speculative pages are already accounted for in free_count, and some
-    // macOS versions count a page in more than one bucket. "Available" can
-    // never exceed the machine's total, so clamp rather than report an
-    // impossible figure.
+                                static_cast<std::uint64_t>(stats.external_page_count) +
+                                static_cast<std::uint64_t>(stats.purgeable_count);
+    // "Available" can never exceed the machine's total, so clamp rather than
+    // report an impossible figure.
     const std::uint64_t bytes = pages * static_cast<std::uint64_t>(page_size);
     const std::uint64_t total = total_physical_memory_bytes();
     return total != 0 ? std::min(bytes, total) : bytes;

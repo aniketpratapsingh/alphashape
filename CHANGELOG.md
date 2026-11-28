@@ -908,8 +908,8 @@ All notable changes to alphashape are recorded here. The format follows
   block per minute, 3.3 hours in total. The budget is now
   `min(60 % of total, 85 % of (available + this process's resident memory))`,
   where "available" is the memory the OS could hand out right now without
-  swapping (Linux `MemAvailable`, macOS free/inactive/purgeable/speculative
-  pages, Windows `ullAvailPhys`). The process's own resident memory is added
+  swapping (Linux `MemAvailable`, macOS free + file-backed + purgeable pages,
+  Windows `ullAvailPhys`). The process's own resident memory is added
   back because memory it already holds is not "used by others". A floor of
   `min(1 GiB, 60 % of total)` keeps a momentarily busy machine from producing an
   absurd plan, and when availability cannot be read the old 60 %-of-total rule

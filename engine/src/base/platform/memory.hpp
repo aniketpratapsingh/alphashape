@@ -17,8 +17,10 @@ std::uint64_t total_physical_memory_bytes();
 /// or 0 when the platform cannot report it. This is the machine's free memory,
 /// not this process's: it already excludes what other programs hold.
 ///
-/// Linux reads MemAvailable from /proc/meminfo; macOS sums the free, inactive,
-/// purgeable and speculative page counts (compressed pages are NOT counted as
+/// Linux reads MemAvailable from /proc/meminfo; macOS sums the free,
+/// file-backed and purgeable page counts (free already includes speculative
+/// pages, and inactive anonymous pages are not reclaimable without
+/// compression/swap, so neither is added; compressed pages are NOT counted as
 /// available); Windows reads ullAvailPhys from GlobalMemoryStatusEx.
 std::uint64_t available_physical_memory_bytes();
 
