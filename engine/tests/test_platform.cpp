@@ -688,11 +688,18 @@ TEST(Platform, CurrentResidentSetIsBelowThePeak) {
     // The current RSS is a real figure and can never exceed the process-wide
     // high-water mark. Equality is allowed: a process that has only grown since
     // start has current == peak.
+    //
+    // A small tolerance is allowed because the peak is read from the kernel's
+    // own accounting (getrusage on Linux/macOS, GetProcessMemoryInfo on
+    // Windows), which is updated lazily and can lag a fresh resident-set read
+    // by a few pages: on Linux the observed gap is tens of kilobytes.
+    constexpr std::uint64_t kAccountingSlack = 1024ULL * 1024ULL;  // 1 MiB
     const std::uint64_t current = plat::current_resident_set_bytes();
     const std::uint64_t peak = plat::peak_resident_set_bytes();
     ASSERT_GT(current, 0U) << "the platform cannot report the resident set size";
     ASSERT_GT(peak, 0U) << "the platform cannot report the peak resident set size";
-    EXPECT_LE(current, peak) << "current " << current << " > peak " << peak;
+    EXPECT_LE(current, peak + kAccountingSlack)
+        << "current " << current << " > peak " << peak << " + slack";
 }
 
 TEST(Platform, MemoryBudgetWithoutOverrideStaysWithinTheDocumentedBounds) {
