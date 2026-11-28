@@ -147,17 +147,20 @@ std::uint64_t current_resident_set_bytes() {
     }
     return static_cast<std::uint64_t>(info.resident_size);
 #else
-    // /proc/self/statm: "size resident shared text lib data dt" in pages. The
-    // first field (virtual size) is skipped with an assignment-suppressing
-    // conversion; only the resident field is wanted.
+    // /proc/self/statm: "size resident shared text lib data dt" in pages. Only
+    // the resident field is wanted; the virtual size is read and discarded
+    // because an assignment-suppressing conversion cannot carry a length
+    // modifier under -Wformat=.
     std::FILE* file = std::fopen("/proc/self/statm", "r");
     if (file == nullptr) {
         return 0;
     }
+    unsigned long long virtual_pages = 0;
     unsigned long long resident_pages = 0;
-    const int read = std::fscanf(file, "%*llu %llu", &resident_pages);
+    const int read = std::fscanf(file, "%llu %llu", &virtual_pages, &resident_pages);
     std::fclose(file);
-    if (read != 1) {
+    (void)virtual_pages;
+    if (read != 2) {
         return 0;
     }
     const long page_size = ::sysconf(_SC_PAGE_SIZE);
