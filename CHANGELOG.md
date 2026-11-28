@@ -898,6 +898,25 @@ All notable changes to alphashape are recorded here. The format follows
 
 ### Fixed
 
+- **Tasks planned their memory against the machine's total RAM, not what was
+  actually free, so a busy machine swapped instead of coarsening.** The task
+  memory budget was a flat 60 % of physical RAM, ignoring what other programs
+  already held. On a 16 GB machine with a virtual machine holding ~8 GB and
+  browsers open, Build Orthomosaic planned an 8.3-9.5 GB peak against a 9.6 GB
+  budget; the process ended up with an 11 GB footprint almost entirely
+  compressed and swapped (16 GB of swap in use) and the ortho ran at about one
+  block per minute, 3.3 hours in total. The budget is now
+  `min(60 % of total, 85 % of (available + this process's resident memory))`,
+  where "available" is the memory the OS could hand out right now without
+  swapping (Linux `MemAvailable`, macOS free + file-backed + purgeable pages,
+  Windows `ullAvailPhys`). The process's own resident memory is added
+  back because memory it already holds is not "used by others". A floor of
+  `min(1 GiB, 60 % of total)` keeps a momentarily busy machine from producing an
+  absurd plan, and when availability cannot be read the old 60 %-of-total rule
+  still applies. The `ALPHASHAPE_MEMORY_BUDGET_MB` environment variable still
+  forces a fixed budget, unchanged. The Build Orthomosaic log line and its
+  refusals now say when the available-memory term was the binding one, e.g.
+  "memory budget 4.1 GB (limited by available memory: 4.8 GB free of 16.0 GB)".
 - **A project with large depth maps could not be saved.** The project container
   is a zip, and the writer refused any entry, offset or entry count that did not
   fit the classic 32/16-bit zip fields, so a project whose depth maps pushed an

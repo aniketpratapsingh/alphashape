@@ -2042,8 +2042,8 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         if (budget != 0 && needed > static_cast<double>(budget)) {
             throw ValueError(
                 "BuildOrthomosaic: not enough memory to reproject the surface (needs ~" +
-                platform::format_gb(needed) + " for the source DEM and its reprojected copy, "
-                "budget " + platform::format_gb(static_cast<double>(budget)) +
+                platform::format_gb(needed) + " for the source DEM and its reprojected copy, " +
+                platform::describe_memory_budget() +
                 "); build the DEM directly in the requested CRS (BuildDem projection) or "
                 "free memory.");
         }
@@ -2321,6 +2321,7 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                 " m even in " + std::to_string(kMinBlockCells) + "-cell blocks; this machine has " +
                 platform::format_gb(static_cast<double>(
                     platform::total_physical_memory_bytes())) +
+                " and " + platform::describe_memory_budget() +
                 ". Set a coarser resolution (e.g. " +
                 format_number(round_sig3(resolution * 4.0)) + " m).");
         }
@@ -2357,9 +2358,8 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         }
         if (!(fits > 0.0)) {
             throw ValueError(
-                "BuildOrthomosaic cannot fit even the smallest ortho in this machine's "
-                "budget of " +
-                platform::format_gb(static_cast<double>(budget)) +
+                "BuildOrthomosaic cannot fit even the smallest ortho in this machine's " +
+                platform::describe_memory_budget() +
                 " (the decoded photographs alone need more). Close other applications "
                 "first, or free memory and retry.");
         }
@@ -2388,9 +2388,8 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
         }
         if (!fits_after_rounding) {
             throw ValueError(
-                "BuildOrthomosaic could not settle on a resolution that fits this "
-                "machine's budget of " +
-                platform::format_gb(static_cast<double>(budget)) +
+                "BuildOrthomosaic could not settle on a resolution that fits this " +
+                platform::describe_memory_budget() +
                 ". Set a resolution explicitly, or close other applications and retry.");
         }
         grid = grid_at(chosen);
@@ -2401,8 +2400,8 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
             << format_number(measured_gsd_metres > 0.0 ? measured_gsd_metres
                                                        : default_resolution)
             << " m but a " << format_number(default_resolution)
-            << " m ortho needs ~" << platform::format_gb(default_peak) << " (budget "
-            << platform::format_gb(static_cast<double>(budget)) << "); building at "
+            << " m ortho needs ~" << platform::format_gb(default_peak) << " ("
+            << platform::describe_memory_budget() << "); building at "
             << format_number(resolution)
             << " m instead. Set resolution explicitly to override (needs more memory) "
                "or free memory.";
@@ -2439,7 +2438,8 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
                             << plan.rows << " blocks of " << plan.block_cells << " (+"
                             << plan.margin_cells << " margin, mosaic levels " << plan.levels
                             << "), predicted peak ~"
-                            << platform::format_gb(plan.estimated_peak_bytes);
+                            << platform::format_gb(plan.estimated_peak_bytes) << "; "
+                            << platform::describe_memory_budget();
     }
 
     // The plane->local fallback height is a whole-DEM median: scanned once here
