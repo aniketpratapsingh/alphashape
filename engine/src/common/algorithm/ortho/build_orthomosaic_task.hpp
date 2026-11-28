@@ -73,13 +73,15 @@ double median_ground_sample_distance(const std::vector<FootprintCamera>& cameras
                                          double>::quiet_NaN());
 
 /// The decode denominator a run uses: the largest power of two in {1,2,4,8} that
-/// keeps a decoded pixel at most HALF an output cell, i.e.
-/// 2 * d <= cell_metres / finest_ground_pixel. The margin matters because a
+/// keeps a decoded pixel at most a QUARTER of an output cell, i.e.
+/// 4 * d <= cell_metres / finest_ground_pixel. The margin matters because a
 /// decoded pixel about the size of the output cell is blurred twice -- once by
 /// the DCT downscale and again by the rectifier's bilinear read at an arbitrary
-/// phase -- which softens the ortho. A native-resolution output (cell == the
-/// photo's own ground pixel) yields 1, so the default run is unchanged; a 10 cm
-/// ortho over 2.4 cm photos yields 2, and a 20 cm ortho over 2.4 cm photos
+/// phase -- which softens the ortho; the quality benchmark showed a measurable
+/// softening even at a half-cell pixel, so the margin is a quarter cell. A
+/// native-resolution output (cell == the photo's own ground pixel) yields 1, so
+/// the default run is unchanged; a 10 cm ortho over 2.4 cm photos yields 1, a
+/// 20 cm ortho over 2.4 cm photos yields 2, and a 40 cm ortho over 2.4 cm photos
 /// yields 4. Anything non-finite or non-positive yields 1 (full resolution), the
 /// safe answer. Exposed so the selection rule can be unit-tested without a
 /// flight.

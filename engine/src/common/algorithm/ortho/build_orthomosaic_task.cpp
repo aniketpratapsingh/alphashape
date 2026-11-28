@@ -1827,15 +1827,16 @@ int choose_decode_denominator(double cell_metres, double finest_ground_pixel) {
         !std::isfinite(finest_ground_pixel)) {
         return 1;
     }
-    // Keep a 2x margin: a decoded pixel is at most HALF an output cell. A
-    // decoded pixel about the size of the cell is blurred twice (the DCT
+    // Keep a 4x margin: a decoded pixel is at most a QUARTER of an output cell.
+    // A decoded pixel about the size of the cell is blurred twice (the DCT
     // downscale, then the rectifier's bilinear read at an arbitrary phase), so
     // the ortho softens; the margin leaves the bilinear read room to interpolate
-    // without losing detail.
+    // without losing detail. The quality benchmark showed a measurable softening
+    // even at a half-cell pixel, so the margin is a quarter cell.
     const double ratio = cell_metres / finest_ground_pixel;
     int denom = 1;
     for (const int candidate : {2, 4, 8}) {
-        if (2.0 * static_cast<double>(candidate) <= ratio) {
+        if (4.0 * static_cast<double>(candidate) <= ratio) {
             denom = candidate;
         }
     }
@@ -2364,11 +2365,13 @@ void BuildOrthomosaicTask::run(Document& document, Params& params,
     // -- decode scale --------------------------------------------------------
     // When the output cell is much coarser than the photographs' own ground
     // pixel, decoding every frame at full resolution is wasted work and wasted
-    // cache: a 10 cm ortho over 2.4 cm photos needs no more than a 1/2 decode,
-    // and the cache then holds 4x as many frames. The rule keeps a 2x margin --
-    // a decoded pixel is at most HALF an output cell -- because a decoded pixel
-    // about the size of the cell is blurred twice (the DCT downscale, then the
-    // rectifier's bilinear read at an arbitrary phase) and the ortho softens.
+    // cache: a 20 cm ortho over 2.4 cm photos needs no more than a 1/2 decode,
+    // and the cache then holds 4x as many frames. The rule keeps a 4x margin --
+    // a decoded pixel is at most a QUARTER of an output cell -- because a
+    // decoded pixel about the size of the cell is blurred twice (the DCT
+    // downscale, then the rectifier's bilinear read at an arbitrary phase) and
+    // the ortho softens; the quality benchmark showed a measurable softening
+    // even at a half-cell pixel, so the margin is a quarter cell.
     // The denominator is chosen ONCE for the run from the finest ground pixel
     // any camera resolves (see finest_ground_pixel_metres), so every frame is
     // decoded at the same scale and the geometry (which divides by it) is

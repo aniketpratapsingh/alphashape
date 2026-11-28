@@ -3420,25 +3420,29 @@ TEST(ExportOrthomosaic, ReprojectionKeepsEveryColour) {
 
 TEST(OrthoDecodeScale, DenominatorFollowsTheOutputCell) {
     // The rule: the largest power of two in {1,2,4,8} that keeps a decoded pixel
-    // at most HALF an output cell, i.e. 2 * d <= cell / finest_ground_pixel. The
-    // margin stops the DCT downscale and the rectifier's bilinear read from
-    // blurring the ortho twice. A native-resolution output (cell == the photo's
-    // own ground pixel) must stay at 1, so the default run is unchanged.
+    // at most a QUARTER of an output cell, i.e. 4 * d <= cell / finest_ground_pixel.
+    // The margin stops the DCT downscale and the rectifier's bilinear read from
+    // blurring the ortho twice; the quality benchmark showed a measurable
+    // softening even at a half-cell pixel, so the margin is a quarter cell. A
+    // native-resolution output (cell == the photo's own ground pixel) must stay
+    // at 1, so the default run is unchanged.
     constexpr double kPhotoPixel = 0.024;  // 2.4 cm, the measured DJI case
     EXPECT_EQ(ortho::choose_decode_denominator(kPhotoPixel, kPhotoPixel), 1)
         << "native resolution must not scale";
     EXPECT_EQ(ortho::choose_decode_denominator(2.08 * kPhotoPixel, kPhotoPixel), 1)
         << "2.08x the photo pixel: a 1/2 decode would leave a pixel at half a "
            "cell, but the margin needs 4x, so no scaling";
-    EXPECT_EQ(ortho::choose_decode_denominator(4.2 * kPhotoPixel, kPhotoPixel), 2)
-        << "4.2x the photo pixel: 1/2";
-    EXPECT_EQ(ortho::choose_decode_denominator(8.5 * kPhotoPixel, kPhotoPixel), 4)
-        << "8.5x the photo pixel: 1/4";
-    EXPECT_EQ(ortho::choose_decode_denominator(20.0 * kPhotoPixel, kPhotoPixel), 8)
-        << "20x the photo pixel: capped at 1/8";
+    EXPECT_EQ(ortho::choose_decode_denominator(4.2 * kPhotoPixel, kPhotoPixel), 1)
+        << "4.2x the photo pixel: still under the 4x margin, so no scaling";
+    EXPECT_EQ(ortho::choose_decode_denominator(8.5 * kPhotoPixel, kPhotoPixel), 2)
+        << "8.5x the photo pixel: 1/2";
+    EXPECT_EQ(ortho::choose_decode_denominator(17.0 * kPhotoPixel, kPhotoPixel), 4)
+        << "17x the photo pixel: 1/4";
+    EXPECT_EQ(ortho::choose_decode_denominator(40.0 * kPhotoPixel, kPhotoPixel), 8)
+        << "40x the photo pixel: capped at 1/8";
     // Just under the margin must not round up.
-    EXPECT_EQ(ortho::choose_decode_denominator(3.99 * kPhotoPixel, kPhotoPixel), 1);
-    EXPECT_EQ(ortho::choose_decode_denominator(7.99 * kPhotoPixel, kPhotoPixel), 2);
+    EXPECT_EQ(ortho::choose_decode_denominator(7.99 * kPhotoPixel, kPhotoPixel), 1);
+    EXPECT_EQ(ortho::choose_decode_denominator(15.99 * kPhotoPixel, kPhotoPixel), 2);
     // Non-finite or non-positive inputs are the safe answer: full resolution.
     EXPECT_EQ(ortho::choose_decode_denominator(std::numeric_limits<double>::quiet_NaN(),
                                                kPhotoPixel),
@@ -3515,9 +3519,10 @@ TEST(OrthoDecodeScale, NativeResolutionRunLogsNoScaling) {
 }
 
 TEST(OrthoDecodeScale, CoarseRunDecodesScaledAndLogsIt) {
-    // A 1 m ortho over the fixture's ~0.12 m photos is ~8x coarser, so the run
-    // decodes at 1/8 and says so. The product must still be produced (the
-    // geometry is unchanged; only the colour read is scaled).
+    // A 1 m ortho over the fixture's ~0.10-0.12 m photos (60 m altitude, 500 px
+    // focal) is ~8-10x coarser, so the run decodes at 1/2 (the 4x margin needs a
+    // ratio of at least 8 for d = 2) and says so. The product must still be
+    // produced (the geometry is unchanged; only the colour read is scaled).
     OrthoSetup& s = setup();
     ScopedLogCapture capture;
     const Orthomosaic ortho = run_ortho(s, block_params("average", 1.0, 0, false, false));

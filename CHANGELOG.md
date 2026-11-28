@@ -87,14 +87,16 @@ All notable changes to alphashape are recorded here. The format follows
   it kept only ~21 of the up to 82 cameras a block needs, and the raster block
   order changed the camera set completely at every row wrap. The run now decodes
   each JPEG at 1/2, 1/4 or 1/8 of its stored resolution (libjpeg DCT scaling)
-  when the output cell is at least 4x the photograph's own ground pixel, so a
+  when the output cell is at least 8x the photograph's own ground pixel, so a
   frame costs 1/d^2 of the memory and the cache holds d^2 times as many; the
   geometry is unchanged because it is computed from the calibration, not the
-  decoded pixels. The 4x threshold keeps a decoded pixel at most half an output
-  cell: a decoded pixel about the size of the cell is blurred twice (the DCT
-  downscale, then the rectifier's bilinear read at an arbitrary phase) and the
-  ortho softens, so a 5 cm ortho over 2.4 cm photos now decodes at full
-  resolution while a 10 cm ortho over 2.4 cm photos decodes at 1/2. Blocks are
+  decoded pixels. The 8x threshold keeps a decoded pixel at most a quarter of an
+  output cell: a decoded pixel about the size of the cell is blurred twice (the
+  DCT downscale, then the rectifier's bilinear read at an arbitrary phase) and
+  the ortho softens, and the quality benchmark showed a measurable softening
+  even at a half-cell pixel, so a 5 cm or 10 cm ortho over 2.4 cm photos now
+  decodes at full resolution while a 20 cm ortho over 2.4 cm photos decodes at
+  1/2. Blocks are
   now visited left-to-right, then right-to-left on the next row, so consecutive
   blocks are always neighbours and the cache keeps the frames the next block
   needs; within a block the frames already cached are fetched first, so the
